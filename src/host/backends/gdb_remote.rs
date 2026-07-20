@@ -1,5 +1,5 @@
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::string::{String, ToString};
 use std::time::Duration;
@@ -18,20 +18,35 @@ impl fmt::Display for RemoteError {
 impl std::error::Error for RemoteError {}
 
 pub struct GdbRemote {
-    stream: TcpStream,
+    stream: BufReader<TcpStream>,
 }
 
 impl GdbRemote {
     pub fn connect(address: impl ToSocketAddrs, timeout: Duration) -> Result<Self, RemoteError> {
-        let address = address
-            .to_socket_addrs()
-            .map_err(error)?
-            .next()
-            .ok_or_else(|| RemoteError("GDB server address resolved to nothing".into()))?;
-        let stream = TcpStream::connect_timeout(&address, timeout).map_err(error)?;
+        let addresses = address.to_socket_addrs().map_err(error)?;
+        let mut last_error = None;
+        let mut stream = None;
+        for address in addresses {
+            match TcpStream::connect_timeout(&address, timeout) {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let stream = stream.ok_or_else(|| {
+            RemoteError(
+                last_error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "GDB server address resolved to nothing".into()),
+            )
+        })?;
         stream.set_read_timeout(Some(timeout)).map_err(error)?;
         stream.set_write_timeout(Some(timeout)).map_err(error)?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream: BufReader::new(stream),
+        })
     }
 
     pub fn query(&mut self, payload: &[u8]) -> Result<Vec<u8>, RemoteError> {
@@ -43,7 +58,7 @@ impl GdbRemote {
             .iter()
             .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
         packet.extend_from_slice(format_hex_byte(checksum).as_bytes());
-        self.stream.write_all(&packet).map_err(error)?;
+        self.stream.get_mut().write_all(&packet).map_err(error)?;
         let acknowledgement = read_byte(&mut self.stream)?;
         if acknowledgement != b'+' {
             return Err(RemoteError(format_args_owned(format_args!(
@@ -132,7 +147,9 @@ impl GdbRemote {
         command.extend_from_slice(&address.to_le_bytes());
         command.extend_from_slice(&halfwords.to_le_bytes());
         command.extend_from_slice(&11u32.to_le_bytes());
-        self.stream.write_all(&command).map_err(error)?;
+        // SEGGER UM08036 section 3.0.6 defines GetInstStats as a raw,
+        // fixed-length exchange that deliberately omits normal GDB framing.
+        self.stream.get_mut().write_all(&command).map_err(error)?;
 
         let expected = 4usize + 8 * 3 * (halfwords as usize + 1);
         let mut response = vec![0; expected];
@@ -184,10 +201,10 @@ impl GdbRemote {
             .iter()
             .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
         if actual != expected {
-            self.stream.write_all(b"-").map_err(error)?;
+            self.stream.get_mut().write_all(b"-").map_err(error)?;
             return Err(RemoteError("GDB response checksum mismatch".into()));
         }
-        self.stream.write_all(b"+").map_err(error)?;
+        self.stream.get_mut().write_all(b"+").map_err(error)?;
         unescape(&encoded)
     }
 }
@@ -319,7 +336,18 @@ fn error(error: io::Error) -> RemoteError {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+
     use super::*;
+
+    #[test]
+    fn connect_tries_every_resolved_address() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let unreachable = "127.0.0.1:0".parse().unwrap();
+        let addresses = [unreachable, listener.local_addr().unwrap()];
+
+        GdbRemote::connect(addresses.as_slice(), Duration::from_secs(1)).unwrap();
+    }
 
     #[test]
     fn hexadecimal_codec_round_trips() {

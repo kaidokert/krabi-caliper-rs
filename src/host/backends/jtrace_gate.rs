@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::string::{String, ToString};
 use std::thread;
 use std::time::Duration;
+use std::vec;
 use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
@@ -119,8 +120,7 @@ impl JTraceCtGate {
         let halfwords = (code_end - code_start) / 2;
 
         self.flash_exact_elf()?;
-        let mut key_baselines: Vec<Option<InstructionStats>> =
-            (0..self.keys).map(|_| None).collect();
+        let mut key_baselines: Vec<Option<InstructionStats>> = vec![None; self.keys as usize];
         let mut within_key_profiles_equal = true;
         let mut cross_key_profiles_equal = true;
         let mut max_within_key_profile_delta = 0;

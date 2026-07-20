@@ -128,12 +128,6 @@ impl JTraceCapture {
                 transcript.display()
             )));
         }
-        if lower.contains("0 instructions (most recently executed first)") {
-            return Err(JTraceError(format!(
-                "J-Trace captured zero instructions; see {}",
-                transcript.display()
-            )));
-        }
         let addresses = decoded_addresses(&text);
         let decoded_instruction_lines = addresses.len();
         let mut unique = addresses.clone();
@@ -258,7 +252,9 @@ pub(crate) fn parse_etm_trial(text: &str) -> Option<(u64, u64)> {
             .parse::<u64>()
             .ok()
     };
-    Some((field("ticks:")?, field("frequency_hz:")?))
+    let ticks = field("ticks:")?;
+    let frequency_hz = field("frequency_hz:")?;
+    (field("output_ok:")? == 1 && ticks != 0 && frequency_hz != 0).then_some((ticks, frequency_hz))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -321,11 +317,27 @@ mod tests {
                     08000ECC:   80 47              BLX       R0\n";
         assert_eq!(trace_instruction_count(text), Some(64));
         assert_eq!(decoded_addresses(text), [0x0800_2a08, 0x0800_0ecc]);
+        assert_eq!(
+            trace_instruction_count("10 instructions (most recently executed first):\n"),
+            Some(10)
+        );
     }
 
     #[test]
     fn parses_target_timing_record() {
         let text = "ETM_TRIAL fixture:sign ticks:142430551 frequency_hz:168000000 output_ok:1\n";
         assert_eq!(parse_etm_trial(text), Some((142_430_551, 168_000_000)));
+        assert_eq!(
+            parse_etm_trial("ETM_TRIAL ticks:1 frequency_hz:2 output_ok:0\n"),
+            None
+        );
+        assert_eq!(
+            parse_etm_trial("ETM_TRIAL ticks:0 frequency_hz:2 output_ok:1\n"),
+            None
+        );
+        assert_eq!(
+            parse_etm_trial("ETM_TRIAL ticks:1 frequency_hz:0 output_ok:1\n"),
+            None
+        );
     }
 }
