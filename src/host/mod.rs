@@ -7,7 +7,9 @@ pub mod campaign;
 mod combined;
 #[cfg(feature = "campaign")]
 mod compare;
+pub mod ct_asm;
 mod elf;
+pub mod isa;
 mod model;
 mod parser;
 mod render;
