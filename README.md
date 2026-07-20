@@ -37,6 +37,8 @@ subsequent reviewed changes.
   for the same text reporting protocol.
 - Optional host-side protocol parsing, owned evidence, JSON/Markdown reports,
   ELF footprint extraction, and Welch timing analysis.
+- Visible process-group-aware command execution, host timestamp boundaries,
+  and a portable simavr Cargo runner.
 
 ```sh
 cargo test --all-features
