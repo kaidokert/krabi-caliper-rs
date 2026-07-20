@@ -41,6 +41,8 @@ subsequent reviewed changes.
   and a portable simavr Cargo runner.
 - Optional declarative campaign profiles with checked inheritance, capability
   requirements, venue binding expansion, and secret-redacted evidence.
+- Campaign execution with Cargo artifact discovery, retained evidence, and
+  aggregate Markdown, CSV, and JSON reports.
 
 ```sh
 cargo test --all-features
