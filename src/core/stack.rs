@@ -1,5 +1,7 @@
 //! Portable high-water measurement for downward-growing embedded stacks.
 
+use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 pub const DEFAULT_SENTINEL: u8 = 0xaa;
@@ -8,9 +10,11 @@ pub const DEFAULT_SENTINEL: u8 = 0xaa;
 ///
 /// # Safety
 ///
-/// `bottom` and `top` must bound one writable stack allocation, with `bottom`
-/// inclusive and `top` exclusive. The stack pointer must be within it. No
-/// other context may use memory below that pointer while it is painted.
+/// `bottom` and `top` must bound one writable stack allocation that remains
+/// valid for the duration of every borrow of this provider. `bottom` is
+/// inclusive and `top` is exclusive. The stack pointer may range from
+/// `bottom` through `top`, inclusive; `sp == top` represents an empty
+/// full-descending stack.
 pub unsafe trait DescendingStack {
     fn bottom(&self) -> NonNull<u8>;
     fn top(&self) -> NonNull<u8>;
@@ -73,10 +77,11 @@ pub enum StackChunkState {
 ///
 /// The model reports offsets rather than target pointer widths, leaving text
 /// layout and transport to the caller.
-pub struct StackMap {
+pub struct StackMap<'stack> {
     bottom: *const u8,
     len: usize,
     sentinel: u8,
+    stack: PhantomData<&'stack UnsafeCell<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,8 +93,17 @@ pub struct StackChunk {
     pub state: StackChunkState,
 }
 
-impl StackMap {
-    pub fn new(stack: &impl DescendingStack, sentinel: u8) -> Result<Self, StackError> {
+impl<'stack> StackMap<'stack> {
+    /// Creates a view over a stack allocation.
+    ///
+    /// # Safety
+    ///
+    /// No other execution context may write the stack allocation while the
+    /// returned map or any iterator borrowing it is used.
+    pub unsafe fn new(
+        stack: &'stack impl DescendingStack,
+        sentinel: u8,
+    ) -> Result<Self, StackError> {
         let bottom = stack.bottom().as_ptr() as usize;
         let top = stack.top().as_ptr() as usize;
         if bottom >= top {
@@ -99,6 +113,7 @@ impl StackMap {
             bottom: bottom as *const u8,
             len: top - bottom,
             sentinel,
+            stack: PhantomData,
         })
     }
 
@@ -111,7 +126,7 @@ impl StackMap {
     }
 
     /// Iterates fixed-size occupancy chunks. A zero chunk size yields no items.
-    pub fn chunks(&self, chunk_bytes: usize) -> StackChunks<'_> {
+    pub fn chunks(&self, chunk_bytes: usize) -> StackChunks<'_, 'stack> {
         StackChunks {
             map: self,
             offset: 0,
@@ -120,13 +135,13 @@ impl StackMap {
     }
 }
 
-pub struct StackChunks<'a> {
-    map: &'a StackMap,
+pub struct StackChunks<'map, 'stack> {
+    map: &'map StackMap<'stack>,
     offset: usize,
     chunk_bytes: usize,
 }
 
-impl Iterator for StackChunks<'_> {
+impl Iterator for StackChunks<'_, '_> {
     type Item = StackChunk;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -159,16 +174,26 @@ impl Iterator for StackChunks<'_> {
 }
 
 #[derive(Debug)]
-pub struct StackProbe {
+pub struct StackProbe<'stack> {
     bottom: NonNull<u8>,
     top: NonNull<u8>,
     painted_end: NonNull<u8>,
     config: StackConfig,
+    stack: PhantomData<&'stack UnsafeCell<u8>>,
 }
 
-impl StackProbe {
+impl<'stack> StackProbe<'stack> {
     /// Paints unused stack below the current live frame.
-    pub fn paint(stack: &impl DescendingStack, config: StackConfig) -> Result<Self, StackError> {
+    ///
+    /// # Safety
+    ///
+    /// No interrupt, task, scheduler, or other execution context may access
+    /// this stack allocation during the call. The caller may allow stack use
+    /// again after painting and before measuring the result.
+    pub unsafe fn paint(
+        stack: &'stack impl DescendingStack,
+        config: StackConfig,
+    ) -> Result<Self, StackError> {
         let bottom = stack.bottom();
         let top = stack.top();
         let sp = stack.current_stack_pointer();
@@ -199,10 +224,18 @@ impl StackProbe {
             top,
             painted_end,
             config,
+            stack: PhantomData,
         })
     }
 
-    pub fn measure(&self) -> StackMeasurement {
+    /// Scans the painted region and returns conservative high-water evidence.
+    ///
+    /// # Safety
+    ///
+    /// No other execution context may write the painted stack region during
+    /// this scan. Stack activity between [`Self::paint`] and this call is the
+    /// workload being measured and is allowed.
+    pub unsafe fn measure(&self) -> StackMeasurement {
         let bottom = self.bottom.as_ptr() as usize;
         let top = self.top.as_ptr() as usize;
         let painted_end = self.painted_end.as_ptr() as usize;
@@ -278,27 +311,35 @@ mod tests {
     #[test]
     fn paints_below_live_stack_and_reports_high_water() {
         let stack = FakeStack::new(0, 56);
-        let probe = StackProbe::paint(&stack, StackConfig::new(8)).unwrap();
+        // SAFETY: the test exclusively owns and accesses this fake stack.
+        let probe = unsafe { StackProbe::paint(&stack, StackConfig::new(8)) }.unwrap();
         assert!((0..48).all(|offset| stack.byte(offset) == DEFAULT_SENTINEL));
         stack.write(40, 0);
-        assert_eq!(probe.measure().high_water_bytes, 24);
-        assert!(!probe.measure().overflowed);
+        // SAFETY: no other context can access the fake stack during the scan.
+        let measurement = unsafe { probe.measure() };
+        assert_eq!(measurement.high_water_bytes, 24);
+        assert!(!measurement.overflowed);
     }
 
     #[test]
     fn detects_lower_bound_overflow() {
         let stack = FakeStack::new(0, 56);
-        let probe = StackProbe::paint(&stack, StackConfig::new(8)).unwrap();
+        // SAFETY: the test exclusively owns and accesses this fake stack.
+        let probe = unsafe { StackProbe::paint(&stack, StackConfig::new(8)) }.unwrap();
         stack.write(0, 0);
-        assert!(probe.measure().overflowed);
+        // SAFETY: no other context can access the fake stack during the scan.
+        assert!(unsafe { probe.measure() }.overflowed);
     }
 
     #[test]
     fn reports_an_unpaintable_safe_zone_conservatively() {
         let stack = FakeStack::new(0, 32);
-        let probe = StackProbe::paint(&stack, StackConfig::new(64)).unwrap();
+        // SAFETY: the test exclusively owns and accesses this fake stack.
+        let probe = unsafe { StackProbe::paint(&stack, StackConfig::new(64)) }.unwrap();
+        // SAFETY: no other context can access the fake stack during the scan.
+        let measurement = unsafe { probe.measure() };
         assert_eq!(
-            probe.measure(),
+            measurement,
             StackMeasurement {
                 high_water_bytes: 64,
                 available_bytes: 64,
@@ -310,15 +351,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_one_past_top_as_an_empty_stack_pointer() {
+        let stack = FakeStack::new(0, 64);
+        // SAFETY: the test exclusively owns and accesses this fake stack.
+        let probe = unsafe { StackProbe::paint(&stack, StackConfig::new(8)) }.unwrap();
+        assert!((0..56).all(|offset| stack.byte(offset) == DEFAULT_SENTINEL));
+        // SAFETY: no other context can access the fake stack during the scan.
+        assert_eq!(unsafe { probe.measure() }.painted_bytes, 56);
+    }
+
+    #[test]
     fn stack_map_reports_unused_partial_and_used_chunks() {
         let stack = FakeStack::new(DEFAULT_SENTINEL, 64);
         for offset in 20..48 {
             stack.write(offset, 0);
         }
-        let chunks: std::vec::Vec<_> = StackMap::new(&stack, DEFAULT_SENTINEL)
-            .unwrap()
-            .chunks(16)
-            .collect();
+        // SAFETY: the test performs no writes while the map is observed.
+        let map = unsafe { StackMap::new(&stack, DEFAULT_SENTINEL) }.unwrap();
+        let chunks: std::vec::Vec<_> = map.chunks(16).collect();
         assert_eq!(chunks[0].state, StackChunkState::Unused);
         assert_eq!(chunks[1].state, StackChunkState::Partial);
         assert_eq!(chunks[1].used_bytes, 12);
@@ -330,7 +380,8 @@ mod tests {
     fn rejects_invalid_stack_pointer_and_bounds() {
         let invalid_sp = FakeStack::new(0, 65);
         assert_eq!(
-            StackProbe::paint(&invalid_sp, StackConfig::new(8)).unwrap_err(),
+            // SAFETY: validation rejects the pointer before accessing memory.
+            unsafe { StackProbe::paint(&invalid_sp, StackConfig::new(8)) }.unwrap_err(),
             StackError::StackPointerOutOfBounds
         );
 
@@ -348,7 +399,8 @@ mod tests {
             }
         }
         assert_eq!(
-            StackProbe::paint(&InvalidBounds, StackConfig::new(0)).unwrap_err(),
+            // SAFETY: validation rejects the bounds before accessing memory.
+            unsafe { StackProbe::paint(&InvalidBounds, StackConfig::new(0)) }.unwrap_err(),
             StackError::InvalidBounds
         );
     }
