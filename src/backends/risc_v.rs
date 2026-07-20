@@ -4,6 +4,11 @@ use core::arch::asm;
 
 use crate::{Counter, Measurement, Unit};
 
+const CSR_MCYCLE: usize = 0xB00;
+const CSR_MINSTRET: usize = 0xB02;
+const CSR_MCYCLEH: usize = 0xB80;
+const CSR_MINSTRETH: usize = 0xB82;
+
 #[inline(always)]
 #[cfg(target_arch = "riscv32")]
 fn read_csr64<const LOW: usize, const HIGH: usize>() -> u64 {
@@ -76,7 +81,7 @@ impl Counter for McycleCounter {
 
     #[inline(always)]
     fn now(&mut self) -> Self::Instant {
-        read_csr64::<0xB00, 0xB80>()
+        read_csr64::<CSR_MCYCLE, CSR_MCYCLEH>()
     }
 
     #[inline(always)]
@@ -103,7 +108,7 @@ impl Counter for MinstretCounter {
 
     #[inline(always)]
     fn now(&mut self) -> Self::Instant {
-        read_csr64::<0xB02, 0xB82>()
+        read_csr64::<CSR_MINSTRET, CSR_MINSTRETH>()
     }
 
     #[inline(always)]
