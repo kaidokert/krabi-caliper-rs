@@ -46,6 +46,7 @@ pub struct PanicAuditConfig {
     pub forbidden_targets: Vec<String>,
     pub expected_negatives: Vec<String>,
     pub extra_cargo_args: Vec<OsString>,
+    pub objdump: Option<PathBuf>,
     pub json_out: Option<PathBuf>,
 }
 
@@ -174,7 +175,10 @@ pub fn run(config: &PanicAuditConfig) -> Result<PanicAuditReport, PanicAuditErro
         status: if success { "PASS" } else { "FAIL" },
     };
     if let Some(path) = &config.json_out {
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent).map_err(error)?;
         }
         fs::write(path, serde_json::to_vec_pretty(&report).map_err(error)?).map_err(error)?;
@@ -271,13 +275,11 @@ fn artifact_from_messages(
     artifact_name: Option<&str>,
     stdout: &[u8],
 ) -> Result<PathBuf, PanicAuditError> {
+    let requested_name = requested_artifact_name(config, artifact_name);
     let mut matches = Message::parse_stream(Cursor::new(stdout))
         .filter_map(Result::ok)
         .filter_map(|message| match message {
-            Message::CompilerArtifact(artifact)
-                if artifact.target.name
-                    == artifact_name.unwrap_or(&config.package).replace('-', "_") =>
-            {
+            Message::CompilerArtifact(artifact) if artifact.target.name == requested_name => {
                 Some(artifact)
             }
             _ => None,
@@ -302,6 +304,14 @@ fn artifact_from_messages(
         _ => Err(PanicAuditError(format!(
             "Cargo reported multiple audit artifacts: {matches:?}"
         ))),
+    }
+}
+
+fn requested_artifact_name(config: &PanicAuditConfig, artifact_name: Option<&str>) -> String {
+    let name = artifact_name.unwrap_or(&config.package);
+    match config.artifact_kind {
+        ArtifactKind::Example => name.to_string(),
+        ArtifactKind::Staticlib => name.replace('-', "_"),
     }
 }
 
@@ -354,14 +364,28 @@ fn analyze(
     })
 }
 
-fn disassembler(config: &PanicAuditConfig) -> Result<(Command, &'static str), PanicAuditError> {
+fn disassembler(config: &PanicAuditConfig) -> Result<(Command, String), PanicAuditError> {
+    if let Some(path) = &config.objdump {
+        let mut command = Command::new(path);
+        if config.target.starts_with("avr-") || config.target == "avr-none" {
+            command.args(["--disassemble", "--demangle", "--no-show-raw-insn"]);
+        } else {
+            command.args([
+                "--disassemble",
+                "--reloc",
+                "--demangle",
+                "--no-show-raw-insn",
+            ]);
+        }
+        return Ok((command, path.display().to_string()));
+    }
     if config.target.starts_with("avr-") || config.target == "avr-none" {
         // LLVM's AVR decoder currently prints ordinary CALL instructions as
         // `<unknown>`, losing the linked target labels needed for attribution.
         // GNU avr-objdump decodes the final ELF and retains those labels.
         let mut command = Command::new("avr-objdump");
         command.args(["--disassemble", "--demangle", "--no-show-raw-insn"]);
-        return Ok((command, "avr-objdump"));
+        return Ok((command, "avr-objdump".into()));
     }
 
     let mut command = Command::new(llvm_objdump()?);
@@ -371,7 +395,7 @@ fn disassembler(config: &PanicAuditConfig) -> Result<(Command, &'static str), Pa
         "--demangle",
         "--no-show-raw-insn",
     ]);
-    Ok((command, "llvm-objdump"))
+    Ok((command, "llvm-objdump".into()))
 }
 
 fn llvm_objdump() -> Result<PathBuf, PanicAuditError> {
@@ -379,7 +403,19 @@ fn llvm_objdump() -> Result<PathBuf, PanicAuditError> {
         .args(["--print", "sysroot"])
         .output()
         .map_err(error)?;
+    if !sysroot.status.success() {
+        return Err(PanicAuditError(format!(
+            "rustc --print sysroot failed: {}",
+            String::from_utf8_lossy(&sysroot.stderr)
+        )));
+    }
     let version = Command::new("rustc").arg("-vV").output().map_err(error)?;
+    if !version.status.success() {
+        return Err(PanicAuditError(format!(
+            "rustc -vV failed: {}",
+            String::from_utf8_lossy(&version.stderr)
+        )));
+    }
     let version_text = String::from_utf8_lossy(&version.stdout);
     let host = version_text
         .lines()
@@ -428,6 +464,7 @@ mod tests {
                 .collect(),
             expected_negatives: vec!["panic_audit__neg__bounds".into()],
             extra_cargo_args: vec![],
+            objdump: None,
             json_out: None,
         }
     }
@@ -464,5 +501,13 @@ mod tests {
                 "{symbol}"
             );
         }
+    }
+
+    #[test]
+    fn preserves_example_hyphens_but_normalizes_staticlib_names() {
+        let mut config = base_config();
+        assert_eq!(requested_artifact_name(&config, Some("my-lib")), "my_lib");
+        config.artifact_kind = ArtifactKind::Example;
+        assert_eq!(requested_artifact_name(&config, Some("my-ex")), "my-ex");
     }
 }

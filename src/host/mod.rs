@@ -15,6 +15,7 @@ mod ctgrind_macros;
 mod elf;
 pub mod isa;
 mod model;
+#[cfg(feature = "campaign")]
 pub mod panic_audit;
 mod parser;
 mod render;

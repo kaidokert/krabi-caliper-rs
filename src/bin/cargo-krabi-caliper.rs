@@ -59,6 +59,9 @@ enum Command {
         expect_negative: Vec<String>,
         #[arg(long)]
         cargo_arg: Vec<OsString>,
+        /// Override llvm-objdump or avr-objdump discovery.
+        #[arg(long)]
+        objdump: Option<PathBuf>,
         #[arg(long)]
         json: Option<PathBuf>,
     },
@@ -245,6 +248,7 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             forbidden_target,
             expect_negative,
             cargo_arg,
+            objdump,
             json,
         } => {
             let report = run_panic_audit(&PanicAuditConfig {
@@ -272,6 +276,7 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
                 },
                 expected_negatives: expect_negative,
                 extra_cargo_args: cargo_arg,
+                objdump,
                 json_out: json,
             })?;
             report.print_human();
