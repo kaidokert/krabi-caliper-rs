@@ -7,6 +7,7 @@
 //! [`ReadCounter`] adapts an application-owned monotonically increasing reader
 //! without imposing a HAL, PAC, runtime, or board framework.
 
+pub mod backends;
 pub mod core;
 pub mod protocol;
 
@@ -17,3 +18,6 @@ pub use core::sample::{SampleSet, Summary, SummaryError};
 #[cfg(feature = "stack")]
 pub use core::stack;
 pub use protocol::report;
+
+#[cfg(feature = "cortex-m")]
+pub use backends::cortex_m;
