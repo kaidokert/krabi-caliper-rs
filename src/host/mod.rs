@@ -1,6 +1,8 @@
 //! Owned host-side protocol evidence and report rendering.
 
 pub mod backends;
+#[cfg(feature = "campaign")]
+pub mod campaign;
 mod elf;
 mod model;
 mod parser;

@@ -39,6 +39,8 @@ subsequent reviewed changes.
   ELF footprint extraction, and Welch timing analysis.
 - Visible process-group-aware command execution, host timestamp boundaries,
   and a portable simavr Cargo runner.
+- Optional declarative campaign profiles with checked inheritance, capability
+  requirements, venue binding expansion, and secret-redacted evidence.
 
 ```sh
 cargo test --all-features
