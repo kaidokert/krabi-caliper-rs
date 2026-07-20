@@ -28,6 +28,8 @@ changes.
 - Optional Cortex-M DWT cycle counting on supported cores, with
   application-owned peripherals and critical-section implementation. The
   `cortex-m-dwt` feature intentionally rejects ARMv6-M targets.
+- Optional machine-mode RISC-V `mcycle` and `minstret` adapters with atomic
+  RV32 high/low snapshots and compiler ordering boundaries.
 
 ```sh
 cargo test --all-features

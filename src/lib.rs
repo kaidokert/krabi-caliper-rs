@@ -21,3 +21,9 @@ pub use protocol::report;
 
 #[cfg(feature = "cortex-m")]
 pub use backends::cortex_m;
+
+#[cfg(all(
+    feature = "risc-v",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
+pub use backends::risc_v;

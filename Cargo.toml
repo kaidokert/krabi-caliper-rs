@@ -16,6 +16,7 @@ paired = []
 stack = []
 cortex-m = ["dep:cortex-m"]
 cortex-m-dwt = ["cortex-m", "dep:critical-section"]
+risc-v = []
 
 [dependencies]
 cortex-m = { version = "0.7", optional = true }
