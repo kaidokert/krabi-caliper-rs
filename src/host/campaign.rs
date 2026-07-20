@@ -14,7 +14,7 @@ use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-use super::{CommandRunner, CommandSpec, CompletionAction};
+use super::CompletionAction;
 
 include!("campaign/config.rs");
 

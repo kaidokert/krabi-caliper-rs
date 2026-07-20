@@ -34,7 +34,7 @@ impl ToolkitConfig {
                 || campaign.cases.as_slice(),
                 |case_set| self.case_sets[case_set].as_slice(),
             );
-            validate_cases(name, cases)?;
+            validate_cases(name, campaign, cases)?;
             for (axis, values) in &campaign.matrix {
                 if values.is_empty() {
                     return Err(CampaignError::InvalidConfig(format!(
@@ -42,6 +42,7 @@ impl ToolkitConfig {
                     )));
                 }
             }
+            validate_matrix_features(name, campaign)?;
             if let Some(policy) = &campaign.constant_time {
                 validate_constant_time_config(policy)?;
             }
@@ -54,6 +55,12 @@ impl ToolkitConfig {
         let mut profile = self.inherited_profile(name, &mut visiting)?;
         let mut initial_evidence = BTreeMap::new();
         if let Some(raw_venue) = &mut profile.venue {
+            let venue_secrets = self
+                .venues
+                .values()
+                .flat_map(|venue| venue.secret_bindings.iter().cloned())
+                .collect();
+            reject_secret_placeholders(raw_venue, &venue_secrets, "profile venue")?;
             *raw_venue = expand_bindings(
                 raw_venue,
                 &BTreeMap::new(),
@@ -103,17 +110,21 @@ impl ToolkitConfig {
     }
 }
 
-fn validate_cases(campaign: &str, cases: &[CaseConfig]) -> Result<(), CampaignError> {
+fn validate_cases(
+    campaign_name: &str,
+    campaign: &CampaignConfig,
+    cases: &[CaseConfig],
+) -> Result<(), CampaignError> {
     if cases.is_empty() {
         return Err(CampaignError::InvalidConfig(format!(
-            "campaign {campaign:?} has no cases"
+            "campaign {campaign_name:?} has no cases"
         )));
     }
     let mut names = BTreeSet::new();
     for case in cases {
-        if !names.insert(&case.name) {
+        if !names.insert(case.name.as_str()) {
             return Err(CampaignError::InvalidConfig(format!(
-                "campaign {campaign:?} has duplicate case {:?}",
+                "campaign {campaign_name:?} has duplicate case {:?}",
                 case.name
             )));
         }
@@ -131,6 +142,64 @@ fn validate_cases(campaign: &str, cases: &[CaseConfig]) -> Result<(), CampaignEr
                     case.name
                 )));
             }
+        }
+    }
+    if let Some(baseline) = campaign.baseline_case.as_deref() {
+        validate_baseline(campaign_name, "campaign", baseline, &names)?;
+    }
+    for case in cases {
+        if let Some(baseline) = case.baseline.as_deref() {
+            validate_baseline(campaign_name, &case.name, baseline, &names)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_baseline(
+    campaign: &str,
+    owner: &str,
+    baseline: &str,
+    names: &BTreeSet<&str>,
+) -> Result<(), CampaignError> {
+    if names.contains(baseline) {
+        Ok(())
+    } else {
+        Err(CampaignError::InvalidConfig(format!(
+            "campaign {campaign:?} baseline {baseline:?} referenced by {owner:?} is not a case"
+        )))
+    }
+}
+
+fn validate_matrix_features(
+    campaign_name: &str,
+    campaign: &CampaignConfig,
+) -> Result<(), CampaignError> {
+    for template in &campaign.matrix_features {
+        let mut rest = template.as_str();
+        while let Some(start) = rest.find('{') {
+            if rest[..start].contains('}') {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "campaign {campaign_name:?} has unmatched matrix placeholder in {template:?}"
+                )));
+            }
+            let tail = &rest[start + 1..];
+            let end = tail.find('}').ok_or_else(|| {
+                CampaignError::InvalidConfig(format!(
+                    "campaign {campaign_name:?} has unterminated matrix placeholder in {template:?}"
+                ))
+            })?;
+            let axis = &tail[..end];
+            if axis.is_empty() || !campaign.matrix.contains_key(axis) {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "campaign {campaign_name:?} matrix feature references unknown axis {axis:?}"
+                )));
+            }
+            rest = &tail[end + 1..];
+        }
+        if rest.contains('}') {
+            return Err(CampaignError::InvalidConfig(format!(
+                "campaign {campaign_name:?} has unmatched matrix placeholder in {template:?}"
+            )));
         }
     }
     Ok(())
@@ -255,6 +324,48 @@ fn binding_looks_secret(name: &str) -> bool {
     ]
     .iter()
     .any(|part| name.contains(part))
+}
+
+fn reject_secret_placeholders(
+    input: &str,
+    declared_secrets: &BTreeSet<String>,
+    field: &str,
+) -> Result<(), CampaignError> {
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        let tail = &rest[start + 2..];
+        let Some(end) = tail.find('}') else {
+            break;
+        };
+        let name = &tail[..end];
+        if declared_secrets.contains(name) || binding_looks_secret(name) {
+            return Err(CampaignError::InvalidConfig(format!(
+                "{field} must not contain secret binding {name}"
+            )));
+        }
+        rest = &tail[end + 1..];
+    }
+    Ok(())
+}
+
+fn reject_identity_secrets(
+    profile: &ResolvedRunnerProfile,
+    secrets: &BTreeSet<String>,
+) -> Result<(), CampaignError> {
+    reject_secret_placeholders(&profile.target, secrets, "profile target")?;
+    reject_secret_placeholders(&profile.cargo_profile, secrets, "profile cargo-profile")?;
+    for (field, value) in [
+        ("profile board", profile.board.as_deref()),
+        ("profile mcu", profile.mcu.as_deref()),
+        ("profile transport", profile.transport.as_deref()),
+        ("profile probe", profile.probe.as_deref()),
+        ("profile host-usb-path", profile.host_usb_path.as_deref()),
+    ] {
+        if let Some(value) = value {
+            reject_secret_placeholders(value, secrets, field)?;
+        }
+    }
+    Ok(())
 }
 
 fn configuration_identity(profile: &ResolvedRunnerProfile) -> String {
@@ -503,21 +614,13 @@ impl RunnerProfile {
             .ok_or_else(|| {
                 CampaignError::InvalidConfig("runner profile requires runner or preset".to_string())
             })?;
-        let mut target = self
+        let target = self
             .target
             .clone()
             .or_else(|| preset.as_ref().map(|value| value.target.to_string()))
             .ok_or_else(|| {
                 CampaignError::InvalidConfig("runner profile requires target or preset".to_string())
             })?;
-        if target == "host" {
-            target = host_target(self.toolchain.as_deref()).ok_or_else(|| {
-                CampaignError::InvalidConfig(
-                    "runner profile target=host requires a discoverable rustc host triple"
-                        .to_string(),
-                )
-            })?;
-        }
         let executable = self
             .executable
             .clone()
@@ -567,19 +670,13 @@ impl RunnerProfile {
             .map(|value| value.controlled_environment.clone())
             .unwrap_or_default();
         for value in controlled.values_mut() {
-            if secrets
-                .iter()
-                .any(|name| value.contains(&format!("${{{name}}}")))
-            {
-                return Err(CampaignError::InvalidConfig(
-                    "controlled-environment must not contain secret bindings".to_string(),
-                ));
-            }
+            reject_secret_placeholders(value, &secrets, "controlled-environment")?;
             *value = expand_bindings(value, &bindings, &secrets, &mut initial_evidence)?;
         }
         let clock_frequency_hz = match &self.clock_frequency_hz {
             Some(ConfiguredU64::Number(value)) => Some(*value),
             Some(ConfiguredU64::Binding(value)) => {
+                reject_secret_placeholders(value, &secrets, "profile clock-frequency-hz")?;
                 let expanded = expand_bindings(value, &bindings, &secrets, &mut initial_evidence)?;
                 Some(expanded.parse::<u64>().map_err(|_| {
                     CampaignError::InvalidConfig(format!(
@@ -629,15 +726,8 @@ impl RunnerProfile {
             controlled_environment: controlled,
             configuration_identity: String::new(),
         };
+        reject_identity_secrets(&resolved, &secrets)?;
         resolve_profile_bindings(&mut resolved, &bindings, &secrets, initial_evidence)?;
-        if resolved.target == "host" {
-            resolved.target = host_target(resolved.toolchain.as_deref()).ok_or_else(|| {
-                CampaignError::InvalidConfig(
-                    "runner profile target=host requires a discoverable rustc host triple"
-                        .to_string(),
-                )
-            })?;
-        }
         resolved.configuration_identity = configuration_identity(&resolved);
         Ok(resolved)
     }
@@ -789,19 +879,6 @@ fn preset_values(preset: RunnerPreset) -> PresetValues {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(ToString::to_string).collect()
-}
-
-fn host_target(toolchain: Option<&str>) -> Option<String> {
-    let mut spec = CommandSpec::new("rustc", ".").arg("-vV");
-    if let Some(toolchain) = toolchain {
-        spec = spec.env("RUSTUP_TOOLCHAIN", toolchain);
-    }
-    let output = CommandRunner.run(&spec).ok()?;
-    output.success().then_some(())?;
-    String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("host: ").map(ToString::to_string))
 }
 
 fn release_profile() -> String {

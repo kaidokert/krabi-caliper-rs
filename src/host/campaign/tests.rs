@@ -140,8 +140,93 @@ cases = [{ name = "fixture", example = "fixture" }]
     );
 
     let error = config.validate().unwrap_err().to_string();
-    assert!(error.contains("must not contain secret bindings"));
+    assert!(error.contains("must not contain secret binding"));
     assert!(!error.contains("sensitive"));
+}
+
+#[test]
+fn heuristic_secrets_cannot_enter_identity_evidence() {
+    let config = parse(
+        r#"
+[venues.lab]
+bindings = { ACCESS_TOKEN = "sensitive" }
+[profiles.hardware]
+runner = "command"
+target = "thumbv7em-none-eabihf"
+venue = "lab"
+probe = "${ACCESS_TOKEN}"
+[campaigns.test]
+profile = "hardware"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("profile probe"));
+    assert!(error.contains("ACCESS_TOKEN"));
+    assert!(!error.contains("sensitive"));
+}
+
+#[test]
+fn host_toolchain_bindings_validate_without_early_discovery() {
+    let config = parse(
+        r#"
+[venues.host]
+bindings = { TOOLCHAIN = "nightly-caller-pin" }
+[profiles.native]
+runner = "command"
+target = "host"
+toolchain = "${TOOLCHAIN}"
+venue = "host"
+[campaigns.test]
+profile = "native"
+cases = [{ name = "fixture", binary = "fixture" }]
+"#,
+    );
+
+    let profile = config.resolve_profile("native").unwrap();
+    assert_eq!(profile.target, "host");
+    assert_eq!(profile.toolchain.as_deref(), Some("nightly-caller-pin"));
+}
+
+#[test]
+fn validates_baselines_and_matrix_feature_placeholders() {
+    let bad_baseline = parse(
+        r#"
+[profiles.qemu]
+preset = "qemu-cortex-m3"
+[campaigns.test]
+profile = "qemu"
+baseline-case = "missing"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    assert!(
+        bad_baseline
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("is not a case")
+    );
+
+    let bad_matrix = parse(
+        r#"
+[profiles.qemu]
+preset = "qemu-cortex-m3"
+[campaigns.test]
+profile = "qemu"
+matrix = { size = ["small"] }
+matrix-features = ["size-{siz}"]
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    assert!(
+        bad_matrix
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown axis")
+    );
 }
 
 #[test]
