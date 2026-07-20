@@ -11,6 +11,7 @@ mod dwt {
 
     use cortex_m::peripheral::{DCB, DWT};
 
+    use crate::MeasurementPlatform;
     use crate::{Counter, Measurement, Unit};
 
     fn measurement_between(start: u32, end: u32, frequency_hz: Option<u64>) -> Measurement {
@@ -105,6 +106,32 @@ mod dwt {
         })
     }
 
+    /// DWT-backed benchmark platform with interrupt exclusion and barriers.
+    pub struct DwtMeasurementPlatform<'dwt> {
+        counter: DwtCycleCounter<'dwt>,
+    }
+
+    impl<'dwt> DwtMeasurementPlatform<'dwt> {
+        pub fn enable(
+            dcb: &mut DCB,
+            dwt: &'dwt mut DWT,
+            frequency_hz: Option<u64>,
+        ) -> Option<Self> {
+            DwtCycleCounter::enable(dcb, dwt, frequency_hz).map(|counter| Self { counter })
+        }
+    }
+
+    impl MeasurementPlatform for DwtMeasurementPlatform<'_> {
+        #[inline(always)]
+        fn measure(
+            &mut self,
+            batches: usize,
+            operation: impl FnMut() -> bool,
+        ) -> (Measurement, bool) {
+            measure_in_critical_section(&mut self.counter, batches, operation)
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -124,4 +151,12 @@ mod dwt {
 }
 
 #[cfg(all(feature = "cortex-m-dwt", not(krabi_caliper_armv6m)))]
-pub use dwt::{DwtCycleCounter, measure_in_critical_section};
+pub use dwt::{DwtCycleCounter, DwtMeasurementPlatform, measure_in_critical_section};
+
+/// Debugger-safe terminal loop for hardware measurement firmware.
+#[cfg(target_arch = "arm")]
+pub fn park() -> ! {
+    loop {
+        cortex_m::asm::nop();
+    }
+}

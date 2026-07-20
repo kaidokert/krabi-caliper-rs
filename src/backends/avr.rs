@@ -30,6 +30,10 @@ mod atmega2560 {
     use avr_device::interrupt::Mutex;
 
     use super::{extend_timer16, timer_measurement};
+    #[cfg(feature = "stack")]
+    use crate::stack::{DescendingStack, StackConfig};
+    #[cfg(feature = "stack")]
+    use crate::{Benchmark, BenchmarkError, BenchmarkReporter, BenchmarkResult, CounterPlatform};
     use crate::{Counter, Measurement};
 
     static TIMER1_WRAPS: Mutex<Cell<u32>> = Mutex::new(Cell::new(0));
@@ -105,10 +109,42 @@ mod atmega2560 {
             timer_measurement(end.wrapping_sub(start), self.frequency_hz, end < start)
         }
     }
+
+    /// Runs a repeated Timer1 benchmark with a caller-owned stack allocation.
+    ///
+    /// # Safety
+    /// The caller must uphold [`Benchmark::run_with_stack`]'s exclusive stack
+    /// access contract for the supplied allocation.
+    #[cfg(feature = "stack")]
+    pub unsafe fn run_benchmark<const N: usize, R: BenchmarkReporter>(
+        timer: &mut TC1,
+        frequency_hz: Option<u64>,
+        reporter: &mut R,
+        benchmark: &Benchmark<'_, N>,
+        stack: &impl DescendingStack,
+        stack_config: StackConfig,
+        operation: impl FnMut() -> bool,
+    ) -> Result<BenchmarkResult<N>, BenchmarkError<R::Error>> {
+        let counter = Timer1Counter::start_prescale_1024(timer, frequency_hz);
+        let mut platform = CounterPlatform::new(counter);
+        unsafe { benchmark.run_with_stack(&mut platform, reporter, stack, stack_config, operation) }
+    }
+
+    /// Terminates a simavr fixture after reporting without burning host CPU.
+    pub fn park_simavr() -> ! {
+        avr_device::interrupt::disable();
+        loop {
+            // SAFETY: interrupts are disabled and sleep is the terminal
+            // instruction expected by the simulator.
+            unsafe { core::arch::asm!("sleep") }
+        }
+    }
 }
 
+#[cfg(all(feature = "avr-atmega2560", target_arch = "avr", feature = "stack"))]
+pub use atmega2560::run_benchmark as run_atmega2560_benchmark;
 #[cfg(all(feature = "avr-atmega2560", target_arch = "avr"))]
-pub use atmega2560::{Timer1Counter as Atmega2560Timer1Counter, timer1_overflow};
+pub use atmega2560::{Timer1Counter as Atmega2560Timer1Counter, park_simavr, timer1_overflow};
 
 #[cfg(test)]
 mod tests {

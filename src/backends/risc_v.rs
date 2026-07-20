@@ -2,6 +2,10 @@
 
 use core::arch::asm;
 
+#[cfg(feature = "stack")]
+use crate::stack::{DescendingStack, StackConfig};
+#[cfg(feature = "stack")]
+use crate::{Benchmark, BenchmarkError, BenchmarkReporter, BenchmarkResult, CounterPlatform};
 use crate::{Counter, Measurement, Unit};
 
 const CSR_MCYCLE: usize = 0xB00;
@@ -114,5 +118,30 @@ impl Counter for MinstretCounter {
     #[inline(always)]
     fn elapsed(&mut self, start: Self::Instant) -> Measurement {
         elapsed_measurement(start, self.now(), Unit::Instructions, None)
+    }
+}
+
+/// Runs a repeated cycle benchmark with a caller-owned stack allocation.
+///
+/// # Safety
+/// The caller must uphold [`Benchmark::run_with_stack`]'s exclusive stack
+/// access contract for the supplied allocation.
+#[cfg(feature = "stack")]
+pub unsafe fn run_benchmark<const N: usize, R: BenchmarkReporter>(
+    cycle_frequency_hz: Option<u64>,
+    reporter: &mut R,
+    benchmark: &Benchmark<'_, N>,
+    stack: &impl DescendingStack,
+    stack_config: StackConfig,
+    operation: impl FnMut() -> bool,
+) -> Result<BenchmarkResult<N>, BenchmarkError<R::Error>> {
+    let mut platform = CounterPlatform::new(McycleCounter::new(cycle_frequency_hz));
+    unsafe { benchmark.run_with_stack(&mut platform, reporter, stack, stack_config, operation) }
+}
+
+/// Parks a QEMU-style RISC-V target after reporting.
+pub fn park() -> ! {
+    loop {
+        core::hint::spin_loop();
     }
 }
