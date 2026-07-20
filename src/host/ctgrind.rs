@@ -199,7 +199,9 @@ pub fn mark_undefined(address: *const u8, len: usize) {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn mark_undefined(_: *const u8, _: usize) {}
+pub fn mark_undefined(_: *const u8, _: usize) {
+    panic!("CT-grind memory marking is supported only on Linux");
+}
 
 #[cfg(target_os = "linux")]
 pub fn mark_defined(address: *const u8, len: usize) {
@@ -213,7 +215,9 @@ pub fn mark_defined(address: *const u8, len: usize) {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn mark_defined(_: *const u8, _: usize) {}
+pub fn mark_defined(_: *const u8, _: usize) {
+    panic!("CT-grind memory marking is supported only on Linux");
+}
 
 #[cfg(test)]
 mod tests {

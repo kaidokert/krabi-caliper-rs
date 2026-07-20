@@ -82,21 +82,19 @@ macro_rules! ctgrind_standard_controls {
         $crate::ctgrind_fixture!(nct_fix__neg__caliper_branch, {
             let secret = core::hint::black_box([0u8; 32]);
             $crate::host::ctgrind::taint(&secret);
-            let observed = if secret[0] & 1 == 0 {
-                core::hint::black_box(1u8)
-            } else {
-                core::hint::black_box(2u8)
-            };
+            let mut observed = 0u8;
+            if secret[0] & 1 == 0 {
+                unsafe { core::ptr::write_volatile(&mut observed, 1) };
+            }
             core::hint::black_box(observed);
         });
         $crate::ctgrind_fixture!(nct_fix__neg__caliper_equality, {
             let secret = core::hint::black_box([0u8; 32]);
             $crate::host::ctgrind::taint(&secret);
-            let observed = if secret[0] == 42 {
-                core::hint::black_box(1u8)
-            } else {
-                core::hint::black_box(2u8)
-            };
+            let mut observed = 0u8;
+            if secret[0] == 42 {
+                unsafe { core::ptr::write_volatile(&mut observed, 1) };
+            }
             core::hint::black_box(observed);
         });
         $crate::ctgrind_fixture!(nct_fix__neg__caliper_index, {
