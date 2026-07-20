@@ -73,6 +73,7 @@ mod atmega2560 {
         /// its overflow interrupt, then starts it with the `/1024` prescaler.
         pub fn start_prescale_1024(timer: &'timer mut TC1, frequency_hz: Option<u64>) -> Self {
             timer.tccr1b.write(|writer| writer.cs1().no_clock());
+            timer.tccr1a.reset();
             avr_device::interrupt::free(|cs| TIMER1_WRAPS.borrow(cs).set(0));
             timer.tifr1.write(|writer| writer.tov1().set_bit());
             timer.timsk1.write(|writer| writer.toie1().set_bit());
