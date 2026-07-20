@@ -26,7 +26,8 @@ changes.
 - Optional downward-growing stack painting, high-water measurement, and
   chunked occupancy inspection behind an application-supplied memory contract.
 - Optional Cortex-M DWT cycle counting on supported cores, with
-  application-owned peripherals and critical-section implementation.
+  application-owned peripherals and critical-section implementation. The
+  `cortex-m-dwt` feature intentionally rejects ARMv6-M targets.
 
 ```sh
 cargo test --all-features

@@ -1,6 +1,11 @@
 //! Cortex-M measurement adapters.
 
-#[cfg(feature = "cortex-m-dwt")]
+#[cfg(all(feature = "cortex-m-dwt", krabi_caliper_armv6m))]
+compile_error!(
+    "the `cortex-m-dwt` feature requires a DWT-capable core and is unavailable on ARMv6-M"
+);
+
+#[cfg(all(feature = "cortex-m-dwt", not(krabi_caliper_armv6m)))]
 mod dwt {
     use core::hint::black_box;
 
@@ -18,8 +23,9 @@ mod dwt {
     /// The Cortex-M DWT 32-bit core-cycle counter.
     ///
     /// The application retains ownership of the peripheral handles and core
-    /// clock configuration. Measurements are valid only when the measured
-    /// interval is known to remain below one complete 32-bit counter period.
+    /// clock configuration. No other code may read, reset, or reconfigure
+    /// CYCCNT while this adapter is active. Measurements are valid only when
+    /// the interval remains below one complete 32-bit counter period.
     pub struct DwtCycleCounter<'dwt> {
         dwt: &'dwt mut DWT,
         frequency_hz: Option<u64>,
@@ -36,10 +42,14 @@ mod dwt {
                 return None;
             }
             dcb.enable_trace();
+            DWT::unlock();
             dwt.set_cycle_count(0);
             dwt.enable_cycle_counter();
             cortex_m::asm::dsb();
             cortex_m::asm::isb();
+            if !DWT::cycle_counter_enabled() {
+                return None;
+            }
             Some(Self { dwt, frequency_hz })
         }
 
@@ -69,9 +79,11 @@ mod dwt {
 
     /// Measures one or more calls inside a critical section with DWT barriers.
     ///
-    /// The application must provide the `critical-section` implementation
-    /// appropriate for its processor, runtime, and scheduler. The measured
-    /// interval must remain below one complete 32-bit CYCCNT period.
+    /// This resets CYCCNT before every interval and therefore requires
+    /// exclusive use of that counter. The application must provide the
+    /// `critical-section` implementation appropriate for its processor,
+    /// runtime, and scheduler. The measured interval must remain below one
+    /// complete 32-bit CYCCNT period.
     #[inline(always)]
     pub fn measure_in_critical_section(
         counter: &mut DwtCycleCounter<'_>,
@@ -111,5 +123,5 @@ mod dwt {
     }
 }
 
-#[cfg(feature = "cortex-m-dwt")]
+#[cfg(all(feature = "cortex-m-dwt", not(krabi_caliper_armv6m)))]
 pub use dwt::{DwtCycleCounter, measure_in_critical_section};
