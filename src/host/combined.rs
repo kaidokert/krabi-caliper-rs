@@ -56,12 +56,25 @@ impl CombinedCtEvidence {
             dwt_elf = Path::new(workspace).join(dwt_elf);
         }
         let etm_elf = etm_elf.into();
-        let same_elf = fs::read(&dwt_elf)
+        let dwt_len = fs::metadata(&dwt_elf)
             .map_err(|error| format!("{}: {error}", dwt_elf.display()))?
-            == fs::read(&etm_elf).map_err(|error| format!("{}: {error}", etm_elf.display()))?;
+            .len();
+        let etm_len = fs::metadata(&etm_elf)
+            .map_err(|error| format!("{}: {error}", etm_elf.display()))?
+            .len();
+        let same_elf = dwt_len == etm_len
+            && fs::read(&dwt_elf).map_err(|error| format!("{}: {error}", dwt_elf.display()))?
+                == fs::read(&etm_elf).map_err(|error| format!("{}: {error}", etm_elf.display()))?;
+        let has_dwt_ct_evidence = case_report
+            .result
+            .as_ref()
+            .is_some_and(|result| !result.welch_analyses.is_empty());
         let verdict = if !same_elf {
             CombinedCtVerdict::IncomparableArtifacts
-        } else if case_report.status == CaseStatus::Pass && etm.status == "PASS" {
+        } else if has_dwt_ct_evidence
+            && case_report.status == CaseStatus::Pass
+            && etm.status == "PASS"
+        {
             CombinedCtVerdict::Pass
         } else {
             CombinedCtVerdict::Fail
@@ -136,10 +149,12 @@ pub fn read_combined_inputs(
     etm_report: &Path,
     etm_elf: &Path,
 ) -> Result<CombinedCtEvidence, String> {
-    let campaign = serde_json::from_slice(&fs::read(campaign).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())?;
-    let etm = serde_json::from_slice(&fs::read(etm_report).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())?;
+    let campaign =
+        serde_json::from_reader(fs::File::open(campaign).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let etm =
+        serde_json::from_reader(fs::File::open(etm_report).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
     CombinedCtEvidence::from_reports(campaign, case, etm, etm_elf)
 }
 
@@ -148,7 +163,7 @@ mod tests {
     use super::*;
     use crate::host::{
         BuildMetadata, CargoTarget, CaseReport, ReproducibilityMetadata, SourceMetadata,
-        TargetMetadata,
+        TargetMetadata, WelchAnalysis, WelchVerdict,
     };
     use std::collections::BTreeMap;
     use std::vec;
@@ -181,7 +196,23 @@ mod tests {
                 run_duration_ms: None,
                 status: CaseStatus::Pass,
                 error: None,
-                result: None,
+                result: Some(crate::host::RunResult {
+                    welch_analyses: vec![WelchAnalysis {
+                        fixture: "fixture".to_string(),
+                        class: "protected".to_string(),
+                        a_samples: 100,
+                        b_samples: 100,
+                        mean_a: Some(10.0),
+                        mean_b: Some(10.0),
+                        variance_a: Some(1.0),
+                        variance_b: Some(1.0),
+                        t_statistic: Some(0.0),
+                        degrees_of_freedom: Some(198.0),
+                        threshold: 4.5,
+                        verdict: WelchVerdict::BelowThreshold,
+                    }],
+                    ..crate::host::RunResult::default()
+                }),
             }],
         }
     }
@@ -232,6 +263,26 @@ mod tests {
         let report =
             CombinedCtEvidence::from_reports(campaign(dwt), "fixture", etm(), &etm_path).unwrap();
         assert_eq!(report.verdict, CombinedCtVerdict::IncomparableArtifacts);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn combined_pass_requires_dwt_constant_time_evidence() {
+        let root =
+            std::env::temp_dir().join(format!("krabi-caliper-no-dwt-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let elf = root.join("firmware.elf");
+        fs::write(&elf, b"same").unwrap();
+        let mut campaign = campaign(elf.clone());
+        campaign.cases[0]
+            .result
+            .as_mut()
+            .unwrap()
+            .welch_analyses
+            .clear();
+
+        let report = CombinedCtEvidence::from_reports(campaign, "fixture", etm(), &elf).unwrap();
+        assert_eq!(report.verdict, CombinedCtVerdict::Fail);
         fs::remove_dir_all(root).unwrap();
     }
 }

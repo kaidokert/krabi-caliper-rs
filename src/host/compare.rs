@@ -203,7 +203,7 @@ impl ComparisonReport {
                 if case.status_regression {
                     writeln!(
                         output,
-                        "| {} | gate-status | {:?} | {:?} | — | — | — | REGRESSION |",
+                        "| {} | gate-status | — | {:?} | {:?} | — | — | — | REGRESSION |",
                         case.id, case.baseline_status, case.current_status
                     )
                     .unwrap();
@@ -528,10 +528,13 @@ fn compare_case(
             let delta = i128::from(*current) - i128::from(*baseline);
             let percent_delta = (*baseline != 0).then_some(delta as f64 * 100.0 / *baseline as f64);
             let absolute_regression = allowed.is_some_and(|limit| delta > i128::from(limit));
-            let percent_regression = policy
-                .max_percent_increase
-                .zip(percent_delta)
-                .is_some_and(|(limit, percent)| percent > limit);
+            let percent_regression = match (policy.max_percent_increase, percent_delta) {
+                (Some(limit), Some(percent)) => percent > limit,
+                (Some(_), None) if delta > 0 => {
+                    allowed.is_none_or(|limit| delta > i128::from(limit))
+                }
+                _ => false,
+            };
             let regression = match metric_policy {
                 MetricPolicy::Informational => false,
                 MetricPolicy::LowerIsBetter => {
@@ -593,7 +596,7 @@ fn metrics(case: &CaseReport) -> BTreeMap<String, (MetricKind, u64, MetricPolicy
                     (MetricKind::Stack, stack, MetricPolicy::LowerIsBetter),
                 );
             }
-            for measurement in &result.measurements {
+            for (sample, measurement) in result.measurements.iter().enumerate() {
                 let counter = measurement
                     .fields
                     .get("counter")
@@ -601,8 +604,8 @@ fn metrics(case: &CaseReport) -> BTreeMap<String, (MetricKind, u64, MetricPolicy
                     .unwrap_or("primary");
                 metrics.insert(
                     format!(
-                        "ticks:{benchmark}:{counter}:{}",
-                        unit_name(measurement.unit)
+                        "ticks:{benchmark}:{counter}:{}:sample:{sample}",
+                        unit_name(measurement.unit),
                     ),
                     (
                         MetricKind::Ticks,
@@ -611,12 +614,12 @@ fn metrics(case: &CaseReport) -> BTreeMap<String, (MetricKind, u64, MetricPolicy
                     ),
                 );
             }
-            for metric in &result.metrics {
+            for (sample, metric) in result.metrics.iter().enumerate() {
                 metrics.insert(
                     format!(
-                        "metric:{benchmark}:{}:{}",
+                        "metric:{benchmark}:{}:{}:sample:{sample}",
                         metric.name,
-                        metric.unit.as_deref().unwrap_or("none")
+                        metric.unit.as_deref().unwrap_or("none"),
                     ),
                     (MetricKind::Application, metric.value, metric.policy),
                 );
@@ -691,7 +694,7 @@ fn unit_name(unit: OwnedUnit) -> &'static str {
 }
 
 pub fn read_campaign(path: &Path) -> Result<CampaignReport, Box<dyn std::error::Error>> {
-    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
 }
 
 #[cfg(test)]
@@ -889,7 +892,7 @@ mod tests {
         let metric = report.cases[0]
             .metrics
             .iter()
-            .find(|value| value.name == "metric:bench:bytes:bytes")
+            .find(|value| value.name == "metric:bench:bytes:bytes:sample:0")
             .unwrap();
         assert_eq!(metric.kind, MetricKind::Application);
         assert!(metric.regression);
@@ -971,6 +974,99 @@ mod tests {
     }
 
     #[test]
+    fn repeated_measurements_and_metrics_keep_sample_identity() {
+        let mut baseline = campaign();
+        let benchmark = baseline.cases[0]
+            .result
+            .as_mut()
+            .unwrap()
+            .benchmarks
+            .get_mut("bench")
+            .unwrap();
+        benchmark
+            .measurements
+            .push(benchmark.measurements[0].clone());
+        let metric = MetricEvent {
+            schema: 1,
+            benchmark: "bench".to_string(),
+            name: "bytes".to_string(),
+            value: 10,
+            unit: Some("bytes".to_string()),
+            policy: MetricPolicy::LowerIsBetter,
+            fields: BTreeMap::new(),
+        };
+        benchmark.metrics.extend([metric.clone(), metric]);
+
+        let mut current = baseline.clone();
+        let benchmark = current.cases[0]
+            .result
+            .as_mut()
+            .unwrap()
+            .benchmarks
+            .get_mut("bench")
+            .unwrap();
+        benchmark.measurements[0].ticks += 1;
+        benchmark.metrics[0].value += 1;
+
+        let report = compare(&baseline, &current);
+        assert_eq!(report.status, ComparisonStatus::Regression);
+        assert!(
+            report.cases[0]
+                .metrics
+                .iter()
+                .any(|metric| metric.name.ends_with("sample:0") && metric.regression)
+        );
+
+        current.cases[0]
+            .result
+            .as_mut()
+            .unwrap()
+            .benchmarks
+            .get_mut("bench")
+            .unwrap()
+            .measurements
+            .pop();
+        assert_eq!(
+            compare(&baseline, &current).status,
+            ComparisonStatus::Incompatible
+        );
+    }
+
+    #[test]
+    fn zero_baseline_growth_requires_an_absolute_allowance() {
+        let mut baseline = campaign();
+        baseline.cases[0].footprint.as_mut().unwrap().flash_bytes = 0;
+        let mut current = baseline.clone();
+        current.cases[0].footprint.as_mut().unwrap().flash_bytes = 1;
+
+        let percent_only = ComparisonPolicy {
+            max_percent_increase: Some(100.0),
+            ..ComparisonPolicy::default()
+        };
+        assert_eq!(
+            compare_campaigns("baseline", &baseline, "current", &current, percent_only).status,
+            ComparisonStatus::Regression
+        );
+
+        let with_absolute_allowance = ComparisonPolicy {
+            max_flash_increase: Some(1),
+            max_percent_increase: Some(100.0),
+            ..ComparisonPolicy::default()
+        };
+        assert_eq!(
+            compare_campaigns(
+                "baseline",
+                &baseline,
+                "current",
+                &current,
+                with_absolute_allowance,
+            )
+            .status,
+            ComparisonStatus::Pass
+        );
+    }
+
+    #[test]
     fn rejects_environment_and_case_set_mismatches() {
         let baseline = campaign();
         let mut current = baseline.clone();
@@ -993,6 +1089,22 @@ mod tests {
         assert_eq!(
             compare(&baseline, &current).status,
             ComparisonStatus::Incompatible
+        );
+    }
+
+    #[test]
+    fn missing_required_environment_evidence_is_incompatible() {
+        let mut baseline = campaign();
+        baseline.cases[0].environment.target.mcu = None;
+        let current = baseline.clone();
+
+        let report = compare(&baseline, &current);
+        assert_eq!(report.status, ComparisonStatus::Incompatible);
+        assert!(
+            report
+                .incompatibilities
+                .iter()
+                .any(|issue| issue.field == "mcu")
         );
     }
 
@@ -1038,9 +1150,12 @@ mod tests {
         let mut current = baseline.clone();
         current.cases[0].status = CaseStatus::WorkloadFail;
 
-        assert_eq!(
-            compare(&baseline, &current).status,
-            ComparisonStatus::Regression
+        let report = compare(&baseline, &current);
+        assert_eq!(report.status, ComparisonStatus::Regression);
+        assert!(
+            report.render_markdown().contains(
+                "| case | gate-status | — | Pass | WorkloadFail | — | — | — | REGRESSION |"
+            )
         );
     }
 }
