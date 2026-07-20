@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -30,10 +30,16 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut arguments = cli.arguments;
-    let artifact = PathBuf::from(arguments.pop().expect("clap requires an artifact"));
+    let (arguments, artifact, artifact_args) = match split_arguments(cli.arguments) {
+        Ok(parts) => parts,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut invocation = SimavrInvocation::new(artifact)
         .args(arguments)
+        .artifact_args(artifact_args)
         .executable(cli.executable)
         .timeout(Duration::from_secs(cli.timeout));
     if let Some(marker) = cli.completion_marker {
@@ -65,27 +71,45 @@ fn main() -> ExitCode {
     }
 }
 
+fn split_arguments(
+    arguments: Vec<OsString>,
+) -> Result<(Vec<OsString>, PathBuf, Vec<OsString>), &'static str> {
+    let artifact_index = arguments
+        .iter()
+        .position(|argument| Path::new(argument).is_file())
+        .ok_or("firmware artifact argument is missing or does not exist")?;
+    let mut before = arguments;
+    let after = before.split_off(artifact_index + 1);
+    let artifact = PathBuf::from(before.pop().expect("artifact index exists"));
+    Ok((before, artifact, after))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_cargo_runner_argument_shape() {
+        let artifact = std::env::current_exe().unwrap();
         let cli = Cli::try_parse_from([
-            "krabi-caliper-simavr",
-            "-t",
-            "30",
-            "--completion-marker",
-            "status:PASS",
-            "-m",
-            "atmega2560",
-            "-f",
-            "16000000",
-            "target/firmware.elf",
+            OsString::from("krabi-caliper-simavr"),
+            OsString::from("-t"),
+            OsString::from("30"),
+            OsString::from("--completion-marker"),
+            OsString::from("status:PASS"),
+            OsString::from("-m"),
+            OsString::from("atmega2560"),
+            OsString::from("-f"),
+            OsString::from("16000000"),
+            artifact.clone().into_os_string(),
+            OsString::from("--app-arg"),
         ])
         .unwrap();
         assert_eq!(cli.timeout, 30);
         assert_eq!(cli.completion_marker.as_deref(), Some("status:PASS"));
-        assert_eq!(cli.arguments.last().unwrap(), "target/firmware.elf");
+        let (simavr_args, parsed_artifact, artifact_args) = split_arguments(cli.arguments).unwrap();
+        assert_eq!(parsed_artifact, artifact);
+        assert_eq!(simavr_args.last().unwrap(), "16000000");
+        assert_eq!(artifact_args, [OsString::from("--app-arg")]);
     }
 }

@@ -18,6 +18,7 @@ use super::{CommandError, CommandOutput, CommandRunner, CommandSpec, CompletionA
 pub struct SimavrInvocation {
     pub artifact: PathBuf,
     pub args: Vec<OsString>,
+    pub artifact_args: Vec<OsString>,
     pub completion_marker: Option<Vec<u8>>,
     pub executable: OsString,
     pub timeout: Duration,
@@ -28,6 +29,7 @@ impl SimavrInvocation {
         Self {
             artifact: artifact.into(),
             args: Vec::new(),
+            artifact_args: Vec::new(),
             completion_marker: None,
             executable: OsString::from("simavr"),
             timeout: Duration::from_secs(60),
@@ -41,6 +43,11 @@ impl SimavrInvocation {
 
     pub fn executable(mut self, executable: impl Into<OsString>) -> Self {
         self.executable = executable.into();
+        self
+    }
+
+    pub fn artifact_args(mut self, args: impl IntoIterator<Item = impl Into<OsString>>) -> Self {
+        self.artifact_args.extend(args.into_iter().map(Into::into));
         self
     }
 
@@ -89,6 +96,7 @@ fn posix_spec(invocation: &SimavrInvocation, cwd: &Path) -> CommandSpec {
         CommandSpec::new(&invocation.executable, cwd)
             .args(invocation.args.iter())
             .arg(&invocation.artifact)
+            .args(invocation.artifact_args.iter())
             .timeout(invocation.timeout),
     )
 }
@@ -109,6 +117,7 @@ fn wsl_spec(invocation: &SimavrInvocation, cwd: &Path, artifact: &OsStr) -> Comm
             .arg(&invocation.executable)
             .args(invocation.args.iter())
             .arg(artifact)
+            .args(invocation.artifact_args.iter())
             .timeout(invocation.timeout + Duration::from_secs(2)),
     )
 }
@@ -227,5 +236,16 @@ mod tests {
         let spec = posix_spec(&invocation, Path::new("/repo"));
         assert_eq!(spec.completion_marker, Some(b"status:PASS".to_vec()));
         assert_eq!(spec.completion_action, CompletionAction::Kill);
+    }
+
+    #[test]
+    fn artifact_arguments_follow_the_firmware_path() {
+        let invocation = invocation().artifact_args(["--app-arg"]);
+        let spec = posix_spec(&invocation, Path::new("/repo"));
+        assert_eq!(spec.args.last(), Some(&OsString::from("--app-arg")));
+        assert_eq!(
+            spec.args[spec.args.len() - 2],
+            OsString::from("firmware.elf")
+        );
     }
 }

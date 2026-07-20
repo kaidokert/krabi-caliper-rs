@@ -3,7 +3,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{CommandRunner, CommandSpec};
 
@@ -12,6 +12,7 @@ use super::{CommandRunner, CommandSpec};
 pub struct TimestampedCommandOutput {
     pub status: ExitStatus,
     pub counters_emitted: usize,
+    pub timed_out: bool,
 }
 
 /// Runs a command and emits a host-monotonic counter after every target
@@ -19,15 +20,19 @@ pub struct TimestampedCommandOutput {
 ///
 /// The original stream is forwarded unchanged. Injected `EM_COUNTER` records
 /// use a one-gigahertz timer qualification so their ticks are nanoseconds from
-/// wrapper start. The shared command runner owns process-group cleanup.
+/// wrapper start. The shared command runner owns deadline enforcement and
+/// process-group cleanup.
 pub fn run_timestamped_command(
     program: &OsStr,
     args: &[OsString],
     cwd: &Path,
-    mut stdout_writer: impl Write,
+    timeout: Duration,
+    mut stdout_writer: impl Write + Send + 'static,
     mut stderr_writer: impl Write + Send + 'static,
 ) -> io::Result<TimestampedCommandOutput> {
-    let spec = CommandSpec::new(program, cwd).args(args.iter());
+    let spec = CommandSpec::new(program, cwd)
+        .args(args.iter())
+        .timeout(timeout);
     let mut child = CommandRunner
         .spawn(&spec, Stdio::piped(), Stdio::piped())
         .map_err(io::Error::other)?;
@@ -43,17 +48,30 @@ pub fn run_timestamped_command(
         .expect("piped stderr must exist");
     let stderr_thread = thread::spawn(move || io::copy(&mut stderr, &mut stderr_writer));
     let started = Instant::now();
-    let counters_emitted =
+    let stdout_thread = thread::spawn(move || {
         timestamp_boundaries(BufReader::new(stdout), &mut stdout_writer, || {
             started.elapsed().as_nanos().min(u64::MAX as u128) as u64
-        })?;
-    let status = child.wait().map_err(io::Error::other)?;
+        })
+    });
+    let (status, timed_out) = loop {
+        match child.try_wait().map_err(io::Error::other)? {
+            Some(status) => break (status, false),
+            None if started.elapsed() >= timeout => {
+                break (child.terminate().map_err(io::Error::other)?, true);
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let counters_emitted = stdout_thread
+        .join()
+        .map_err(|_| io::Error::other("stdout timestamp thread panicked"))??;
     stderr_thread
         .join()
         .map_err(|_| io::Error::other("stderr forwarding thread panicked"))??;
     Ok(TimestampedCommandOutput {
         status,
         counters_emitted,
+        timed_out,
     })
 }
 
@@ -154,5 +172,21 @@ EM_BOUNDARY schema:1 benchmark:x trial:0\n";
             timestamp_boundaries(Cursor::new(input), &mut output, || 1).unwrap(),
             0
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminates_a_timestamped_command_at_its_deadline() {
+        let output = run_timestamped_command(
+            OsStr::new("sh"),
+            &[OsString::from("-c"), OsString::from("sleep 10")],
+            Path::new("."),
+            Duration::from_millis(30),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(output.timed_out);
     }
 }
