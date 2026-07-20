@@ -53,6 +53,11 @@ cortex-m-semihosting = { version = "0.5", optional = true }
 serde_json = "1"
 
 [[bin]]
+name = "cargo-krabi-caliper"
+path = "src/bin/cargo-krabi-caliper.rs"
+required-features = ["cli", "campaign"]
+
+[[bin]]
 name = "krabi-caliper-simavr"
 path = "src/bin/krabi-caliper-simavr.rs"
 required-features = ["cli"]
