@@ -26,6 +26,6 @@ cargo check --no-default-features
 
 The crate requires Rust 1.86 or newer and uses the Rust 2024 edition.
 
-## Licence
+## License
 
 Licensed under either Apache-2.0 or MIT, at your option.

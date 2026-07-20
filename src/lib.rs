@@ -9,5 +9,5 @@
 
 pub mod core;
 
-pub use core::counter::{Counter, Measurement, Rate, ReadCounter, Unit};
-pub use core::sample::{SampleSet, Summary};
+pub use core::counter::{Counter, Measurement, Nanoseconds, Rate, ReadCounter, Unit};
+pub use core::sample::{SampleSet, Summary, SummaryError};
