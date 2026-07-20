@@ -309,6 +309,9 @@ impl RunResult {
                 if self.target.board.is_none() {
                     self.target.board = value.board.clone();
                 }
+                if self.target.clock_frequency_hz.is_none() {
+                    self.target.clock_frequency_hz = value.frequency_hz;
+                }
                 self.starts.push(value.clone());
             }
             OwnedEvent::Sample(value) => self

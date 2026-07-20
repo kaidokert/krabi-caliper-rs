@@ -1,6 +1,5 @@
 //! Statistical analysis of class-labelled paired timing samples.
 
-use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 
@@ -50,19 +49,15 @@ pub fn analyze_welch(result: &RunResult, threshold: f64) -> Vec<WelchAnalysis> {
     } else {
         DEFAULT_WELCH_THRESHOLD
     };
-    let classes = result
+    result
         .results
         .iter()
         .chain(&result.diagnostics)
-        .map(|comparison| (comparison.fixture.as_str(), comparison))
-        .collect::<BTreeMap<_, _>>();
-    result
-        .samples
-        .iter()
-        .filter_map(|(fixture, samples)| {
-            classes
-                .get(fixture.as_str())
-                .map(|comparison| analyze_fixture(comparison, samples, threshold))
+        .filter_map(|comparison| {
+            result
+                .samples
+                .get(&comparison.fixture)
+                .map(|samples| analyze_fixture(comparison, samples, threshold))
         })
         .collect()
 }
@@ -216,5 +211,19 @@ mod tests {
         let analysis = analyze_welch(&result(&[100, 100], &[101, 101]), 4.5);
         assert_eq!(analysis[0].t_statistic, None);
         assert_eq!(analysis[0].verdict, WelchVerdict::DeterministicDifference);
+    }
+
+    #[test]
+    fn preserves_multiple_classes_for_one_fixture() {
+        let mut result = result(&[99, 100], &[100, 101]);
+        let mut diagnostic = result.results[0].clone();
+        diagnostic.class = "diagnostic".into();
+        diagnostic.status = None;
+        result.diagnostics.push(diagnostic);
+
+        let analyses = analyze_welch(&result, 4.5);
+        assert_eq!(analyses.len(), 2);
+        assert_eq!(analyses[0].class, "positive");
+        assert_eq!(analyses[1].class, "diagnostic");
     }
 }

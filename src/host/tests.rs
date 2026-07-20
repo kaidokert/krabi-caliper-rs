@@ -18,6 +18,7 @@ fn parses_aggregates_and_renders_complete_evidence() {
     assert_eq!(result.status, RunStatus::Pass);
     assert_eq!(result.target.target.as_deref(), Some("thumbv7em"));
     assert_eq!(result.target.board.as_deref(), Some("f407"));
+    assert_eq!(result.target.clock_frequency_hz, Some(168_000_000));
     assert_eq!(result.ignored_lines, 1);
     assert_eq!(result.samples["verify"].len(), 2);
     assert_eq!(result.results.len(), 1);
@@ -57,4 +58,21 @@ fn rejects_ambiguous_duplicate_fields() {
     assert_eq!(error.record.as_deref(), Some("EM_OUTCOME"));
     assert_eq!(error.field.as_deref(), Some("benchmark"));
     assert!(error.message.contains("duplicate"));
+}
+
+#[test]
+fn correlates_wrapped_full_width_counters_without_shifting_by_64() {
+    let mut result = parse(concat!(
+        "EM_BOUNDARY schema:1 benchmark:external trial:0 phase:begin\n",
+        "EM_COUNTER schema:1 benchmark:external trial:0 phase:begin ticks:18446744073709551614 width:64 unit:core-cycles frequency_hz:none\n",
+        "EM_BOUNDARY schema:1 benchmark:external trial:0 phase:end status:PASS\n",
+        "EM_COUNTER schema:1 benchmark:external trial:0 phase:end ticks:2 width:64 unit:core-cycles frequency_hz:none\n",
+    ))
+    .unwrap();
+
+    result.correlate_external(true);
+    assert!(result.external_errors.is_empty());
+    let measurement = &result.benchmarks["external"].measurements[0];
+    assert_eq!(measurement.ticks, 4);
+    assert!(measurement.wrapped);
 }

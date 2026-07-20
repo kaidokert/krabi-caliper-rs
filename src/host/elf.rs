@@ -46,6 +46,7 @@ pub fn read_elf_symbol(path: &Path, name: &str) -> Result<Option<u64>, ElfError>
     Ok(object
         .symbols()
         .chain(object.dynamic_symbols())
+        .filter(|symbol| symbol.is_definition())
         .find(|symbol| symbol.name().ok() == Some(name))
         .map(|symbol| symbol.address()))
 }
@@ -136,11 +137,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_the_current_test_elf() {
-        let footprint =
-            read_elf_footprint(Path::new(std::env::current_exe().unwrap().as_path())).unwrap();
+    fn reads_a_platform_independent_minimal_elf() {
+        const ELF64_HEADER: [u8; 64] = [
+            0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0x3e, 0, 1, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64,
+            0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0,
+        ];
+        let footprint = footprint_from_bytes(&ELF64_HEADER).unwrap();
 
-        assert!(footprint.text_bytes > 0);
+        assert_eq!(footprint.text_bytes, 0);
         assert_eq!(
             footprint.flash_bytes,
             footprint.text_bytes + footprint.read_only_data_bytes + footprint.data_bytes
