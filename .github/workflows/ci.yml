@@ -1,0 +1,45 @@
+name: Rust CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+      - name: Check minimal no_std build
+        run: cargo +stable check --no-default-features
+
+      - name: Run all tests
+        run: cargo +stable test --all-features
+
+      - name: Run Clippy
+        run: cargo +stable clippy --all-targets --all-features -- -D warnings
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc --all-features --no-deps
+
+      - name: Verify package
+        run: cargo +stable package

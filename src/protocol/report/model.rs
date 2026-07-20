@@ -206,16 +206,12 @@ pub struct CounterSnapshotRecord<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "host", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "host", serde(rename_all = "kebab-case"))]
+#[derive(Default)]
 pub enum MetricPolicy {
     LowerIsBetter,
     HigherIsBetter,
+    #[default]
     Informational,
-}
-
-impl Default for MetricPolicy {
-    fn default() -> Self {
-        Self::Informational
-    }
 }
 
 impl MetricPolicy {
