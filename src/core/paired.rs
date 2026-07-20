@@ -29,6 +29,7 @@ pub const BALANCED_8: [Side; 8] = [
 #[cfg_attr(feature = "host", serde(rename_all = "kebab-case"))]
 #[non_exhaustive]
 pub enum RunError {
+    ZeroSampleCapacity,
     OddSampleCapacity,
     BlockCountOverflow,
     CapacityExceeded,
@@ -62,6 +63,9 @@ impl<const N: usize> PairedRunner<N> {
         self,
         mut measure: impl FnMut(Side) -> (Measurement, bool),
     ) -> Result<PairedRun<N>, RunError> {
+        if N == 0 {
+            return Err(RunError::ZeroSampleCapacity);
+        }
         if N % 2 != 0 {
             return Err(RunError::OddSampleCapacity);
         }
@@ -109,20 +113,32 @@ pub struct Comparison {
     pub wrapped: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "host", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "host", serde(rename_all = "kebab-case"))]
+#[non_exhaustive]
+pub enum ComparisonError {
+    Summary(SummaryError),
+    UnequalSampleCounts,
+    WrappedMeasurement,
+}
+
+impl From<SummaryError> for ComparisonError {
+    fn from(error: SummaryError) -> Self {
+        Self::Summary(error)
+    }
+}
+
 impl<const N: usize> PairedRun<N> {
-    pub fn comparison(&self) -> Result<Comparison, SummaryError> {
-        let (a, b) = self.samples.summaries()?;
-        Ok(Comparison {
-            a,
-            b,
-            combined_spread: a.min.min(b.min).abs_diff(a.max.max(b.max)),
-            ranges_overlap: a.min <= b.max && b.min <= a.max,
-            wrapped: a.wrapped || b.wrapped,
-        })
+    pub fn comparison(&self) -> Result<Comparison, ComparisonError> {
+        self.samples.comparison()
     }
 
-    pub fn evaluate(&self, policy: impl ComparisonPolicy) -> Result<bool, SummaryError> {
+    pub fn evaluate(&self, policy: impl ComparisonPolicy) -> Result<bool, ComparisonError> {
         let comparison = self.comparison()?;
+        if comparison.wrapped {
+            return Err(ComparisonError::WrappedMeasurement);
+        }
         Ok(self.outputs_ok && policy.accepts(&comparison))
     }
 }
@@ -177,26 +193,38 @@ impl<const N: usize> PairedSamples<N> {
         }
     }
 
-    pub fn summaries(&self) -> Result<(Summary, Summary), SummaryError> {
+    pub fn summaries(&self) -> Result<(Summary, Summary), ComparisonError> {
+        if self.a.len() != self.b.len() {
+            return Err(ComparisonError::UnequalSampleCounts);
+        }
         let a = self.a.summary()?;
         let b = self.b.summary()?;
         if a.unit != b.unit {
-            return Err(SummaryError::UnitMismatch);
+            return Err(SummaryError::UnitMismatch.into());
         }
         if a.frequency_hz != b.frequency_hz {
-            return Err(SummaryError::FrequencyMismatch);
+            return Err(SummaryError::FrequencyMismatch.into());
         }
         Ok((a, b))
     }
 
-    pub fn combined_spread(&self) -> Result<u64, SummaryError> {
+    pub fn comparison(&self) -> Result<Comparison, ComparisonError> {
         let (a, b) = self.summaries()?;
-        Ok(a.min.min(b.min).abs_diff(a.max.max(b.max)))
+        Ok(Comparison {
+            a,
+            b,
+            combined_spread: a.min.min(b.min).abs_diff(a.max.max(b.max)),
+            ranges_overlap: a.min <= b.max && b.min <= a.max,
+            wrapped: a.wrapped || b.wrapped,
+        })
     }
 
-    pub fn ranges_overlap(&self) -> Result<bool, SummaryError> {
-        let (a, b) = self.summaries()?;
-        Ok(a.min <= b.max && b.min <= a.max)
+    pub fn combined_spread(&self) -> Result<u64, ComparisonError> {
+        Ok(self.comparison()?.combined_spread)
+    }
+
+    pub fn ranges_overlap(&self) -> Result<bool, ComparisonError> {
+        Ok(self.comparison()?.ranges_overlap)
     }
 }
 
@@ -234,7 +262,10 @@ mod tests {
         samples
             .push(Side::B, Measurement::new(100, Unit::TimerTicks))
             .unwrap();
-        assert_eq!(samples.summaries(), Err(SummaryError::UnitMismatch));
+        assert_eq!(
+            samples.summaries(),
+            Err(ComparisonError::Summary(SummaryError::UnitMismatch))
+        );
     }
 
     #[test]
@@ -305,6 +336,10 @@ mod tests {
     #[test]
     fn rejects_odd_capacities_and_propagates_output_failures() {
         assert_eq!(
+            PairedRunner::<0>::new().run(|_| (cycles(1), true)),
+            Err(RunError::ZeroSampleCapacity)
+        );
+        assert_eq!(
             PairedRunner::<3>::new().run(|_| (cycles(1), true)),
             Err(RunError::OddSampleCapacity)
         );
@@ -325,6 +360,33 @@ mod tests {
                 require_overlap: true
             }),
             Ok(false)
+        );
+    }
+
+    #[test]
+    fn rejects_unbalanced_and_wrapped_evidence() {
+        let mut unbalanced = PairedSamples::<2>::new();
+        unbalanced.push(Side::A, cycles(100)).unwrap();
+        assert_eq!(
+            unbalanced.comparison(),
+            Err(ComparisonError::UnequalSampleCounts)
+        );
+
+        let mut wrapped = PairedRun {
+            samples: PairedSamples::<1>::new(),
+            outputs_ok: true,
+        };
+        wrapped
+            .samples
+            .push(Side::A, cycles(100).with_wrapped(true))
+            .unwrap();
+        wrapped.samples.push(Side::B, cycles(100)).unwrap();
+        assert_eq!(
+            wrapped.evaluate(MaxSpread {
+                ticks: 0,
+                require_overlap: true,
+            }),
+            Err(ComparisonError::WrappedMeasurement)
         );
     }
 

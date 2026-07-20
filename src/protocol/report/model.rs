@@ -298,22 +298,6 @@ pub trait Reporter {
 
     fn diagnostic(&mut self, record: &ComparisonRecord<'_>) -> Result<(), Self::Error>;
 
-    #[cfg(feature = "paired")]
-    fn paired_result<const N: usize>(
-        &mut self,
-        record: &PairedResult<'_, N>,
-    ) -> Result<(), Self::Error>
-    where
-        Self: Sized;
-
-    #[cfg(feature = "paired")]
-    fn paired_diagnostic<const N: usize>(
-        &mut self,
-        record: &PairedDiagnostic<'_, N>,
-    ) -> Result<(), Self::Error>
-    where
-        Self: Sized;
-
     fn run_summary(&mut self, record: &RunSummary<'_>) -> Result<(), Self::Error>;
 
     fn measurement(&mut self, record: &MeasurementRecord<'_>) -> Result<(), Self::Error>;
@@ -331,4 +315,18 @@ pub trait Reporter {
     fn counter_snapshot(&mut self, record: &CounterSnapshotRecord<'_>) -> Result<(), Self::Error>;
 
     fn metric(&mut self, record: &MetricRecord<'_>) -> Result<(), Self::Error>;
+}
+
+/// Paired-record extension implemented by reporters that support this feature.
+#[cfg(feature = "paired")]
+pub trait PairedReporter: Reporter {
+    fn paired_result<const N: usize>(
+        &mut self,
+        record: &PairedResult<'_, N>,
+    ) -> Result<(), Self::Error>;
+
+    fn paired_diagnostic<const N: usize>(
+        &mut self,
+        record: &PairedDiagnostic<'_, N>,
+    ) -> Result<(), Self::Error>;
 }
