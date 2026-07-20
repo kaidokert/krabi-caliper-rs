@@ -5,10 +5,11 @@ Portable measurement primitives for embedded Rust targets and host-side
 analysis.
 
 This repository is being assembled through small, dependency-ordered changes.
-The initial API provides architecture-neutral, allocation-free counter and
-sample types suitable for `no_std` firmware. Target counter backends,
-reporting transports, stack measurement, paired constant-time acquisition,
-and host campaign tooling will be added in subsequent reviewed changes.
+The current API provides architecture-neutral, allocation-free counter,
+sample, and reporting types suitable for `no_std` firmware. Target counter
+backends, reporting transports, stack measurement, paired constant-time
+acquisition, and host campaign tooling will be added in subsequent reviewed
+changes.
 
 ## Current API
 
@@ -18,6 +19,8 @@ and host campaign tooling will be added in subsequent reviewed changes.
 - Application-owned counter adaptation through `ReadCounter`.
 - Fixed-capacity raw sample collection and summary statistics without
   allocation.
+- Borrowed typed measurement events and a versioned `EM_*` text encoding for
+  any `core::fmt::Write` sink.
 
 ```sh
 cargo test --all-features

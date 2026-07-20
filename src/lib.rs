@@ -8,6 +8,8 @@
 //! without imposing a HAL, PAC, runtime, or board framework.
 
 pub mod core;
+pub mod protocol;
 
 pub use core::counter::{Counter, Measurement, Nanoseconds, Rate, ReadCounter, Unit};
 pub use core::sample::{SampleSet, Summary, SummaryError};
+pub use protocol::report;
