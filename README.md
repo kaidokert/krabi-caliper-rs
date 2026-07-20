@@ -18,6 +18,8 @@ subsequent reviewed changes.
 - Application-owned counter adaptation through `ReadCounter`.
 - Fixed-capacity raw sample collection and summary statistics without
   allocation.
+- Repeated benchmark lifecycles, external measurement boundaries, paired
+  campaign suites, and reproducible non-cryptographic fixture streams.
 - Borrowed typed measurement events and a versioned `EM_*` text encoding for
   any `core::fmt::Write` sink.
 - Optional balanced paired acquisition and deterministic comparison policies
