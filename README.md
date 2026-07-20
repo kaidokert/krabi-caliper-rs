@@ -25,6 +25,8 @@ changes.
   for constant-time experiments.
 - Optional downward-growing stack painting, high-water measurement, and
   chunked occupancy inspection behind an application-supplied memory contract.
+- Optional Cortex-M DWT cycle counting on supported cores, with
+  application-owned peripherals and critical-section implementation.
 
 ```sh
 cargo test --all-features
