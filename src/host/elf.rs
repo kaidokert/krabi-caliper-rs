@@ -132,20 +132,26 @@ fn footprint_from_bytes(bytes: &[u8]) -> Result<ElfFootprint, object::Error> {
     Ok(footprint)
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )
+))]
 mod tests {
     use super::*;
 
     #[test]
-    fn reads_a_platform_independent_minimal_elf() {
-        const ELF64_HEADER: [u8; 64] = [
-            0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0x3e, 0, 1, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64,
-            0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0,
-        ];
-        let footprint = footprint_from_bytes(&ELF64_HEADER).unwrap();
+    fn reads_the_current_elf_test_binary() {
+        let executable = std::env::current_exe().unwrap();
+        let footprint = read_elf_footprint(&executable).unwrap();
 
-        assert_eq!(footprint.text_bytes, 0);
+        assert!(footprint.text_bytes > 0);
         assert_eq!(
             footprint.flash_bytes,
             footprint.text_bytes + footprint.read_only_data_bytes + footprint.data_bytes

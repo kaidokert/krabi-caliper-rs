@@ -1,11 +1,13 @@
 //! Owned host-side protocol evidence and report rendering.
 
+pub mod backends;
 mod elf;
 mod model;
 mod parser;
 mod render;
 mod stats;
 
+pub use backends::*;
 pub use elf::*;
 pub use model::*;
 pub use parser::{ParseError, ProtocolParser, parse};
