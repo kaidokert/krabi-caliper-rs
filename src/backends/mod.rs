@@ -1,5 +1,8 @@
 //! Architecture-specific target measurement adapters.
 
+#[cfg(feature = "avr")]
+pub mod avr;
+
 #[cfg(feature = "cortex-m")]
 pub mod cortex_m;
 

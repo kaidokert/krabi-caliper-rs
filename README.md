@@ -29,6 +29,8 @@ subsequent reviewed changes.
   `cortex-m-dwt` feature intentionally rejects ARMv6-M targets.
 - Optional machine-mode RISC-V `mcycle` and `minstret` adapters with atomic
   RV32 high/low snapshots and compiler ordering boundaries.
+- Optional ATmega2560 Timer1 wrap extension with application-owned clock and
+  global interrupt policy.
 
 ```sh
 cargo test --all-features

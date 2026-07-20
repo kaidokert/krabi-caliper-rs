@@ -19,6 +19,9 @@ pub use core::sample::{SampleSet, Summary, SummaryError};
 pub use core::stack;
 pub use protocol::report;
 
+#[cfg(feature = "avr")]
+pub use backends::avr;
+
 #[cfg(feature = "cortex-m")]
 pub use backends::cortex_m;
 

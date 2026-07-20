@@ -17,8 +17,11 @@ stack = []
 cortex-m = ["dep:cortex-m"]
 cortex-m-dwt = ["cortex-m", "dep:critical-section"]
 risc-v = []
+avr = []
+avr-atmega2560 = ["avr", "dep:avr-device"]
 
 [dependencies]
+avr-device = { version = "0.7", optional = true, features = ["atmega2560"] }
 cortex-m = { version = "0.7", optional = true }
 critical-section = { version = "1", optional = true }
 serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
