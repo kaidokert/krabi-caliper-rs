@@ -14,4 +14,6 @@ pub use core::counter::{Counter, Measurement, Nanoseconds, Rate, ReadCounter, Un
 #[cfg(feature = "paired")]
 pub use core::paired;
 pub use core::sample::{SampleSet, Summary, SummaryError};
+#[cfg(feature = "stack")]
+pub use core::stack;
 pub use protocol::report;

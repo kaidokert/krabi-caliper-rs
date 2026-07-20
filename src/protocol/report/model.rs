@@ -150,6 +150,14 @@ pub struct RunSummary<'a> {
     pub fields: &'a [Field<'a>],
 }
 
+#[cfg(feature = "stack")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StackRecord<'a> {
+    pub benchmark: &'a str,
+    pub measurement: StackMeasurement,
+    pub fields: &'a [Field<'a>],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MeasurementRecord<'a> {
     pub benchmark: &'a str,
@@ -329,4 +337,10 @@ pub trait PairedReporter: Reporter {
         &mut self,
         record: &PairedDiagnostic<'_, N>,
     ) -> Result<(), Self::Error>;
+}
+
+/// Stack-record extension implemented by reporters that support this feature.
+#[cfg(feature = "stack")]
+pub trait StackReporter: Reporter {
+    fn stack_measurement(&mut self, record: &StackRecord<'_>) -> Result<(), Self::Error>;
 }
