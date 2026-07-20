@@ -19,11 +19,16 @@ cortex-m-dwt = ["cortex-m", "dep:critical-section"]
 risc-v = []
 avr = []
 avr-atmega2560 = ["avr", "dep:avr-device"]
+rtt = ["dep:rtt-target"]
+semihosting = ["dep:cortex-m-semihosting"]
+uart = []
 
 [dependencies]
 avr-device = { version = "0.7", optional = true, features = ["atmega2560"] }
 cortex-m = { version = "0.7", optional = true }
 critical-section = { version = "1", optional = true }
+cortex-m-semihosting = { version = "0.5", optional = true }
+rtt-target = { version = "0.6", optional = true }
 serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
 
 [dev-dependencies]

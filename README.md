@@ -31,6 +31,8 @@ subsequent reviewed changes.
   RV32 high/low snapshots and compiler ordering boundaries.
 - Optional ATmega2560 Timer1 wrap extension with application-owned clock and
   global interrupt policy.
+- Optional RTT, Cortex-M semihosting, and application-owned byte-UART adapters
+  for the same text reporting protocol.
 
 ```sh
 cargo test --all-features
