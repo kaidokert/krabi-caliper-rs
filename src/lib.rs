@@ -7,8 +7,13 @@
 //! [`ReadCounter`] adapts an application-owned monotonically increasing reader
 //! without imposing a HAL, PAC, runtime, or board framework.
 
+#[cfg(feature = "host")]
+extern crate std;
+
 pub mod backends;
 pub mod core;
+#[cfg(feature = "host")]
+pub mod host;
 pub mod protocol;
 
 pub use core::benchmark::{
