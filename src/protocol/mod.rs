@@ -5,7 +5,7 @@ pub mod report;
 #[cfg(feature = "rtt")]
 pub mod rtt;
 
-#[cfg(feature = "semihosting")]
+#[cfg(all(feature = "semihosting", target_arch = "arm", target_os = "none"))]
 pub mod semihosting;
 
 #[cfg(feature = "uart")]
