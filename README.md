@@ -6,10 +6,9 @@ analysis.
 
 This repository is being assembled through small, dependency-ordered changes.
 The current API provides architecture-neutral, allocation-free counter,
-sample, and reporting types suitable for `no_std` firmware. Target counter
-backends, reporting transports, stack measurement, paired constant-time
-acquisition, and host campaign tooling will be added in subsequent reviewed
-changes.
+sample, and reporting types suitable for `no_std` firmware. Additional target
+adapters, reporting transports, and host campaign tooling will be added in
+subsequent reviewed changes.
 
 ## Current API
 
