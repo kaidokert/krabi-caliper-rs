@@ -76,9 +76,10 @@ fn timestamp_boundaries(
                 now(),
             )?;
             counters_emitted += 1;
+            writer.flush()?;
         }
-        writer.flush()?;
     }
+    writer.flush()?;
     Ok(counters_emitted)
 }
 

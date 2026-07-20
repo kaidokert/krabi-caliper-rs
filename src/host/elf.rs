@@ -132,18 +132,20 @@ fn footprint_from_bytes(bytes: &[u8]) -> Result<ElfFootprint, object::Error> {
     Ok(footprint)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(any(
+#[cfg(all(
+    test,
+    any(
         target_os = "android",
         target_os = "dragonfly",
         target_os = "freebsd",
         target_os = "linux",
         target_os = "netbsd",
         target_os = "openbsd"
-    ))]
+    )
+))]
+mod tests {
+    use super::*;
+
     #[test]
     fn reads_the_current_elf_test_binary() {
         let executable = std::env::current_exe().unwrap();

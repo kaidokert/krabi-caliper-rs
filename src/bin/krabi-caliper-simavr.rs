@@ -24,7 +24,7 @@ struct Cli {
     completion_marker: Option<String>,
 
     /// simavr arguments followed by the firmware artifact appended by Cargo.
-    #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+    #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
     arguments: Vec<OsString>,
 }
 
@@ -77,7 +77,6 @@ mod tests {
             "30",
             "--completion-marker",
             "status:PASS",
-            "--",
             "-m",
             "atmega2560",
             "-f",
