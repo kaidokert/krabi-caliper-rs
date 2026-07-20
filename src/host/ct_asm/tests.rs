@@ -4,7 +4,8 @@ mod tests {
     #[test]
     fn thumb_it_does_not_mask_a_conditional_branch() {
         let blocks = split_blocks("<ct_fix__x>:\n  0: it eq\n  2: beq 0x8\n");
-        let patterns = Patterns::new(&[r"^b(?:eq|ne)$"], &[r"^it[te]{0,3}$"], &[], &[], &[]);
+        let patterns =
+            Patterns::new(&[r"^b(?:eq|ne)$"], &[r"^it[te]{0,3}$"], &[], &[], &[]).unwrap();
         let found = scan_block(&blocks[0], &patterns, true);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].mnemonic, "beq");
@@ -17,6 +18,56 @@ mod tests {
         let calls = [Regex::new(r"^bl$").unwrap()];
         let reached = compute_reachable_symbols(&blocks, &calls);
         assert!(reached.contains("helper"));
+    }
+
+    #[test]
+    fn parses_nested_generic_symbols_and_architecture_neutral_implicit_offsets() {
+        let blocks = split_blocks(
+            "<ct_fix__generic::<core::option::Option<u8>>>:\n  nop\n  ret\n",
+        );
+        assert_eq!(
+            blocks[0].symbol,
+            "ct_fix__generic::<core::option::Option<u8>>"
+        );
+        assert_eq!(blocks[0].insns[0].offset, 0);
+        assert_eq!(blocks[0].insns[1].offset, 1);
+        assert_eq!(
+            extract_target("bl <helper::<core::option::Option<u8>>>").as_deref(),
+            Some("helper::<core::option::Option<u8>>")
+        );
+    }
+
+    #[test]
+    fn policy_regex_errors_are_structured() {
+        assert!(Patterns::new(&["("], &[], &[], &[], &[]).is_err());
+        assert!(Patterns::new(&[], &[], &[], &["("], &[]).is_err());
+    }
+
+    #[test]
+    fn ladder_report_requires_positive_and_every_negative_control() {
+        let report = LadderReport {
+            target: "thumb".to_string(),
+            ladder_symbols_matched: 0,
+            ladder_symbols_expected: 0,
+            ladder_branches_seen: 0,
+            ladder_branches_allowed: 0,
+            positive_fixtures_checked: 0,
+            negative_controls_checked: 1,
+            negative_controls_tripped: 1,
+            negative_controls_failed_to_trip: Vec::new(),
+            ladder_violations: Vec::new(),
+        };
+        assert_ne!(report.exit_code(), 0);
+
+        let report = LadderReport {
+            positive_fixtures_checked: 1,
+            negative_controls_checked: 2,
+            negative_controls_failed_to_trip: Vec::from([
+                "nct_fix__neg__missed".to_string(),
+            ]),
+            ..report
+        };
+        assert_ne!(report.exit_code(), 0);
     }
 
     const TEST_CALIBRATIONS: &[SymbolCalibration] = &[

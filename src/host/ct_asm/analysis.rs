@@ -35,30 +35,36 @@ impl Patterns {
         call: &[&str],
         allowed_helpers: &[&str],
         extra_allowed_helpers: &[&str],
-    ) -> Self {
+    ) -> Result<Self, String> {
         let compile = |items: &[&str], label: &str| {
             items
                 .iter()
-                .map(|p| Regex::new(p).unwrap_or_else(|e| panic!("bad {label} regex {p:?}: {e}")))
-                .collect()
+                .map(|pattern| {
+                    Regex::new(pattern)
+                        .map_err(|error| format!("bad {label} regex {pattern:?}: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
         };
-        Self {
-            forbidden: compile(forbidden, "forbidden"),
-            allowed: compile(allowed, "allowed"),
-            call: compile(call, "call"),
+        Ok(Self {
+            forbidden: compile(forbidden, "forbidden")?,
+            allowed: compile(allowed, "allowed")?,
+            call: compile(call, "call")?,
             allowed_helpers: allowed_helpers
                 .iter()
                 .chain(extra_allowed_helpers)
-                .map(|p| Regex::new(p).unwrap_or_else(|e| panic!("bad helper regex {p:?}: {e}")))
-                .collect(),
-        }
+                .map(|pattern| {
+                    Regex::new(pattern)
+                        .map_err(|error| format!("bad helper regex {pattern:?}: {error}"))
+                })
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
 pub fn split_blocks(text: &str) -> Vec<FunctionBlock> {
     let mut blocks = Vec::new();
     let mut current: Option<FunctionBlock> = None;
-    let mut implicit_offset = 0;
+    let mut implicit_index = 0;
     for line in text.lines() {
         if line.is_empty()
             || line.starts_with("Disassembly")
@@ -75,7 +81,7 @@ pub fn split_blocks(text: &str) -> Vec<FunctionBlock> {
                 symbol: c[1].to_string(),
                 insns: Vec::new(),
             });
-            implicit_offset = 0;
+            implicit_index = 0;
             continue;
         }
         let Some(block) = current.as_mut() else {
@@ -93,8 +99,8 @@ pub fn split_blocks(text: &str) -> Vec<FunctionBlock> {
             let offset = c
                 .get(1)
                 .and_then(|m| u64::from_str_radix(m.as_str(), 16).ok())
-                .unwrap_or(implicit_offset);
-            implicit_offset = offset + 4;
+                .unwrap_or(implicit_index);
+            implicit_index += 1;
             let mnemonic = c[2].to_ascii_lowercase();
             if mnemonic == "..." {
                 continue;
@@ -157,26 +163,26 @@ pub fn compute_reachable_symbols(blocks: &[FunctionBlock], calls: &[Regex]) -> H
         .map(|b| b.symbol.clone())
         .collect();
     while let Some(symbol) = queue.pop_front() {
-        if !visited.insert(symbol.clone()) {
+        if visited.contains(&symbol) {
             continue;
         }
-        let Some(block) = by_symbol.get(symbol.as_str()) else {
-            continue;
-        };
-        for insn in &block.insns {
-            if !calls.iter().any(|p| p.is_match(&insn.mnemonic)) {
-                continue;
-            }
-            let target = insn
-                .call_target
-                .clone()
-                .or_else(|| extract_target(&insn.full_line));
-            if let Some(target) = target {
-                if !visited.contains(&target) {
-                    queue.push_back(target);
+        if let Some(block) = by_symbol.get(symbol.as_str()) {
+            for insn in &block.insns {
+                if !calls.iter().any(|p| p.is_match(&insn.mnemonic)) {
+                    continue;
+                }
+                let target = insn
+                    .call_target
+                    .clone()
+                    .or_else(|| extract_target(&insn.full_line));
+                if let Some(target) = target {
+                    if !visited.contains(&target) {
+                        queue.push_back(target);
+                    }
                 }
             }
         }
+        visited.insert(symbol);
     }
     visited
 }
@@ -276,7 +282,10 @@ pub struct LadderReport {
     pub ladder_symbols_expected: usize,
     pub ladder_branches_seen: usize,
     pub ladder_branches_allowed: usize,
+    pub positive_fixtures_checked: usize,
+    pub negative_controls_checked: usize,
     pub negative_controls_tripped: usize,
+    pub negative_controls_failed_to_trip: Vec<String>,
     pub ladder_violations: Vec<ViolationOut>,
 }
 
@@ -356,7 +365,9 @@ impl CalibratedSymbolsReport {
 impl LadderReport {
     pub fn exit_code(&self) -> i32 {
         (self.ladder_symbols_matched != self.ladder_symbols_expected
-            || self.negative_controls_tripped == 0
+            || self.positive_fixtures_checked == 0
+            || self.negative_controls_checked == 0
+            || !self.negative_controls_failed_to_trip.is_empty()
             || !self.ladder_violations.is_empty()) as i32
     }
     pub fn print_human(&self) {
@@ -370,9 +381,12 @@ impl LadderReport {
             self.ladder_branches_seen, self.ladder_branches_allowed
         );
         println!(
-            "  negative controls:   {} tripped",
-            self.negative_controls_tripped
+            "  negative controls:   {} of {} tripped",
+            self.negative_controls_tripped, self.negative_controls_checked
         );
+        for control in &self.negative_controls_failed_to_trip {
+            eprintln!("  FAIL: negative control {control} did not trip");
+        }
         print_violations("ladder", &self.ladder_violations);
     }
 }

@@ -196,13 +196,16 @@ pub fn run_whole_surface<T: TargetPolicy>(
         }
     };
     let blocks = split_blocks(&text);
-    let patterns = Patterns::new(
+    let patterns = match Patterns::new(
         spec.forbidden(),
         spec.allowed(),
         spec.calls(),
         spec.allowed_helpers(),
         spec.extra_allowed_helpers(),
-    );
+    ) {
+        Ok(patterns) => patterns,
+        Err(error) => return usage_error(&error, false),
+    };
     let reachable = compute_reachable_symbols(&blocks, &patterns.call);
     let mut fixture_count = 0;
     let mut fixture_violations = Vec::new();
@@ -287,7 +290,10 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
         }
     };
     let blocks = split_blocks(&text);
-    let patterns = Patterns::new(spec.forbidden(), spec.allowed(), &[], &[], &[]);
+    let patterns = match Patterns::new(spec.forbidden(), spec.allowed(), &[], &[], &[]) {
+        Ok(patterns) => patterns,
+        Err(error) => return usage_error(&error, true),
+    };
     let ladder = match Regex::new(args.ladder.as_deref().unwrap_or(config.default_ladder)) {
         Ok(v) => v,
         Err(e) => return usage_error(&format!("bad --ladder regex: {e}"), true),
@@ -295,9 +301,13 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
     let mut matched = 0;
     let mut seen = 0;
     let mut violations = Vec::new();
-    let mut negatives = 0;
+    let mut neg_seen = BTreeSet::new();
+    let mut neg_tripped = BTreeSet::new();
     let mut positives = 0;
     for block in &blocks {
+        if is_positive_fixture(&block.symbol) {
+            positives += 1;
+        }
         if ladder.is_match(&block.symbol) {
             matched += 1;
             let mut found = scan_block(block, &patterns, spec.thumb_it_blocks());
@@ -307,13 +317,12 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
             }
             continue;
         }
-        if is_positive_fixture(&block.symbol) {
-            positives += 1;
-        }
-        if is_negative_control(&block.symbol)
-            && !scan_block(block, &patterns, spec.thumb_it_blocks()).is_empty()
-        {
-            negatives += 1;
+        if is_negative_control(&block.symbol) {
+            let name = block.symbol.trim_start_matches('_').to_string();
+            neg_seen.insert(name.clone());
+            if !scan_block(block, &patterns, spec.thumb_it_blocks()).is_empty() {
+                neg_tripped.insert(name);
+            }
         }
     }
     let report = LadderReport {
@@ -322,7 +331,10 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
         ladder_symbols_expected: args.expect_ladder.unwrap_or(positives),
         ladder_branches_seen: seen,
         ladder_branches_allowed: spec.ladder_allowed_branches(),
-        negative_controls_tripped: negatives,
+        positive_fixtures_checked: positives,
+        negative_controls_checked: neg_seen.len(),
+        negative_controls_tripped: neg_tripped.len(),
+        negative_controls_failed_to_trip: negative_failures(&neg_seen, &neg_tripped),
         ladder_violations: violations.into_iter().map(Into::into).collect(),
     };
     report.print_human();
@@ -395,7 +407,7 @@ fn calibrate_blocks(
     blocks: &[FunctionBlock],
     spec: &CalibratedSymbolsTarget,
 ) -> Result<Vec<SymbolCalibrationResult>, String> {
-    let patterns = Patterns::new(spec.forbidden(), spec.allowed(), &[], &[], &[]);
+    let patterns = Patterns::new(spec.forbidden(), spec.allowed(), &[], &[], &[])?;
     spec.calibrations
         .iter()
         .map(|calibration| {
@@ -509,12 +521,17 @@ fn select_target<T: TargetPolicy>(
     }
 }
 fn host_triple() -> Option<String> {
-    let out = Command::new("rustc").arg("-vV").output().ok()?;
-    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
-        l.strip_prefix("host: ")
-            .map(str::trim)
-            .map(ToString::to_string)
-    })
+    static HOST_TRIPLE: OnceLock<Option<String>> = OnceLock::new();
+    HOST_TRIPLE
+        .get_or_init(|| {
+            let out = Command::new("rustc").arg("-vV").output().ok()?;
+            String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
+                line.strip_prefix("host: ")
+                    .map(str::trim)
+                    .map(ToString::to_string)
+            })
+        })
+        .clone()
 }
 
 fn acquire_disassembly<T: TargetPolicy>(
@@ -536,6 +553,7 @@ fn build_fixtures<T: TargetPolicy>(spec: &T, config: DriverConfig<'_>) -> Result
     let mut command = Command::new(env!("CARGO"));
     command
         .current_dir(config.workspace)
+        .env("RUSTUP_TOOLCHAIN", spec.toolchain())
         .arg("build")
         .arg("--release")
         .arg("-p")
@@ -572,9 +590,12 @@ fn find_archive<T: TargetPolicy>(spec: &T, config: DriverConfig<'_>) -> Result<P
         .find(|p| p.exists())
         .ok_or_else(|| format!("could not find {leaf} under {}", target.display()))
 }
-fn llvm_objdump() -> PathBuf {
+fn llvm_objdump(toolchain: &str) -> PathBuf {
     if let (Ok(sysroot), Some(host)) = (
-        Command::new("rustc").args(["--print", "sysroot"]).output(),
+        Command::new("rustc")
+            .env("RUSTUP_TOOLCHAIN", toolchain)
+            .args(["--print", "sysroot"])
+            .output(),
         host_triple(),
     ) {
         if sysroot.status.success() {
@@ -591,7 +612,7 @@ fn llvm_objdump() -> PathBuf {
     "llvm-objdump".into()
 }
 fn run_objdump<T: TargetPolicy>(spec: &T, archive: &Path) -> Result<String, String> {
-    let mut command = Command::new(llvm_objdump());
+    let mut command = Command::new(llvm_objdump(spec.toolchain()));
     command.args(["--disassemble", "--no-show-raw-insn", "--reloc"]);
     if spec.triple().starts_with("avr-") || spec.triple() == "avr-none" {
         command.arg("--triple=avr");

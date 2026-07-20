@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 use std::println;
 use std::process::{Command, ExitCode};
 use std::string::{String, ToString};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use std::vec::Vec;
 
 use regex::Regex;
 use serde::Serialize;
 
-static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<([^>]+)>:\s*$").unwrap());
+static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<(.+)>:\s*$").unwrap());
 static INSN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(?:([0-9a-fA-F]+):)?\s+(\S+)(?:\s+(.*))?$").unwrap());
 static RELOC_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -25,7 +25,7 @@ static RELOC_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 static TARGET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<([^>]+)>(?:\s+@\s+imm[^<]*)?\s*$").unwrap());
+    LazyLock::new(|| Regex::new(r"<(.+)>(?:\s+@\s+imm[^<]*)?\s*$").unwrap());
 
 include!("ct_asm/analysis.rs");
 include!("ct_asm/driver.rs");
