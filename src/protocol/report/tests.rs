@@ -181,6 +181,21 @@ mod tests {
                 })
                 .is_err()
         );
+        for field in [
+            Field::token("target", "custom"),
+            Field::token("board", "custom"),
+            Field::u64("width", 32),
+        ] {
+            assert!(
+                reporter
+                    .outcome(&OutcomeRecord {
+                        benchmark: "valid",
+                        passed: true,
+                        fields: &[field],
+                    })
+                    .is_err()
+            );
+        }
     }
 
     #[test]
