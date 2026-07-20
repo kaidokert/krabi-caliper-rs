@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::format;
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::path::PathBuf;
 use std::string::{String, ToString};
