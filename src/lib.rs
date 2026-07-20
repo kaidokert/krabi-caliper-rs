@@ -11,13 +11,72 @@ pub mod backends;
 pub mod core;
 pub mod protocol;
 
+pub use core::benchmark::{
+    Benchmark, BenchmarkConfig, BenchmarkError, BenchmarkReporter, BenchmarkResult,
+    CounterPlatform, ExternalBenchmarkResult, MeasurementPlatform,
+};
 pub use core::counter::{Counter, Measurement, Nanoseconds, Rate, ReadCounter, Unit};
+#[cfg(feature = "deterministic-rng")]
+pub use core::deterministic;
+pub use core::footprint::FootprintError;
 #[cfg(feature = "paired")]
 pub use core::paired;
 pub use core::sample::{SampleSet, Summary, SummaryError};
 #[cfg(feature = "stack")]
 pub use core::stack;
+#[cfg(feature = "paired")]
+pub use core::suite;
 pub use protocol::report;
+
+/// Reports application-owned measurements, stack evidence, and one outcome.
+///
+/// This expands to direct reporter calls so footprint-sensitive firmware does
+/// not retain a generic measurement loop.
+#[macro_export]
+macro_rules! report_completed {
+    (
+        $reporter:expr,
+        benchmark: $benchmark:expr,
+        passed: $passed:expr,
+        fields: $fields:expr,
+        stack: $stack:expr,
+        measurements: [
+            $(
+                $(#[$measurement_meta:meta])*
+                ($counter:expr, $measurement:expr)
+            ),* $(,)?
+        ]
+    ) => {{
+        use $crate::report::{Reporter as _, StackReporter as _};
+        let result: Result<(), _> = Ok(());
+        $(
+            $(#[$measurement_meta])*
+            let result = result.and_then(|()| {
+                $reporter.measurement(&$crate::report::MeasurementRecord {
+                    benchmark: $benchmark,
+                    measurement: $measurement,
+                    counter: Some($counter),
+                    fields: $fields,
+                })
+            });
+        )*
+        result
+            .and_then(|()| {
+                $reporter.stack_measurement(&$crate::report::StackRecord {
+                    benchmark: $benchmark,
+                    measurement: $stack,
+                    fields: $fields,
+                })
+            })
+            .and_then(|()| {
+                $reporter.outcome(&$crate::report::OutcomeRecord {
+                    benchmark: $benchmark,
+                    passed: $passed,
+                    fields: $fields,
+                })
+            })
+    }};
+}
 
 #[cfg(feature = "avr")]
 pub use backends::avr;
