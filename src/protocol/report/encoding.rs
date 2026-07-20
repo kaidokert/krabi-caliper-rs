@@ -35,6 +35,56 @@ impl<W: Write> Write for TextReporter<W> {
     }
 }
 
+#[cfg(feature = "paired")]
+struct PairedEventRecord<'a, const N: usize> {
+    fixture: &'a str,
+    class: &'a str,
+    policy: Option<&'a str>,
+    run: &'a PairedRun<N>,
+    comparison: crate::paired::Comparison,
+    passed: Option<bool>,
+    fields: &'a [Field<'a>],
+}
+
+#[cfg(feature = "paired")]
+fn emit_paired_events<R: Reporter, const N: usize>(
+    reporter: &mut R,
+    record: PairedEventRecord<'_, N>,
+) -> Result<(), R::Error> {
+    for (side, samples) in [('A', &record.run.samples.a), ('B', &record.run.samples.b)] {
+        for (index, sample) in samples.iter().enumerate() {
+            reporter.event(Event::Sample(&SampleRecord {
+                fixture: record.fixture,
+                side,
+                index,
+                ticks: sample.ticks,
+                wrapped: sample.wrapped,
+                fields: record.fields,
+            }))?;
+        }
+    }
+    let comparison = ComparisonRecord {
+        fixture: record.fixture,
+        class: record.class,
+        policy: record.policy,
+        a_min: record.comparison.a.min,
+        a_max: record.comparison.a.max,
+        b_min: record.comparison.b.min,
+        b_max: record.comparison.b.max,
+        spread: record.comparison.combined_spread,
+        overlap: record.comparison.ranges_overlap,
+        wrapped: record.comparison.wrapped,
+        output_ok: record.run.outputs_ok,
+        passed: record.passed,
+        fields: record.fields,
+    };
+    reporter.event(if record.passed.is_some() {
+        Event::Result(&comparison)
+    } else {
+        Event::Diagnostic(&comparison)
+    })
+}
+
 impl<W: Write> Reporter for TextReporter<W> {
     type Error = fmt::Error;
 
@@ -209,6 +259,90 @@ impl<W: Write> Reporter for TextReporter<W> {
         )?;
         write_fields(&mut self.writer, record.fields)?;
         writeln!(self.writer)
+    }
+}
+
+#[cfg(feature = "paired")]
+impl<W: Write> PairedReporter for TextReporter<W> {
+    #[inline(never)]
+    fn paired_result<const N: usize>(&mut self, record: &PairedResult<'_, N>) -> fmt::Result {
+        validate_token(record.fixture)?;
+        validate_token(record.class)?;
+        validate_token(record.policy)?;
+        validate_fields(record.fields)?;
+        let comparison = record.run.comparison().map_err(|_| fmt::Error)?;
+        emit_paired_events(
+            self,
+            PairedEventRecord {
+                fixture: record.fixture,
+                class: record.class,
+                policy: Some(record.policy),
+                run: record.run,
+                comparison,
+                passed: Some(record.passed),
+                fields: record.fields,
+            },
+        )?;
+
+        if self.compatibility == Compatibility::CtV0 {
+            write!(
+                self.writer,
+                "CT_RESULT fixture:{} class:{} a_min:{} a_max:{} b_min:{} b_max:{} spread:{} output_ok:{} status:{}",
+                record.fixture,
+                record.class,
+                comparison.a.min,
+                comparison.a.max,
+                comparison.b.min,
+                comparison.b.max,
+                comparison.combined_spread,
+                record.run.outputs_ok as u8,
+                if record.passed { "PASS" } else { "FAIL" },
+            )?;
+            write_fields(&mut self.writer, record.fields)?;
+            writeln!(self.writer)?;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn paired_diagnostic<const N: usize>(
+        &mut self,
+        record: &PairedDiagnostic<'_, N>,
+    ) -> fmt::Result {
+        validate_token(record.fixture)?;
+        validate_token(record.class)?;
+        validate_fields(record.fields)?;
+        let comparison = record.run.comparison().map_err(|_| fmt::Error)?;
+        emit_paired_events(
+            self,
+            PairedEventRecord {
+                fixture: record.fixture,
+                class: record.class,
+                policy: None,
+                run: record.run,
+                comparison,
+                passed: None,
+                fields: record.fields,
+            },
+        )?;
+
+        if self.compatibility == Compatibility::CtV0 {
+            write!(
+                self.writer,
+                "CT_DIAGNOSTIC fixture:{} class:{} a_min:{} a_max:{} b_min:{} b_max:{} spread:{} output_ok:{}",
+                record.fixture,
+                record.class,
+                comparison.a.min,
+                comparison.a.max,
+                comparison.b.min,
+                comparison.b.max,
+                comparison.combined_spread,
+                record.run.outputs_ok as u8,
+            )?;
+            write_fields(&mut self.writer, record.fields)?;
+            writeln!(self.writer)?;
+        }
+        Ok(())
     }
 }
 

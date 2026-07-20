@@ -122,6 +122,26 @@ pub struct ComparisonRecord<'a> {
     pub fields: &'a [Field<'a>],
 }
 
+#[cfg(feature = "paired")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PairedResult<'a, const N: usize> {
+    pub fixture: &'a str,
+    pub class: &'a str,
+    pub policy: &'a str,
+    pub run: &'a PairedRun<N>,
+    pub passed: bool,
+    pub fields: &'a [Field<'a>],
+}
+
+#[cfg(feature = "paired")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PairedDiagnostic<'a, const N: usize> {
+    pub fixture: &'a str,
+    pub class: &'a str,
+    pub run: &'a PairedRun<N>,
+    pub fields: &'a [Field<'a>],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RunSummary<'a> {
     pub suite: &'a str,
@@ -295,4 +315,18 @@ pub trait Reporter {
     fn counter_snapshot(&mut self, record: &CounterSnapshotRecord<'_>) -> Result<(), Self::Error>;
 
     fn metric(&mut self, record: &MetricRecord<'_>) -> Result<(), Self::Error>;
+}
+
+/// Paired-record extension implemented by reporters that support this feature.
+#[cfg(feature = "paired")]
+pub trait PairedReporter: Reporter {
+    fn paired_result<const N: usize>(
+        &mut self,
+        record: &PairedResult<'_, N>,
+    ) -> Result<(), Self::Error>;
+
+    fn paired_diagnostic<const N: usize>(
+        &mut self,
+        record: &PairedDiagnostic<'_, N>,
+    ) -> Result<(), Self::Error>;
 }
