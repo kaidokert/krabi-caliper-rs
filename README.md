@@ -21,6 +21,8 @@ changes.
   allocation.
 - Borrowed typed measurement events and a versioned `EM_*` text encoding for
   any `core::fmt::Write` sink.
+- Optional balanced paired acquisition and deterministic comparison policies
+  for constant-time experiments.
 
 ```sh
 cargo test --all-features

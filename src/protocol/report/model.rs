@@ -122,6 +122,26 @@ pub struct ComparisonRecord<'a> {
     pub fields: &'a [Field<'a>],
 }
 
+#[cfg(feature = "paired")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PairedResult<'a, const N: usize> {
+    pub fixture: &'a str,
+    pub class: &'a str,
+    pub policy: &'a str,
+    pub run: &'a PairedRun<N>,
+    pub passed: bool,
+    pub fields: &'a [Field<'a>],
+}
+
+#[cfg(feature = "paired")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PairedDiagnostic<'a, const N: usize> {
+    pub fixture: &'a str,
+    pub class: &'a str,
+    pub run: &'a PairedRun<N>,
+    pub fields: &'a [Field<'a>],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RunSummary<'a> {
     pub suite: &'a str,
@@ -277,6 +297,22 @@ pub trait Reporter {
     fn result(&mut self, record: &ComparisonRecord<'_>) -> Result<(), Self::Error>;
 
     fn diagnostic(&mut self, record: &ComparisonRecord<'_>) -> Result<(), Self::Error>;
+
+    #[cfg(feature = "paired")]
+    fn paired_result<const N: usize>(
+        &mut self,
+        record: &PairedResult<'_, N>,
+    ) -> Result<(), Self::Error>
+    where
+        Self: Sized;
+
+    #[cfg(feature = "paired")]
+    fn paired_diagnostic<const N: usize>(
+        &mut self,
+        record: &PairedDiagnostic<'_, N>,
+    ) -> Result<(), Self::Error>
+    where
+        Self: Sized;
 
     fn run_summary(&mut self, record: &RunSummary<'_>) -> Result<(), Self::Error>;
 

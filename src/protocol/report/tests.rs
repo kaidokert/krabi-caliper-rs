@@ -7,6 +7,8 @@ mod tests {
 
     use super::*;
     use crate::{Measurement, Unit};
+    #[cfg(feature = "paired")]
+    use crate::paired::{MaxSpread, PairedRun, PairedSamples, Side};
 
     const FIELDS: &[Field<'_>] = &[
         Field::token("case", "small"),
@@ -216,5 +218,80 @@ mod tests {
             assert_eq!(EventTag::from_wire_name(tag.wire_name()), Some(tag));
         }
         assert_eq!(EventTag::from_wire_name("EM_UNKNOWN"), None);
+    }
+
+    #[cfg(feature = "paired")]
+    #[test]
+    fn paired_records_emit_raw_evidence_and_comparison() {
+        let mut run = PairedRun {
+            samples: PairedSamples::<2>::new(),
+            outputs_ok: true,
+        };
+        run.samples.push(Side::A, cycles(100)).unwrap();
+        run.samples.push(Side::A, cycles(103)).unwrap();
+        run.samples.push(Side::B, cycles(102)).unwrap();
+        run.samples.push(Side::B, cycles(104)).unwrap();
+        let passed = run
+            .evaluate(MaxSpread {
+                ticks: 4,
+                require_overlap: true,
+            })
+            .unwrap();
+
+        let mut reporter = TextReporter::new(String::new()).compatibility(Compatibility::CtV0);
+        reporter
+            .paired_result(&PairedResult {
+                fixture: "ct-eq",
+                class: "positive",
+                policy: "max-spread-overlap",
+                run: &run,
+                passed,
+                fields: &[Field::token("carrier", "u32x8")],
+            })
+            .unwrap();
+
+        let output = reporter.into_inner();
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("EM_SAMPLE"))
+                .count(),
+            4
+        );
+        assert!(output.contains("EM_SAMPLE schema:1 fixture:ct-eq side:A index:0 ticks:100"));
+        assert!(output.contains("EM_RESULT schema:1 fixture:ct-eq class:positive"));
+        assert!(output.contains("spread:4 overlap:1 wrapped:0 output_ok:1 status:PASS"));
+        assert!(output.contains("CT_RESULT fixture:ct-eq class:positive"));
+    }
+
+    #[cfg(feature = "paired")]
+    #[test]
+    fn paired_reporter_rejects_incompatible_evidence() {
+        let mut run = PairedRun {
+            samples: PairedSamples::<1>::new(),
+            outputs_ok: true,
+        };
+        run.samples
+            .push(Side::A, Measurement::new(1, Unit::CoreCycles))
+            .unwrap();
+        run.samples
+            .push(Side::B, Measurement::new(1, Unit::TimerTicks))
+            .unwrap();
+
+        assert!(
+            TextReporter::new(String::new())
+                .paired_diagnostic(&PairedDiagnostic {
+                    fixture: "mismatch",
+                    class: "control",
+                    run: &run,
+                    fields: &[],
+                })
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "paired")]
+    fn cycles(ticks: u64) -> Measurement {
+        Measurement::new(ticks, Unit::CoreCycles).with_frequency(168_000_000)
     }
 }

@@ -11,5 +11,7 @@ pub mod core;
 pub mod protocol;
 
 pub use core::counter::{Counter, Measurement, Nanoseconds, Rate, ReadCounter, Unit};
+#[cfg(feature = "paired")]
+pub use core::paired;
 pub use core::sample::{SampleSet, Summary, SummaryError};
 pub use protocol::report;

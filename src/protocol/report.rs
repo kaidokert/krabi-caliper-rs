@@ -3,6 +3,8 @@
 use core::fmt::{self, Write};
 
 use crate::Unit;
+#[cfg(feature = "paired")]
+use crate::paired::PairedRun;
 
 pub const SCHEMA_VERSION: u16 = 1;
 
