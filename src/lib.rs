@@ -33,6 +33,81 @@ pub use core::stack;
 pub use core::suite;
 pub use protocol::report;
 
+#[doc(hidden)]
+#[cfg(feature = "ctgrind")]
+pub mod __ctgrind_private {
+    pub use inventory;
+    pub use paste::paste;
+}
+
+/// Registers a CT-grind fixture using the shared inventory and naming policy.
+#[cfg(feature = "ctgrind")]
+#[macro_export]
+macro_rules! ctgrind_fixture {
+    ($name:ident, $body:block) => {
+        $crate::__ctgrind_private::paste! {
+            #[allow(non_snake_case)]
+            fn [<run_ $name>]() $body
+            $crate::__ctgrind_private::inventory::submit! {
+                $crate::host::ctgrind::CtgrindFixture {
+                    name: stringify!($name),
+                    run: [<run_ $name>],
+                }
+            }
+        }
+    };
+}
+
+/// Places a typed ctgrind registration beside an already-defined exported
+/// fixture without colliding with its Rust value-namespace name.
+#[cfg(feature = "ctgrind")]
+#[macro_export]
+macro_rules! ctgrind_local {
+    ($name:ident, $registration:item) => {
+        $crate::__ctgrind_private::paste! {
+            #[allow(non_snake_case)]
+            mod [<ctgrind_registration_ $name>] {
+                $registration
+            }
+        }
+    };
+}
+
+/// Registers detector controls for secret-dependent branching, equality, and
+/// indexed memory access. Every CT-grind binary should include these controls.
+#[cfg(feature = "ctgrind")]
+#[macro_export]
+macro_rules! ctgrind_standard_controls {
+    () => {
+        $crate::ctgrind_fixture!(nct_fix__neg__caliper_branch, {
+            let secret = core::hint::black_box([0u8; 32]);
+            $crate::host::ctgrind::taint(&secret);
+            let observed = if secret[0] & 1 == 0 {
+                core::hint::black_box(1u8)
+            } else {
+                core::hint::black_box(2u8)
+            };
+            core::hint::black_box(observed);
+        });
+        $crate::ctgrind_fixture!(nct_fix__neg__caliper_equality, {
+            let secret = core::hint::black_box([0u8; 32]);
+            $crate::host::ctgrind::taint(&secret);
+            let observed = if secret[0] == 42 {
+                core::hint::black_box(1u8)
+            } else {
+                core::hint::black_box(2u8)
+            };
+            core::hint::black_box(observed);
+        });
+        $crate::ctgrind_fixture!(nct_fix__neg__caliper_index, {
+            let secret = core::hint::black_box([0u8; 32]);
+            let table = core::hint::black_box([0u8; 256]);
+            $crate::host::ctgrind::taint(&secret);
+            core::hint::black_box(table[secret[0] as usize]);
+        });
+    };
+}
+
 /// Reports application-owned measurements and one outcome.
 ///
 /// This expands to direct reporter calls so footprint-sensitive firmware does

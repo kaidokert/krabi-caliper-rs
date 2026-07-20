@@ -14,6 +14,7 @@ default = []
 host = ["dep:serde", "serde/std", "dep:serde_json", "dep:object", "dep:rustc-demangle", "dep:command-group", "dep:regex"]
 cli = ["host", "dep:clap"]
 campaign = ["host", "dep:toml", "dep:cargo_metadata"]
+ctgrind = ["host", "dep:crabgrind", "dep:inventory", "dep:paste"]
 paired = []
 stack = []
 deterministic-rng = ["dep:rand_core"]
@@ -30,6 +31,9 @@ uart = []
 avr-device = { version = "0.7", optional = true, features = ["atmega2560"] }
 cortex-m = { version = "0.7", optional = true }
 critical-section = { version = "1", optional = true }
+crabgrind = { version = "0.3", optional = true }
+inventory = { version = "0.3", optional = true }
+paste = { version = "1", optional = true }
 rand_core = { version = "0.10", optional = true, default-features = false }
 regex = { version = "1.10", optional = true }
 rtt-target = { version = "0.6", optional = true }
