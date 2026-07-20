@@ -6,10 +6,9 @@ analysis.
 
 This repository is being assembled through small, dependency-ordered changes.
 The current API provides architecture-neutral, allocation-free counter,
-sample, and reporting types suitable for `no_std` firmware. Target counter
-backends, reporting transports, stack measurement, paired constant-time
-acquisition, and host campaign tooling will be added in subsequent reviewed
-changes.
+sample, and reporting types suitable for `no_std` firmware. Additional target
+adapters, reporting transports, and host campaign tooling will be added in
+subsequent reviewed changes.
 
 ## Current API
 
@@ -28,6 +27,8 @@ changes.
 - Optional Cortex-M DWT cycle counting on supported cores, with
   application-owned peripherals and critical-section implementation. The
   `cortex-m-dwt` feature intentionally rejects ARMv6-M targets.
+- Optional machine-mode RISC-V `mcycle` and `minstret` adapters with atomic
+  RV32 high/low snapshots and compiler ordering boundaries.
 
 ```sh
 cargo test --all-features
