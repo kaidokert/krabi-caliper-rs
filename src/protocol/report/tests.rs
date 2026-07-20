@@ -294,4 +294,31 @@ mod tests {
     fn cycles(ticks: u64) -> Measurement {
         Measurement::new(ticks, Unit::CoreCycles).with_frequency(168_000_000)
     }
+
+    #[cfg(feature = "stack")]
+    #[test]
+    fn emits_stack_evidence_and_compatibility_record() {
+        let mut reporter = TextReporter::new(String::new()).compatibility(Compatibility::CtV0);
+        reporter
+            .stack_measurement(&StackRecord {
+                benchmark: "verify",
+                measurement: crate::stack::StackMeasurement {
+                    high_water_bytes: 2048,
+                    available_bytes: 8192,
+                    painted_bytes: 7168,
+                    safe_zone_bytes: 256,
+                    overflowed: false,
+                },
+                fields: &[Field::token("source", "cortex-m4")],
+            })
+            .unwrap();
+
+        let output = reporter.into_inner();
+        assert!(output.contains(
+            "EM_STACK schema:1 benchmark:verify used:2048 available:8192 painted:7168 safe_zone:256 overflowed:0 source:cortex-m4"
+        ));
+        assert!(output.contains(
+            "CT_STACK suite:verify bytes:2048 available:8192 painted:7168 safe_zone:256 overflowed:0 source:cortex-m4"
+        ));
+    }
 }

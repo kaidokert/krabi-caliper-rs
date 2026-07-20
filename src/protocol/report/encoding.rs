@@ -346,6 +346,44 @@ impl<W: Write> PairedReporter for TextReporter<W> {
     }
 }
 
+#[cfg(feature = "stack")]
+impl<W: Write> StackReporter for TextReporter<W> {
+    #[inline(never)]
+    fn stack_measurement(&mut self, record: &StackRecord<'_>) -> fmt::Result {
+        validate_token(record.benchmark)?;
+        validate_fields(record.fields)?;
+        write!(
+            self.writer,
+            "EM_STACK schema:{} benchmark:{} used:{} available:{} painted:{} safe_zone:{} overflowed:{}",
+            SCHEMA_VERSION,
+            record.benchmark,
+            record.measurement.high_water_bytes,
+            record.measurement.available_bytes,
+            record.measurement.painted_bytes,
+            record.measurement.safe_zone_bytes,
+            record.measurement.overflowed as u8,
+        )?;
+        write_fields(&mut self.writer, record.fields)?;
+        writeln!(self.writer)?;
+
+        if self.compatibility == Compatibility::CtV0 {
+            write!(
+                self.writer,
+                "CT_STACK suite:{} bytes:{} available:{} painted:{} safe_zone:{} overflowed:{}",
+                record.benchmark,
+                record.measurement.high_water_bytes,
+                record.measurement.available_bytes,
+                record.measurement.painted_bytes,
+                record.measurement.safe_zone_bytes,
+                record.measurement.overflowed as u8,
+            )?;
+            write_fields(&mut self.writer, record.fields)?;
+            writeln!(self.writer)?;
+        }
+        Ok(())
+    }
+}
+
 fn unit_name(unit: Unit) -> &'static str {
     match unit {
         Unit::CoreCycles => "core-cycles",

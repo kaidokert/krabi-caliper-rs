@@ -5,6 +5,8 @@ use core::fmt::{self, Write};
 use crate::Unit;
 #[cfg(feature = "paired")]
 use crate::paired::PairedRun;
+#[cfg(feature = "stack")]
+use crate::stack::StackMeasurement;
 
 pub const SCHEMA_VERSION: u16 = 1;
 

@@ -23,6 +23,8 @@ changes.
   any `core::fmt::Write` sink.
 - Optional balanced paired acquisition and deterministic comparison policies
   for constant-time experiments.
+- Optional downward-growing stack painting, high-water measurement, and
+  chunked occupancy inspection behind an application-supplied memory contract.
 
 ```sh
 cargo test --all-features
