@@ -5,16 +5,26 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
 use std::format;
+use std::fs;
+use std::io::{Cursor, Read};
+use std::path::Path;
 use std::path::PathBuf;
 use std::string::{String, ToString};
+use std::time::Duration;
 use std::vec;
 use std::vec::Vec;
 
+use cargo_metadata::Message;
 use serde::{Deserialize, Serialize};
 
-use super::CompletionAction;
+use super::{
+    BuildMetadata, CommandError, CommandOutput, CommandRunner, CommandSpec, CompletionAction,
+    ElfFootprint, MetricPolicy, RunResult, RunStatus, SourceMetadata, TargetMetadata, parse,
+    read_elf_footprint, render_json, render_markdown,
+};
 
 include!("campaign/config.rs");
 
@@ -62,35 +72,12 @@ pub struct CaseConfig {
     pub baseline: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "name", rename_all = "kebab-case")]
-pub enum CargoTarget {
-    Example(String),
-    Binary(String),
-}
-
-#[derive(Debug)]
-pub enum CampaignConfigError {
-    MissingProfile(String),
-    InvalidConfig(String),
-}
-
-impl fmt::Display for CampaignConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingProfile(value) => write!(formatter, "unknown runner profile {value:?}"),
-            Self::InvalidConfig(value) => formatter.write_str(value),
-        }
-    }
-}
-
-impl Error for CampaignConfigError {}
-
-type CampaignError = CampaignConfigError;
-
 const fn continue_on_failure() -> bool {
     true
 }
+
+include!("campaign/model.rs");
+include!("campaign/executor.rs");
 
 #[cfg(test)]
 mod tests;

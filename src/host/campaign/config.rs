@@ -867,7 +867,7 @@ fn preset_values(preset: RunnerPreset) -> PresetValues {
             target: "avr-none",
             executable: "simavr",
             args: &["-m", "atmega2560", "-f", "16000000"],
-            completion_marker: Some("status:PASS"),
+            completion_marker: Some("EM_OUTCOME"),
             artifact_extension: "elf",
             board: Some("simavr-atmega2560"),
             mcu: Some("atmega2560"),

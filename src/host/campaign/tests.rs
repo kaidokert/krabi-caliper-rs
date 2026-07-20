@@ -258,3 +258,254 @@ minimum-samples-per-class = 1
     );
     assert!(invalid_ct.validate().is_err());
 }
+
+fn matrix_campaign() -> CampaignConfig {
+    CampaignConfig {
+        profile: "test".to_string(),
+        constant_time: None,
+        case_set: None,
+        cases: vec![CaseConfig {
+            name: "parser".to_string(),
+            example: Some("parser".to_string()),
+            binary: None,
+            features: vec!["base".to_string()],
+            expected_benchmark: None,
+            expected_suite: None,
+            timeout_seconds: None,
+            delay_before_run_seconds: None,
+            baseline: None,
+        }],
+        baseline_case: None,
+        matrix: BTreeMap::from([
+            ("depth".to_string(), vec!["7".to_string(), "9".to_string()]),
+            (
+                "mode".to_string(),
+                vec!["tiny".to_string(), "small".to_string()],
+            ),
+        ]),
+        matrix_features: vec!["depth-{depth}".to_string(), "mode-{mode}".to_string()],
+        continue_on_failure: true,
+        artifact_dir: None,
+    }
+}
+
+#[test]
+fn expands_complete_and_quick_campaign_matrices() {
+    let cases = expand_cases(&matrix_campaign(), &CampaignSelection::default()).unwrap();
+    assert_eq!(cases.len(), 4);
+    assert_eq!(cases[0].id, "parser__depth-7__mode-tiny");
+    assert_eq!(cases[3].features, ["base", "depth-9", "mode-small"]);
+
+    let quick = expand_cases(
+        &matrix_campaign(),
+        &CampaignSelection {
+            quick: true,
+            cases: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert_eq!(quick.len(), 1);
+    assert_eq!(quick[0].id, "parser__depth-7__mode-tiny");
+}
+
+#[test]
+fn configured_commands_substitute_artifacts_and_deadlines() {
+    let command = RunnerCommandConfig {
+        executable: "probe-rs".to_string(),
+        args: vec!["download".to_string(), "{artifact}".to_string()],
+        timeout_seconds: 17,
+    };
+    let spec = configured_runner_command(
+        &command,
+        Path::new("/repo"),
+        Path::new("/repo/target/firmware"),
+    );
+
+    assert_eq!(spec.program, OsString::from("probe-rs"));
+    assert_eq!(
+        spec.args,
+        ["download", "/repo/target/firmware"].map(OsString::from)
+    );
+    assert_eq!(spec.timeout, Duration::from_secs(17));
+}
+
+#[test]
+fn enrichment_attaches_reproducibility_evidence() {
+    let case = expand_cases(&matrix_campaign(), &CampaignSelection::default())
+        .unwrap()
+        .remove(0);
+    let environment = ReproducibilityMetadata {
+        recorded_unix_seconds: 1,
+        source: SourceMetadata {
+            workspace: Some("/repo/fixture".to_string()),
+            repository: Some("https://example.invalid/repo".to_string()),
+            git_commit: Some("abc123".to_string()),
+            dirty: Some(false),
+        },
+        build: BuildMetadata {
+            toolchain: Some("test-toolchain".to_string()),
+            rustc: Some("rustc test".to_string()),
+            cargo: Some("cargo test".to_string()),
+            target: Some("thumbv7em-none-eabihf".to_string()),
+            optimization: Some("release".to_string()),
+            features: case.features.clone(),
+        },
+        target: TargetMetadata {
+            probe: Some("serial".to_string()),
+            clock_frequency_hz: Some(16_000_000),
+            ..TargetMetadata::default()
+        },
+    };
+    let mut result =
+        crate::host::parse("EM_SUMMARY schema:1 suite:test passed:1 failed:0\n").unwrap();
+
+    enrich_result(&mut result, "campaign", "profile", &case, &environment);
+
+    assert_eq!(result.identity.campaign.as_deref(), Some("campaign"));
+    assert_eq!(result.identity.features, case.features);
+    assert_eq!(result.source.git_commit.as_deref(), Some("abc123"));
+    assert_eq!(result.target.probe.as_deref(), Some("serial"));
+}
+
+#[test]
+fn unknown_case_selection_is_an_error() {
+    let error = expand_cases(
+        &matrix_campaign(),
+        &CampaignSelection {
+            quick: false,
+            cases: vec!["missing".to_string()],
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("produced no cases"));
+}
+
+#[cfg(unix)]
+#[test]
+fn executes_an_external_counter_campaign_end_to_end() {
+    let workspace = std::env::temp_dir().join(format!(
+        "krabi-caliper-campaign-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(workspace.join("examples")).unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "external-campaign-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[example]]
+name = "external-fixture"
+path = "examples/external-fixture.rs"
+
+[workspace]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("examples/external-fixture.rs"),
+        "fn main() {}\n",
+    )
+    .unwrap();
+    let config: ToolkitConfig = toml::from_str(
+        r#"
+[profiles.external]
+runner = "command"
+target = "host"
+executable = "sh"
+require-external-measurements = true
+timeout-seconds = 10
+artifact-extension = ""
+args = [
+  "-c",
+  "printf '%s\\n' 'EM_BOUNDARY schema:1 benchmark:external-fixture trial:0 phase:begin' 'EM_COUNTER schema:1 benchmark:external-fixture trial:0 phase:begin ticks:1000 width:32 unit:simulator-cycles frequency_hz:16000000 source:fixture-wrapper' 'EM_BOUNDARY schema:1 benchmark:external-fixture trial:0 phase:end status:PASS' 'EM_COUNTER schema:1 benchmark:external-fixture trial:0 phase:end ticks:1456 width:32 unit:simulator-cycles frequency_hz:16000000 source:fixture-wrapper' 'EM_OUTCOME schema:1 benchmark:external-fixture status:PASS'",
+  "external-counter-wrapper",
+  "{artifact}",
+]
+
+[campaigns.external]
+profile = "external"
+cases = [{ name = "external", example = "external-fixture", expected-benchmark = "external-fixture" }]
+"#,
+    )
+    .unwrap();
+    let output_dir = workspace.join("target/krabi-caliper/external");
+    let _ = std::fs::remove_dir_all(&output_dir);
+
+    let report = CampaignExecutor::default()
+        .run(
+            &config,
+            "external",
+            &workspace,
+            &CampaignSelection::default(),
+        )
+        .unwrap();
+
+    assert!(report.success());
+    assert_eq!(report.cases[0].status, CaseStatus::Pass);
+    assert_eq!(
+        report.cases[0].result.as_ref().unwrap().benchmarks["external-fixture"].measurements[0]
+            .ticks,
+        456
+    );
+    assert!(output_dir.join("report.md").is_file());
+    assert!(output_dir.join("report.csv").is_file());
+    assert!(output_dir.join("results.json").is_file());
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn executor_revalidates_declarative_input_before_running() {
+    let config = parse(
+        r#"
+[profiles.qemu]
+preset = "qemu-cortex-m3"
+[campaigns.invalid]
+profile = "qemu"
+baseline-case = "missing"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let error = CampaignExecutor::default()
+        .run(
+            &config,
+            "invalid",
+            Path::new("."),
+            &CampaignSelection::default(),
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("is not a case"));
+}
+
+#[test]
+fn non_elf_artifacts_have_no_elf_footprint() {
+    let path =
+        std::env::temp_dir().join(format!("krabi-caliper-non-elf-test-{}", std::process::id()));
+    std::fs::write(&path, b"MZ\0\0native executable").unwrap();
+
+    assert_eq!(artifact_footprint(&path).unwrap(), None);
+
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn simavr_preset_waits_for_a_terminal_outcome() {
+    let config = parse(
+        r#"
+[profiles.avr]
+preset = "simavr-atmega2560"
+[campaigns.test]
+profile = "avr"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let profile = config.resolve_profile("avr").unwrap();
+    assert_eq!(profile.completion_marker.as_deref(), Some("EM_OUTCOME"));
+}
