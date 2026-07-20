@@ -236,10 +236,9 @@ where
         run: crate::paired::PairedRun<N>,
         policy: impl ComparisonPolicy,
     ) -> Result<bool, SuiteError<R::Error>> {
-        let comparison = run
-            .comparison()
+        let passed = run
+            .evaluate(policy)
             .map_err(|_| SuiteError::IncompatibleMeasurements)?;
-        let passed = run.outputs_ok && policy.accepts(&comparison);
         self.reporter
             .paired_result(&PairedResult {
                 fixture: spec.name,
@@ -546,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn counter_wrap_is_evidence_not_automatic_failure() {
+    fn counter_wrap_cannot_produce_a_passing_verdict() {
         struct WrappedPlatform;
         impl MeasurementPlatform for WrappedPlatform {
             fn measure(
@@ -582,7 +581,10 @@ mod tests {
         .unwrap()
         .max_sample_ticks(101);
 
-        assert!(suite.positive("wrapped", &0, &1, |_| true).unwrap());
-        assert_eq!(suite.finish().unwrap().passed, 1);
+        assert_eq!(
+            suite.positive("wrapped", &0, &1, |_| true),
+            Err(SuiteError::IncompatibleMeasurements)
+        );
+        assert_eq!(suite.finish().unwrap(), SuiteTotals::default());
     }
 }

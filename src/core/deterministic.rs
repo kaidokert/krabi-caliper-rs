@@ -62,8 +62,6 @@ impl rand_core::TryRng for FixtureRng {
     }
 }
 
-impl rand_core::TryCryptoRng for FixtureRng {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

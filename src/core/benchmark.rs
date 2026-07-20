@@ -99,6 +99,7 @@ pub struct ExternalBenchmarkResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BenchmarkError<E> {
     Reporter(E),
+    SampleCapacity,
     #[cfg(feature = "stack")]
     Stack(StackError),
 }
@@ -268,7 +269,7 @@ impl<'a, const N: usize> Benchmark<'a, N> {
                     .is_none_or(|limit| measurement.ticks < limit);
             samples
                 .push(measurement)
-                .expect("exactly N samples are recorded");
+                .map_err(|_| BenchmarkError::SampleCapacity)?;
         }
 
         #[cfg(feature = "stack")]
@@ -335,6 +336,7 @@ fn run_batches(batches: usize, operation: &mut impl FnMut() -> bool) -> bool {
 mod tests {
     extern crate std;
 
+    #[cfg(feature = "stack")]
     use core::ptr::NonNull;
     use std::string::String;
 
@@ -447,6 +449,24 @@ mod tests {
                 "EM_METRIC schema:1 benchmark:external-parser name:input-bytes value:512"
             )
         );
+    }
+
+    #[cfg(not(feature = "stack"))]
+    #[test]
+    fn completed_benchmark_does_not_require_stack_support() {
+        let mut reporter = TextReporter::new(String::new());
+        crate::report_completed!(
+            &mut reporter,
+            benchmark: "parser",
+            passed: true,
+            fields: &[],
+            measurements: [("timer", Measurement::new(12, Unit::TimerTicks))]
+        )
+        .unwrap();
+
+        let output = reporter.into_inner();
+        assert!(output.contains("EM_MEASUREMENT"));
+        assert!(output.contains("EM_OUTCOME schema:1 benchmark:parser status:PASS"));
     }
 
     #[cfg(feature = "stack")]
