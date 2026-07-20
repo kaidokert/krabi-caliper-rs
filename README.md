@@ -35,6 +35,8 @@ subsequent reviewed changes.
   global interrupt policy.
 - Optional RTT, Cortex-M semihosting, and application-owned byte-UART adapters
   for the same text reporting protocol.
+- Optional host-side protocol parsing, owned evidence, JSON/Markdown reports,
+  ELF footprint extraction, and Welch timing analysis.
 
 ```sh
 cargo test --all-features
