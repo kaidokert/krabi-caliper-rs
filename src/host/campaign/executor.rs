@@ -24,6 +24,7 @@ impl CampaignExecutor {
         workspace: &Path,
         selection: &CampaignSelection,
     ) -> Result<CampaignReport, CampaignError> {
+        config.validate()?;
         let campaign = config
             .campaigns
             .get(campaign_name)
@@ -153,8 +154,7 @@ impl CampaignExecutor {
             path: retained_artifact.clone(),
             source,
         })?;
-        let footprint = read_elf_footprint(&built_artifact)
-            .map_err(|error| CampaignError::InvalidConfig(error.to_string()))?;
+        let footprint = artifact_footprint(&built_artifact)?;
         let mut prepare_commands = Vec::new();
         for (index, prepare) in profile.prepare.iter().enumerate() {
             let spec = configured_runner_command(prepare, workspace, &built_artifact);
@@ -177,7 +177,7 @@ impl CampaignExecutor {
                     features: case.features.clone(),
                     parameters: case.parameters.clone(),
                     artifact: Some(retained_artifact),
-                    footprint: Some(footprint),
+                    footprint,
                     baseline: case.baseline.clone(),
                     build_command: build_display,
                     prepare_commands,
@@ -230,7 +230,7 @@ impl CampaignExecutor {
             features: case.features.clone(),
             parameters: case.parameters.clone(),
             artifact: Some(retained_artifact),
-            footprint: Some(footprint),
+            footprint,
             baseline: case.baseline.clone(),
             build_command: build_display,
             prepare_commands,
@@ -362,32 +362,30 @@ fn enrich_result(
 }
 
 fn command_value(workspace: &Path, program: &str, args: &[&str]) -> Option<String> {
-    let value = command_output(workspace, program, args)?;
+    let value = captured_command_output(workspace, program, args, None)?;
     (!value.is_empty()).then_some(value)
 }
 
 fn host_target(toolchain: Option<&str>) -> Option<String> {
-    command_output_with_toolchain("rustc", &["-vV"], toolchain)?
+    captured_command_output(Path::new("."), "rustc", &["-vV"], toolchain)?
         .lines()
         .find_map(|line| line.strip_prefix("host: ").map(ToString::to_string))
 }
 
-fn command_output_with_toolchain(
+fn command_value_with_toolchain(
+    workspace: &Path,
     program: &str,
     args: &[&str],
     toolchain: Option<&str>,
 ) -> Option<String> {
-    let mut spec = CommandSpec::new(program, ".")
-        .args(args.iter().copied())
-        .timeout(Duration::from_secs(5));
-    if let Some(toolchain) = toolchain {
-        spec = spec.env("RUSTUP_TOOLCHAIN", toolchain);
-    }
-    let output = CommandRunner.run(&spec).ok()?;
-    output.success().then(|| output.stdout_lossy())
+    captured_command_output(workspace, program, args, toolchain)
 }
 
-fn command_value_with_toolchain(
+fn command_output(workspace: &Path, program: &str, args: &[&str]) -> Option<String> {
+    captured_command_output(workspace, program, args, None)
+}
+
+fn captured_command_output(
     workspace: &Path,
     program: &str,
     args: &[&str],
@@ -411,23 +409,24 @@ fn command_value_with_toolchain(
     Some(value.trim().to_string())
 }
 
-fn command_output(workspace: &Path, program: &str, args: &[&str]) -> Option<String> {
-    let output = CommandRunner
-        .run(
-            &CommandSpec::new(program, workspace)
-                .args(args.iter().copied())
-                .timeout(Duration::from_secs(5)),
-        )
-        .ok()?;
-    if !output.success() {
-        return None;
-    }
-    let value = if output.stdout.is_empty() {
-        output.stderr_lossy()
+fn artifact_footprint(path: &Path) -> Result<Option<ElfFootprint>, CampaignError> {
+    let mut header = [0_u8; 4];
+    let mut file = fs::File::open(path).map_err(|source| CampaignError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.read_exact(&mut header)
+        .map_err(|source| CampaignError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if header == *b"\x7fELF" {
+        read_elf_footprint(path)
+            .map(Some)
+            .map_err(|error| CampaignError::InvalidConfig(error.to_string()))
     } else {
-        output.stdout_lossy()
-    };
-    Some(value.trim().to_string())
+        Ok(None)
+    }
 }
 
 pub fn expand_cases(

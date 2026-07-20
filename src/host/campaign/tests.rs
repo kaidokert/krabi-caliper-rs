@@ -457,3 +457,55 @@ cases = [{ name = "external", example = "external-fixture", expected-benchmark =
     assert!(output_dir.join("results.json").is_file());
     std::fs::remove_dir_all(workspace).unwrap();
 }
+
+#[test]
+fn executor_revalidates_declarative_input_before_running() {
+    let config = parse(
+        r#"
+[profiles.qemu]
+preset = "qemu-cortex-m3"
+[campaigns.invalid]
+profile = "qemu"
+baseline-case = "missing"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let error = CampaignExecutor::default()
+        .run(
+            &config,
+            "invalid",
+            Path::new("."),
+            &CampaignSelection::default(),
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("is not a case"));
+}
+
+#[test]
+fn non_elf_artifacts_have_no_elf_footprint() {
+    let path =
+        std::env::temp_dir().join(format!("krabi-caliper-non-elf-test-{}", std::process::id()));
+    std::fs::write(&path, b"MZ\0\0native executable").unwrap();
+
+    assert_eq!(artifact_footprint(&path).unwrap(), None);
+
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn simavr_preset_waits_for_a_terminal_outcome() {
+    let config = parse(
+        r#"
+[profiles.avr]
+preset = "simavr-atmega2560"
+[campaigns.test]
+profile = "avr"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let profile = config.resolve_profile("avr").unwrap();
+    assert_eq!(profile.completion_marker.as_deref(), Some("EM_OUTCOME"));
+}
