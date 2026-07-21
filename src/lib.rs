@@ -1,5 +1,6 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(target_arch = "avr", feature(asm_experimental_arch))]
 
 //! Architecture-neutral measurement values and fixed-capacity samples.
 //!
@@ -187,6 +188,60 @@ macro_rules! report_completed {
                     fields: $fields,
                 })
             })
+    }};
+}
+
+/// Installs the SysTick exception required by the Cortex-M footprint counter.
+#[cfg(feature = "cortex-m")]
+#[macro_export]
+macro_rules! cortex_m_systick_overflow_handler {
+    () => {
+        #[cortex_m_rt::exception]
+        fn SysTick() {
+            $crate::cortex_m::systick_overflow();
+        }
+    };
+}
+
+/// Installs the Timer/Counter1 overflow ISR required by the ATmega2560 counter.
+#[cfg(feature = "avr-atmega2560")]
+#[macro_export]
+macro_rules! atmega2560_timer1_overflow_handler {
+    () => {
+        #[avr_device::interrupt(atmega2560)]
+        fn TIMER1_OVF() {
+            $crate::avr::timer1_overflow();
+        }
+    };
+}
+
+/// Selects RTT on a caller-defined hardware feature and semihosting otherwise.
+#[macro_export]
+macro_rules! cortex_m_reporter {
+    ($hardware_feature:literal) => {{
+        #[cfg(feature = $hardware_feature)]
+        {
+            $crate::protocol::rtt::init_blocking()
+        }
+        #[cfg(not(feature = $hardware_feature))]
+        {
+            $crate::protocol::semihosting::init().expect("failed to open semihosting stdout")
+        }
+    }};
+}
+
+/// Exits a semihosted fixture and leaves hardware firmware running for RTT.
+#[macro_export]
+macro_rules! finish_cortex_m_report {
+    ($passed:expr, $hardware_feature:literal) => {{
+        #[cfg(not(feature = $hardware_feature))]
+        if $passed {
+            $crate::protocol::semihosting::exit_success();
+        } else {
+            $crate::protocol::semihosting::exit_failure();
+        }
+        #[cfg(feature = $hardware_feature)]
+        let _ = $passed;
     }};
 }
 

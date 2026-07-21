@@ -11,6 +11,23 @@ pub struct TextReporter<W> {
     compatibility: Compatibility,
 }
 
+/// A reporter for small targets whose output driver implements `ufmt::uWrite`.
+#[cfg(feature = "ufmt")]
+pub struct UfmtReporter<W> {
+    writer: W,
+}
+
+#[cfg(feature = "ufmt")]
+impl<W> UfmtReporter<W> {
+    pub const fn new(writer: W) -> Self {
+        Self { writer }
+    }
+
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+}
+
 impl<W> TextReporter<W> {
     pub const fn new(writer: W) -> Self {
         Self {
@@ -34,6 +51,436 @@ impl<W: Write> Write for TextReporter<W> {
         self.writer.write_str(value)
     }
 }
+#[cfg(feature = "ufmt")]
+impl<W: ufmt::uWrite> Reporter for UfmtReporter<W> {
+    type Error = UfmtReportError<W::Error>;
+
+    fn run_start(&mut self, record: &RunStart<'_>) -> Result<(), Self::Error> {
+        write_run_start_ufmt(&mut self.writer, record)
+    }
+
+    fn sample(&mut self, record: &SampleRecord<'_>) -> Result<(), Self::Error> {
+        write_sample_ufmt(&mut self.writer, record)
+    }
+
+    fn result(&mut self, record: &ComparisonRecord<'_>) -> Result<(), Self::Error> {
+        write_comparison_ufmt(&mut self.writer, EventTag::Result, record)
+    }
+
+    fn diagnostic(&mut self, record: &ComparisonRecord<'_>) -> Result<(), Self::Error> {
+        write_comparison_ufmt(&mut self.writer, EventTag::Diagnostic, record)
+    }
+
+    fn run_summary(&mut self, record: &RunSummary<'_>) -> Result<(), Self::Error> {
+        write_run_summary_ufmt(&mut self.writer, record)
+    }
+
+    fn measurement(&mut self, record: &MeasurementRecord<'_>) -> Result<(), Self::Error> {
+        write_measurement_ufmt(&mut self.writer, record)
+    }
+
+    fn indexed_measurement(
+        &mut self,
+        record: &MeasurementRecord<'_>,
+        trial: u32,
+    ) -> Result<(), Self::Error> {
+        write_measurement_ufmt_indexed(&mut self.writer, record, Some(trial))
+    }
+
+    fn outcome(&mut self, record: &OutcomeRecord<'_>) -> Result<(), Self::Error> {
+        write_outcome_ufmt(&mut self.writer, record)
+    }
+
+    fn boundary(&mut self, record: &BoundaryRecord<'_>) -> Result<(), Self::Error> {
+        write_boundary_ufmt(&mut self.writer, record)
+    }
+
+    fn counter_snapshot(&mut self, record: &CounterSnapshotRecord<'_>) -> Result<(), Self::Error> {
+        write_counter_snapshot_ufmt(&mut self.writer, record)
+    }
+
+    fn metric(&mut self, record: &MetricRecord<'_>) -> Result<(), Self::Error> {
+        write_metric_ufmt(&mut self.writer, record)
+    }
+
+}
+
+#[cfg(all(feature = "ufmt", feature = "paired"))]
+impl<W: ufmt::uWrite> PairedReporter for UfmtReporter<W> {
+    fn paired_result<const N: usize>(
+        &mut self,
+        record: &PairedResult<'_, N>,
+    ) -> Result<(), Self::Error> {
+        let comparison = record
+            .run
+            .comparison()
+            .map_err(|_| UfmtReportError::InvalidToken)?;
+        emit_paired_events(
+            self,
+            PairedEventRecord {
+                fixture: record.fixture,
+                class: record.class,
+                policy: Some(record.policy),
+                run: record.run,
+                comparison,
+                passed: Some(record.passed),
+                fields: record.fields,
+            },
+        )
+    }
+
+    fn paired_diagnostic<const N: usize>(
+        &mut self,
+        record: &PairedDiagnostic<'_, N>,
+    ) -> Result<(), Self::Error> {
+        let comparison = record
+            .run
+            .comparison()
+            .map_err(|_| UfmtReportError::InvalidToken)?;
+        emit_paired_events(
+            self,
+            PairedEventRecord {
+                fixture: record.fixture,
+                class: record.class,
+                policy: None,
+                run: record.run,
+                comparison,
+                passed: None,
+                fields: record.fields,
+            },
+        )
+    }
+}
+
+#[cfg(all(feature = "ufmt", feature = "stack"))]
+impl<W: ufmt::uWrite> StackReporter for UfmtReporter<W> {
+    fn stack_measurement(&mut self, record: &StackRecord<'_>) -> Result<(), Self::Error> {
+        write_stack_ufmt(&mut self.writer, record)
+    }
+}
+
+#[cfg(feature = "ufmt")]
+fn write_run_start_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    record: &RunStart<'_>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    validate_token(record.suite).map_err(|_| UfmtReportError::InvalidToken)?;
+    validate_token(record.target).map_err(|_| UfmtReportError::InvalidToken)?;
+    if let Some(board) = record.board {
+        validate_token(board).map_err(|_| UfmtReportError::InvalidToken)?;
+    }
+    validate_fields(record.fields).map_err(|_| UfmtReportError::InvalidToken)?;
+    ufmt::uwrite!(
+        writer,
+        "EM_BEGIN schema:{} suite:{} target:{} board:{} unit:{} frequency_hz:",
+        SCHEMA_VERSION,
+        record.suite,
+        record.target,
+        record.board.unwrap_or("none"),
+        unit_name(record.unit),
+    )
+    .map_err(UfmtReportError::Writer)?;
+    write_optional_u64_ufmt(writer, record.frequency_hz)?;
+    write_fields_ufmt(writer, record.fields)?;
+    ufmt::uWrite::write_str(writer, "\n").map_err(UfmtReportError::Writer)
+}
+
+#[cfg(feature = "ufmt")]
+fn write_sample_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    record: &SampleRecord<'_>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    validate_token(record.fixture).map_err(|_| UfmtReportError::InvalidToken)?;
+    validate_fields(record.fields).map_err(|_| UfmtReportError::InvalidToken)?;
+    if !matches!(record.side, 'A' | 'B') {
+        return Err(UfmtReportError::InvalidToken);
+    }
+    ufmt::uWrite::write_str(writer, EventTag::Sample.wire_name())
+        .map_err(UfmtReportError::Writer)?;
+    ufmt::uwrite!(
+        writer,
+        " schema:{} fixture:{} side:{} index:{} ticks:{} wrapped:{}",
+        SCHEMA_VERSION,
+        record.fixture,
+        record.side,
+        record.index,
+        record.ticks,
+        record.wrapped as u8,
+    )
+    .map_err(UfmtReportError::Writer)?;
+    write_fields_ufmt(writer, record.fields)?;
+    ufmt::uWrite::write_str(writer, "\n").map_err(UfmtReportError::Writer)
+}
+
+#[cfg(feature = "ufmt")]
+fn write_comparison_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    tag: EventTag,
+    record: &ComparisonRecord<'_>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    validate_token(record.fixture).map_err(|_| UfmtReportError::InvalidToken)?;
+    validate_token(record.class).map_err(|_| UfmtReportError::InvalidToken)?;
+    if let Some(policy) = record.policy {
+        validate_token(policy).map_err(|_| UfmtReportError::InvalidToken)?;
+    }
+    validate_fields(record.fields).map_err(|_| UfmtReportError::InvalidToken)?;
+    ufmt::uWrite::write_str(writer, tag.wire_name()).map_err(UfmtReportError::Writer)?;
+    ufmt::uwrite!(
+        writer,
+        " schema:{} fixture:{} class:{}",
+        SCHEMA_VERSION,
+        record.fixture,
+        record.class,
+    )
+    .map_err(UfmtReportError::Writer)?;
+    if let Some(policy) = record.policy {
+        ufmt::uwrite!(writer, " policy:{}", policy).map_err(UfmtReportError::Writer)?;
+    }
+    ufmt::uwrite!(
+        writer,
+        " a_min:{} a_max:{} b_min:{} b_max:{} spread:{} overlap:{} wrapped:{} output_ok:{}",
+        record.a_min,
+        record.a_max,
+        record.b_min,
+        record.b_max,
+        record.spread,
+        record.overlap as u8,
+        record.wrapped as u8,
+        record.output_ok as u8,
+    )
+    .map_err(UfmtReportError::Writer)?;
+    if let Some(passed) = record.passed {
+        ufmt::uwrite!(writer, " status:{}", if passed { "PASS" } else { "FAIL" })
+            .map_err(UfmtReportError::Writer)?;
+    }
+    write_fields_ufmt(writer, record.fields)?;
+    ufmt::uWrite::write_str(writer, "\n").map_err(UfmtReportError::Writer)
+}
+
+#[cfg(feature = "ufmt")]
+fn write_run_summary_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    record: &RunSummary<'_>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    validate_token(record.suite).map_err(|_| UfmtReportError::InvalidToken)?;
+    validate_fields(record.fields).map_err(|_| UfmtReportError::InvalidToken)?;
+    ufmt::uwrite!(
+        writer,
+        "EM_SUMMARY schema:{} suite:{} passed:{} failed:{}",
+        SCHEMA_VERSION,
+        record.suite,
+        record.passed,
+        record.failed,
+    )
+    .map_err(UfmtReportError::Writer)?;
+    write_fields_ufmt(writer, record.fields)?;
+    ufmt::uWrite::write_str(writer, "\n").map_err(UfmtReportError::Writer)
+}
+
+/// Emits one stack record through an `ufmt` transport without duplicating the
+/// protocol formatter in AVR applications.
+#[cfg(all(feature = "stack", feature = "ufmt"))]
+pub fn write_stack_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    record: &StackRecord<'_>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    validate_token(record.benchmark).map_err(|_| UfmtReportError::InvalidToken)?;
+    validate_fields(record.fields).map_err(|_| UfmtReportError::InvalidToken)?;
+    ufmt::uwrite!(
+        writer,
+        "EM_STACK schema:{} benchmark:{} used:{} available:{} painted:{} safe_zone:{} overflowed:{}",
+        SCHEMA_VERSION,
+        record.benchmark,
+        record.measurement.high_water_bytes,
+        record.measurement.available_bytes,
+        record.measurement.painted_bytes,
+        record.measurement.safe_zone_bytes,
+        record.measurement.overflowed as u8,
+    )
+    .map_err(UfmtReportError::Writer)?;
+    write_fields_ufmt(writer, record.fields)?;
+    ufmt::uWrite::write_str(writer, "\n").map_err(UfmtReportError::Writer)
+}
+
+/// Emits a measurement record through a compact `ufmt` transport.
+#[cfg(feature = "ufmt")]
+pub fn write_measurement_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    record: &MeasurementRecord<'_>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    write_measurement_ufmt_indexed(writer, record, None)
+}
+
+#[cfg(feature = "ufmt")]
+fn write_measurement_ufmt_indexed<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    record: &MeasurementRecord<'_>,
+    trial: Option<u32>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    validate_token(record.benchmark).map_err(|_| UfmtReportError::InvalidToken)?;
+    if let Some(counter) = record.counter {
+        validate_token(counter).map_err(|_| UfmtReportError::InvalidToken)?;
+    }
+    validate_fields(record.fields).map_err(|_| UfmtReportError::InvalidToken)?;
+    ufmt::uwrite!(
+        writer,
+        "EM_MEASUREMENT schema:{} benchmark:{} ticks:{} unit:{} frequency_hz:",
+        SCHEMA_VERSION,
+        record.benchmark,
+        record.measurement.ticks,
+        unit_name(record.measurement.unit),
+    )
+    .map_err(UfmtReportError::Writer)?;
+    match record.measurement.frequency_hz {
+        Some(value) => ufmt::uwrite!(writer, "{}", value).map_err(UfmtReportError::Writer)?,
+        None => ufmt::uWrite::write_str(writer, "none").map_err(UfmtReportError::Writer)?,
+    }
+    ufmt::uwrite!(writer, " wrapped:{}", record.measurement.wrapped as u8)
+        .map_err(UfmtReportError::Writer)?;
+    if let Some(trial) = trial {
+        ufmt::uwrite!(writer, " trial:{}", trial).map_err(UfmtReportError::Writer)?;
+    }
+    if let Some(counter) = record.counter {
+        ufmt::uwrite!(writer, " counter:{}", counter).map_err(UfmtReportError::Writer)?;
+    }
+    write_fields_ufmt(writer, record.fields)?;
+    ufmt::uWrite::write_str(writer, "\n").map_err(UfmtReportError::Writer)
+}
+
+#[cfg(feature = "ufmt")]
+pub fn write_outcome_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    record: &OutcomeRecord<'_>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    validate_token(record.benchmark).map_err(|_| UfmtReportError::InvalidToken)?;
+    validate_fields(record.fields).map_err(|_| UfmtReportError::InvalidToken)?;
+    ufmt::uwrite!(
+        writer,
+        "EM_OUTCOME schema:{} benchmark:{} status:{}",
+        SCHEMA_VERSION,
+        record.benchmark,
+        if record.passed { "PASS" } else { "FAIL" },
+    )
+    .map_err(UfmtReportError::Writer)?;
+    write_fields_ufmt(writer, record.fields)?;
+    ufmt::uWrite::write_str(writer, "\n").map_err(UfmtReportError::Writer)
+}
+
+#[cfg(feature = "ufmt")]
+fn write_boundary_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    record: &BoundaryRecord<'_>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    validate_token(record.benchmark).map_err(|_| UfmtReportError::InvalidToken)?;
+    validate_fields(record.fields).map_err(|_| UfmtReportError::InvalidToken)?;
+    ufmt::uwrite!(
+        writer,
+        "EM_BOUNDARY schema:{} benchmark:{} trial:{} phase:{}",
+        SCHEMA_VERSION,
+        record.benchmark,
+        record.trial,
+        phase_name(record.phase),
+    )
+    .map_err(UfmtReportError::Writer)?;
+    if let Some(passed) = record.passed {
+        ufmt::uwrite!(writer, " status:{}", if passed { "PASS" } else { "FAIL" })
+            .map_err(UfmtReportError::Writer)?;
+    }
+    write_fields_ufmt(writer, record.fields)?;
+    ufmt::uWrite::write_str(writer, "\n").map_err(UfmtReportError::Writer)
+}
+
+#[cfg(feature = "ufmt")]
+fn write_counter_snapshot_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    record: &CounterSnapshotRecord<'_>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    validate_token(record.benchmark).map_err(|_| UfmtReportError::InvalidToken)?;
+    validate_fields(record.fields).map_err(|_| UfmtReportError::InvalidToken)?;
+    ufmt::uwrite!(
+        writer,
+        "EM_COUNTER schema:{} benchmark:{} trial:{} phase:{} ticks:{} width:{} unit:{} frequency_hz:",
+        SCHEMA_VERSION,
+        record.benchmark,
+        record.trial,
+        phase_name(record.phase),
+        record.ticks,
+        record.width_bits,
+        unit_name(record.unit),
+    )
+    .map_err(UfmtReportError::Writer)?;
+    write_optional_u64_ufmt(writer, record.frequency_hz)?;
+    write_fields_ufmt(writer, record.fields)?;
+    ufmt::uWrite::write_str(writer, "\n").map_err(UfmtReportError::Writer)
+}
+
+#[cfg(feature = "ufmt")]
+fn write_metric_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    record: &MetricRecord<'_>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    validate_token(record.benchmark).map_err(|_| UfmtReportError::InvalidToken)?;
+    validate_token(record.name).map_err(|_| UfmtReportError::InvalidToken)?;
+    if let Some(unit) = record.unit {
+        validate_token(unit).map_err(|_| UfmtReportError::InvalidToken)?;
+    }
+    validate_fields(record.fields).map_err(|_| UfmtReportError::InvalidToken)?;
+    ufmt::uwrite!(
+        writer,
+        "EM_METRIC schema:{} benchmark:{} name:{} value:{} unit:{} policy:{}",
+        SCHEMA_VERSION,
+        record.benchmark,
+        record.name,
+        record.value,
+        record.unit.unwrap_or("none"),
+        record.policy.as_str(),
+    )
+    .map_err(UfmtReportError::Writer)?;
+    write_fields_ufmt(writer, record.fields)?;
+    ufmt::uWrite::write_str(writer, "\n").map_err(UfmtReportError::Writer)
+}
+
+#[cfg(feature = "ufmt")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UfmtReportError<E> {
+    Writer(E),
+    InvalidToken,
+}
+
+#[cfg(feature = "ufmt")]
+fn write_optional_u64_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    value: Option<u64>,
+) -> Result<(), UfmtReportError<W::Error>> {
+    match value {
+        Some(value) => ufmt::uwrite!(writer, "{}", value).map_err(UfmtReportError::Writer),
+        None => ufmt::uWrite::write_str(writer, "none").map_err(UfmtReportError::Writer),
+    }
+}
+
+#[cfg(feature = "ufmt")]
+fn write_fields_ufmt<W: ufmt::uWrite + ?Sized>(
+    writer: &mut W,
+    fields: &[Field<'_>],
+) -> Result<(), UfmtReportError<W::Error>> {
+    for field in fields {
+        ufmt::uwrite!(writer, " {}:", field.key).map_err(UfmtReportError::Writer)?;
+        match field.value {
+            FieldValue::Token(value) => {
+                ufmt::uWrite::write_str(writer, value).map_err(UfmtReportError::Writer)?;
+            }
+            FieldValue::U64(value) => {
+                ufmt::uwrite!(writer, "{}", value).map_err(UfmtReportError::Writer)?;
+            }
+            FieldValue::Bool(value) => {
+                ufmt::uWrite::write_str(writer, if value { "1" } else { "0" })
+                    .map_err(UfmtReportError::Writer)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 
 #[cfg(feature = "paired")]
 struct PairedEventRecord<'a, const N: usize> {
