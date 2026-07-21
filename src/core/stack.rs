@@ -194,9 +194,22 @@ impl<'stack> StackProbe<'stack> {
         stack: &'stack impl DescendingStack,
         config: StackConfig,
     ) -> Result<Self, StackError> {
-        let bottom = stack.bottom();
-        let top = stack.top();
-        let sp = stack.current_stack_pointer();
+        unsafe {
+            Self::paint_bounds(
+                stack.bottom(),
+                stack.top(),
+                stack.current_stack_pointer(),
+                config,
+            )
+        }
+    }
+
+    unsafe fn paint_bounds(
+        bottom: NonNull<u8>,
+        top: NonNull<u8>,
+        sp: NonNull<u8>,
+        config: StackConfig,
+    ) -> Result<Self, StackError> {
         let bottom_addr = bottom.as_ptr() as usize;
         let top_addr = top.as_ptr() as usize;
         let sp_addr = sp.as_ptr() as usize;
@@ -254,6 +267,233 @@ impl<'stack> StackProbe<'stack> {
             safe_zone_bytes: self.config.safe_zone_bytes,
             overflowed: painted_end == bottom || current == bottom,
         }
+    }
+}
+
+/// Linker-provided bounds combined with an architecture-specific SP reader.
+pub struct LinkerStack<A> {
+    bottom: NonNull<u8>,
+    top: NonNull<u8>,
+    architecture: A,
+}
+
+impl<A> LinkerStack<A> {
+    /// # Safety
+    /// The pointers must satisfy [`DescendingStack`]'s allocation contract.
+    pub unsafe fn new(bottom: *mut u8, top: *mut u8, architecture: A) -> Self {
+        Self {
+            bottom: NonNull::new(bottom).expect("stack bottom must be non-null"),
+            top: NonNull::new(top).expect("stack top must be non-null"),
+            architecture,
+        }
+    }
+}
+
+/// Architecture adapter that snapshots the current stack pointer.
+pub trait StackPointer {
+    fn current_stack_pointer(&self) -> NonNull<u8>;
+}
+
+// SAFETY: construction establishes the bounds and A supplies the current SP.
+unsafe impl<A: StackPointer> DescendingStack for LinkerStack<A> {
+    fn bottom(&self) -> NonNull<u8> {
+        self.bottom
+    }
+
+    fn top(&self) -> NonNull<u8> {
+        self.top
+    }
+
+    fn current_stack_pointer(&self) -> NonNull<u8> {
+        self.architecture.current_stack_pointer()
+    }
+}
+
+#[cfg(all(feature = "cortex-m", target_arch = "arm"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CortexM;
+
+/// Rust target-family name for the active Cortex-M architecture.
+#[cfg(all(feature = "cortex-m", target_arch = "arm"))]
+pub const fn cortex_m_architecture_name() -> &'static str {
+    if cfg!(krabi_caliper_armv6m) {
+        "thumbv6m"
+    } else if cfg!(krabi_caliper_armv7m) {
+        "thumbv7m"
+    } else if cfg!(krabi_caliper_armv7em) {
+        "thumbv7em"
+    } else if cfg!(krabi_caliper_armv8m_base) {
+        "thumbv8m.base"
+    } else if cfg!(krabi_caliper_armv8m_main) {
+        "thumbv8m.main"
+    } else {
+        "thumb-unknown"
+    }
+}
+
+#[cfg(all(feature = "cortex-m", target_arch = "arm"))]
+impl StackPointer for CortexM {
+    fn current_stack_pointer(&self) -> NonNull<u8> {
+        let sp: usize;
+        // SAFETY: this only snapshots SP.
+        unsafe {
+            core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+            NonNull::new_unchecked(sp as *mut u8)
+        }
+    }
+}
+
+#[cfg(all(feature = "cortex-m", target_arch = "arm"))]
+impl LinkerStack<CortexM> {
+    /// Uses the conventional `cortex-m-rt` stack floor and top symbols.
+    ///
+    /// # Safety
+    /// The linker symbols must describe writable stack storage owned by the caller.
+    pub unsafe fn cortex_m_runtime() -> Self {
+        unsafe extern "C" {
+            static _stack_end: u8;
+            static _stack_start: u8;
+        }
+        unsafe {
+            Self::new(
+                core::ptr::addr_of!(_stack_end).cast_mut(),
+                core::ptr::addr_of!(_stack_start).cast_mut(),
+                CortexM,
+            )
+        }
+    }
+}
+
+#[cfg(all(feature = "cortex-m", target_arch = "arm"))]
+/// Paints the conventional `cortex-m-rt` stack allocation.
+///
+/// # Safety
+/// The linker-provided stack range must be exclusively owned while the probe is active.
+pub unsafe fn paint_cortex_m_runtime<const SAFE: usize>() -> Result<StackProbe<'static>, StackError>
+{
+    let stack = unsafe { LinkerStack::<CortexM>::cortex_m_runtime() };
+    unsafe {
+        StackProbe::paint_bounds(
+            stack.bottom(),
+            stack.top(),
+            stack.current_stack_pointer(),
+            StackConfig::new(SAFE),
+        )
+    }
+}
+
+#[cfg(all(
+    feature = "risc-v",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RiscV;
+
+#[cfg(all(
+    feature = "risc-v",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
+impl StackPointer for RiscV {
+    fn current_stack_pointer(&self) -> NonNull<u8> {
+        let sp: usize;
+        unsafe {
+            core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack));
+            NonNull::new_unchecked(sp as *mut u8)
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "risc-v",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
+impl LinkerStack<RiscV> {
+    /// # Safety
+    /// `_sheap.._stack_start` must be writable and reserved for stack probing.
+    pub unsafe fn riscv_runtime() -> Self {
+        unsafe extern "C" {
+            static _sheap: u8;
+            static _stack_start: u8;
+        }
+        unsafe {
+            Self::new(
+                core::ptr::addr_of!(_sheap).cast_mut(),
+                core::ptr::addr_of!(_stack_start).cast_mut(),
+                RiscV,
+            )
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "risc-v",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
+/// Paints the conventional `riscv-rt` stack allocation.
+///
+/// # Safety
+/// The linker-provided stack range must be exclusively owned while the probe is active.
+pub unsafe fn paint_riscv_runtime<const SAFE: usize>() -> Result<StackProbe<'static>, StackError> {
+    let stack = unsafe { LinkerStack::<RiscV>::riscv_runtime() };
+    unsafe {
+        StackProbe::paint_bounds(
+            stack.bottom(),
+            stack.top(),
+            stack.current_stack_pointer(),
+            StackConfig::new(SAFE),
+        )
+    }
+}
+
+#[cfg(all(feature = "avr", target_arch = "avr"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Avr;
+
+#[cfg(all(feature = "avr", target_arch = "avr"))]
+impl StackPointer for Avr {
+    fn current_stack_pointer(&self) -> NonNull<u8> {
+        let lo: u8;
+        let hi: u8;
+        unsafe {
+            core::arch::asm!(
+                "in {sreg}, 0x3F", "cli", "in {lo}, 0x3D", "in {hi}, 0x3E",
+                "out 0x3F, {sreg}", sreg = out(reg) _, lo = out(reg) lo, hi = out(reg) hi,
+                options(nomem, nostack, preserves_flags),
+            );
+            NonNull::new_unchecked((((hi as usize) << 8) | lo as usize) as *mut u8)
+        }
+    }
+}
+
+#[cfg(all(feature = "avr", target_arch = "avr"))]
+impl LinkerStack<Avr> {
+    /// # Safety
+    /// `_end..ram_end_exclusive` must be writable SRAM reserved for the stack.
+    pub unsafe fn avr_runtime(ram_end_exclusive: usize) -> Self {
+        unsafe extern "C" {
+            static mut _end: u8;
+        }
+        unsafe { Self::new(&raw mut _end, ram_end_exclusive as *mut u8, Avr) }
+    }
+}
+
+#[cfg(all(feature = "avr", target_arch = "avr"))]
+/// Paints the conventional avr-libc stack allocation.
+///
+/// # Safety
+/// `_end..ram_end_exclusive` must be writable SRAM exclusively owned by the probe.
+pub unsafe fn paint_avr_runtime<const SAFE: usize>(
+    ram_end_exclusive: usize,
+    sentinel: u8,
+) -> Result<StackProbe<'static>, StackError> {
+    let stack = unsafe { LinkerStack::<Avr>::avr_runtime(ram_end_exclusive) };
+    unsafe {
+        StackProbe::paint_bounds(
+            stack.bottom(),
+            stack.top(),
+            stack.current_stack_pointer(),
+            StackConfig::new(SAFE).sentinel(sentinel),
+        )
     }
 }
 

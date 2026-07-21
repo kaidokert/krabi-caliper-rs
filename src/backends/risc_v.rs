@@ -8,6 +8,13 @@ use crate::stack::{DescendingStack, StackConfig};
 use crate::{Benchmark, BenchmarkError, BenchmarkReporter, BenchmarkResult, CounterPlatform};
 use crate::{Counter, Measurement, Unit};
 
+#[cfg(feature = "stack")]
+use crate::FootprintError;
+#[cfg(feature = "stack")]
+use crate::report::{Field, MeasurementRecord, OutcomeRecord, StackRecord, StackReporter};
+#[cfg(feature = "stack")]
+use crate::stack::paint_riscv_runtime;
+
 const CSR_MCYCLE: usize = 0xB00;
 const CSR_MINSTRET: usize = 0xB02;
 const CSR_MCYCLEH: usize = 0xB80;
@@ -119,6 +126,121 @@ impl Counter for MinstretCounter {
     fn elapsed(&mut self, start: Self::Instant) -> Measurement {
         elapsed_measurement(start, self.now(), Unit::Instructions, None)
     }
+}
+
+/// A 32-bit MMIO UART transmit FIFO whose high bit reports `full`.
+#[cfg(feature = "uart")]
+pub struct MmioTxFifo32<const TXDATA: usize>;
+
+#[cfg(feature = "uart")]
+impl<const TXDATA: usize> MmioTxFifo32<TXDATA> {
+    /// # Safety
+    /// `TXDATA` must be a writable transmit-data register exclusively owned by this writer.
+    pub const unsafe fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "uart")]
+impl<const TXDATA: usize> crate::protocol::uart::WriteByte for MmioTxFifo32<TXDATA> {
+    fn write_byte(&mut self, byte: u8) {
+        let register = TXDATA as *mut u32;
+        unsafe {
+            while core::ptr::read_volatile(register) & (1 << 31) != 0 {
+                core::hint::spin_loop();
+            }
+            core::ptr::write_volatile(register, byte as u32);
+        }
+    }
+}
+
+/// Writes one application-authorized 32-bit MMIO control register.
+///
+/// # Safety
+/// `address` must identify a writable register owned by the caller.
+pub unsafe fn write_mmio32(address: usize, value: u32) {
+    unsafe { core::ptr::write_volatile(address as *mut u32, value) }
+}
+
+/// Client-owned policy for one RISC-V footprint operation.
+#[cfg(feature = "stack")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FootprintConfig<'a> {
+    pub benchmark: &'a str,
+    pub fields: &'a [Field<'a>],
+    pub cycle_frequency_hz: Option<u64>,
+}
+
+#[cfg(feature = "stack")]
+impl<'a> FootprintConfig<'a> {
+    pub const fn new(benchmark: &'a str, fields: &'a [Field<'a>]) -> Self {
+        Self {
+            benchmark,
+            fields,
+            cycle_frequency_hz: None,
+        }
+    }
+
+    pub const fn frequency_hz(mut self, frequency_hz: u64) -> Self {
+        self.cycle_frequency_hz = Some(frequency_hz);
+        self
+    }
+}
+
+/// Paints the runtime stack, measures one operation, and emits canonical events.
+///
+/// # Safety
+/// The `riscv-rt` linker stack must be exclusively owned while the probe is active.
+#[cfg(feature = "stack")]
+pub unsafe fn run_footprint<const SAFE_ZONE_BYTES: usize, R: StackReporter>(
+    reporter: impl FnOnce() -> R,
+    config: FootprintConfig<'_>,
+    operation: fn() -> bool,
+) -> Result<bool, FootprintError<R::Error>> {
+    let stack_probe =
+        unsafe { paint_riscv_runtime::<SAFE_ZONE_BYTES>() }.map_err(FootprintError::Stack)?;
+    let mut cycles = McycleCounter::new(config.cycle_frequency_hz);
+    let mut instructions = MinstretCounter::new();
+    let cycles_start = cycles.now();
+    let instructions_start = instructions.now();
+    let passed = operation();
+    let instruction_measurement = instructions.elapsed(instructions_start);
+    let cycle_measurement = cycles.elapsed(cycles_start);
+    let stack = unsafe { stack_probe.measure() };
+    let passed = passed && !stack.overflowed;
+    let mut reporter = reporter();
+
+    reporter
+        .measurement(&MeasurementRecord {
+            benchmark: config.benchmark,
+            measurement: instruction_measurement,
+            counter: Some("minstret"),
+            fields: config.fields,
+        })
+        .map_err(FootprintError::Reporter)?;
+    reporter
+        .measurement(&MeasurementRecord {
+            benchmark: config.benchmark,
+            measurement: cycle_measurement,
+            counter: Some("mcycle"),
+            fields: config.fields,
+        })
+        .map_err(FootprintError::Reporter)?;
+    reporter
+        .stack_measurement(&StackRecord {
+            benchmark: config.benchmark,
+            measurement: stack,
+            fields: config.fields,
+        })
+        .map_err(FootprintError::Reporter)?;
+    reporter
+        .outcome(&OutcomeRecord {
+            benchmark: config.benchmark,
+            passed,
+            fields: config.fields,
+        })
+        .map_err(FootprintError::Reporter)?;
+    Ok(passed)
 }
 
 /// Runs a repeated cycle benchmark with a caller-owned stack allocation.

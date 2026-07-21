@@ -31,7 +31,13 @@ mod atmega2560 {
 
     use super::{extend_timer16, timer_measurement};
     #[cfg(feature = "stack")]
+    use crate::FootprintError;
+    #[cfg(feature = "stack")]
+    use crate::report::{Field, MeasurementRecord, OutcomeRecord, StackRecord, StackReporter};
+    #[cfg(feature = "stack")]
     use crate::stack::{DescendingStack, StackConfig};
+    #[cfg(feature = "stack")]
+    use crate::stack::{StackMeasurement, paint_avr_runtime};
     #[cfg(feature = "stack")]
     use crate::{Benchmark, BenchmarkError, BenchmarkReporter, BenchmarkResult, CounterPlatform};
     use crate::{Counter, Measurement};
@@ -110,6 +116,97 @@ mod atmega2560 {
         }
     }
 
+    /// Client-owned policy for one ATmega2560 footprint operation.
+    #[cfg(feature = "stack")]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct FootprintConfig<'a> {
+        pub benchmark: &'a str,
+        pub fields: &'a [Field<'a>],
+        pub sentinel: u8,
+        pub frequency_hz: Option<u64>,
+    }
+
+    #[cfg(feature = "stack")]
+    impl<'a> FootprintConfig<'a> {
+        pub const fn new(benchmark: &'a str, fields: &'a [Field<'a>]) -> Self {
+            Self {
+                benchmark,
+                fields,
+                sentinel: crate::stack::DEFAULT_SENTINEL,
+                frequency_hz: Some(15_625),
+            }
+        }
+
+        pub const fn sentinel(mut self, sentinel: u8) -> Self {
+            self.sentinel = sentinel;
+            self
+        }
+
+        pub const fn frequency_hz(mut self, frequency_hz: u64) -> Self {
+            self.frequency_hz = Some(frequency_hz);
+            self
+        }
+    }
+
+    /// Paints the runtime stack, measures one operation, and emits canonical events.
+    ///
+    /// # Safety
+    /// The avr-libc `_end..RAMEND` stack region must be exclusively owned while active.
+    #[cfg(feature = "stack")]
+    pub unsafe fn run_footprint<const SAFE_ZONE_BYTES: usize, R: StackReporter>(
+        timer: &mut TC1,
+        reporter: &mut R,
+        config: FootprintConfig<'_>,
+        operation: fn() -> bool,
+    ) -> Result<bool, FootprintError<R::Error>> {
+        let stack_probe = unsafe { paint_avr_runtime::<SAFE_ZONE_BYTES>(0x2200, config.sentinel) }
+            .map_err(FootprintError::Stack)?;
+        let counter = Timer1Counter::start_prescale_1024(timer, config.frequency_hz);
+        let passed = operation();
+        let timer1 = timer_measurement(
+            counter.elapsed_ticks_since_start(),
+            config.frequency_hz,
+            false,
+        );
+        let stack = unsafe { stack_probe.measure() };
+        let passed = passed && !stack.overflowed;
+
+        report_footprint(reporter, config, passed, stack, timer1)?;
+        Ok(passed)
+    }
+
+    #[cfg(feature = "stack")]
+    fn report_footprint<R: StackReporter>(
+        reporter: &mut R,
+        config: FootprintConfig<'_>,
+        passed: bool,
+        stack: StackMeasurement,
+        timer1: Measurement,
+    ) -> Result<(), FootprintError<R::Error>> {
+        reporter
+            .measurement(&MeasurementRecord {
+                benchmark: config.benchmark,
+                measurement: timer1,
+                counter: Some("timer1"),
+                fields: config.fields,
+            })
+            .map_err(FootprintError::Reporter)?;
+        reporter
+            .stack_measurement(&StackRecord {
+                benchmark: config.benchmark,
+                measurement: stack,
+                fields: config.fields,
+            })
+            .map_err(FootprintError::Reporter)?;
+        reporter
+            .outcome(&OutcomeRecord {
+                benchmark: config.benchmark,
+                passed,
+                fields: config.fields,
+            })
+            .map_err(FootprintError::Reporter)
+    }
+
     /// Runs a repeated Timer1 benchmark with a caller-owned stack allocation.
     ///
     /// # Safety
@@ -142,6 +239,8 @@ mod atmega2560 {
 
 #[cfg(all(feature = "avr-atmega2560", target_arch = "avr", feature = "stack"))]
 pub use atmega2560::run_benchmark as run_atmega2560_benchmark;
+#[cfg(all(feature = "avr-atmega2560", target_arch = "avr", feature = "stack"))]
+pub use atmega2560::{FootprintConfig, run_footprint as run_atmega2560_footprint};
 #[cfg(all(feature = "avr-atmega2560", target_arch = "avr"))]
 pub use atmega2560::{Timer1Counter as Atmega2560Timer1Counter, park_simavr, timer1_overflow};
 
