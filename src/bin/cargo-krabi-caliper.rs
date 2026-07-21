@@ -1,5 +1,7 @@
 use std::ffi::OsString;
 use std::fs;
+#[cfg(feature = "ctgrind")]
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -266,8 +268,8 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             let spec = command.command_spec();
             println!("+ (cd {} && {})", spec.cwd.display(), spec.display());
             let output = CommandRunner.run(&spec)?;
-            print!("{}", output.stdout_lossy());
-            eprint!("{}", output.stderr_lossy());
+            std::io::stdout().write_all(&output.stdout)?;
+            std::io::stderr().write_all(&output.stderr)?;
             Ok(output.success())
         }
         Command::PanicAudit {
