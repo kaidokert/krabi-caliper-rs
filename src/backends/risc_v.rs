@@ -146,7 +146,9 @@ impl<const TXDATA: usize> crate::protocol::uart::WriteByte for MmioTxFifo32<TXDA
     fn write_byte(&mut self, byte: u8) {
         let register = TXDATA as *mut u32;
         unsafe {
-            while core::ptr::read_volatile(register) & (1 << 31) != 0 {}
+            while core::ptr::read_volatile(register) & (1 << 31) != 0 {
+                core::hint::spin_loop();
+            }
             core::ptr::write_volatile(register, byte as u32);
         }
     }
@@ -205,6 +207,7 @@ pub unsafe fn run_footprint<const SAFE_ZONE_BYTES: usize, R: StackReporter>(
     let instruction_measurement = instructions.elapsed(instructions_start);
     let cycle_measurement = cycles.elapsed(cycles_start);
     let stack = unsafe { stack_probe.measure() };
+    let passed = passed && !stack.overflowed;
     let mut reporter = reporter();
 
     reporter

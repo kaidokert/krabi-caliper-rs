@@ -194,9 +194,22 @@ impl<'stack> StackProbe<'stack> {
         stack: &'stack impl DescendingStack,
         config: StackConfig,
     ) -> Result<Self, StackError> {
-        let bottom = stack.bottom();
-        let top = stack.top();
-        let sp = stack.current_stack_pointer();
+        unsafe {
+            Self::paint_bounds(
+                stack.bottom(),
+                stack.top(),
+                stack.current_stack_pointer(),
+                config,
+            )
+        }
+    }
+
+    unsafe fn paint_bounds(
+        bottom: NonNull<u8>,
+        top: NonNull<u8>,
+        sp: NonNull<u8>,
+        config: StackConfig,
+    ) -> Result<Self, StackError> {
         let bottom_addr = bottom.as_ptr() as usize;
         let top_addr = top.as_ptr() as usize;
         let sp_addr = sp.as_ptr() as usize;
@@ -359,9 +372,14 @@ impl LinkerStack<CortexM> {
 pub unsafe fn paint_cortex_m_runtime<const SAFE: usize>() -> Result<StackProbe<'static>, StackError>
 {
     let stack = unsafe { LinkerStack::<CortexM>::cortex_m_runtime() };
-    // The linker allocation is static even though its provider is temporary.
-    unsafe { StackProbe::paint(&stack, StackConfig::new(SAFE)) }
-        .map(|probe| unsafe { core::mem::transmute::<StackProbe<'_>, StackProbe<'static>>(probe) })
+    unsafe {
+        StackProbe::paint_bounds(
+            stack.bottom(),
+            stack.top(),
+            stack.current_stack_pointer(),
+            StackConfig::new(SAFE),
+        )
+    }
 }
 
 #[cfg(all(
@@ -417,8 +435,14 @@ impl LinkerStack<RiscV> {
 /// The linker-provided stack range must be exclusively owned while the probe is active.
 pub unsafe fn paint_riscv_runtime<const SAFE: usize>() -> Result<StackProbe<'static>, StackError> {
     let stack = unsafe { LinkerStack::<RiscV>::riscv_runtime() };
-    unsafe { StackProbe::paint(&stack, StackConfig::new(SAFE)) }
-        .map(|probe| unsafe { core::mem::transmute::<StackProbe<'_>, StackProbe<'static>>(probe) })
+    unsafe {
+        StackProbe::paint_bounds(
+            stack.bottom(),
+            stack.top(),
+            stack.current_stack_pointer(),
+            StackConfig::new(SAFE),
+        )
+    }
 }
 
 #[cfg(all(feature = "avr", target_arch = "avr"))]
@@ -434,6 +458,7 @@ impl StackPointer for Avr {
             core::arch::asm!(
                 "in {sreg}, 0x3F", "cli", "in {lo}, 0x3D", "in {hi}, 0x3E",
                 "out 0x3F, {sreg}", sreg = out(reg) _, lo = out(reg) lo, hi = out(reg) hi,
+                options(nomem, nostack, preserves_flags),
             );
             NonNull::new_unchecked((((hi as usize) << 8) | lo as usize) as *mut u8)
         }
@@ -462,8 +487,14 @@ pub unsafe fn paint_avr_runtime<const SAFE: usize>(
     sentinel: u8,
 ) -> Result<StackProbe<'static>, StackError> {
     let stack = unsafe { LinkerStack::<Avr>::avr_runtime(ram_end_exclusive) };
-    unsafe { StackProbe::paint(&stack, StackConfig::new(SAFE).sentinel(sentinel)) }
-        .map(|probe| unsafe { core::mem::transmute::<StackProbe<'_>, StackProbe<'static>>(probe) })
+    unsafe {
+        StackProbe::paint_bounds(
+            stack.bottom(),
+            stack.top(),
+            stack.current_stack_pointer(),
+            StackConfig::new(SAFE).sentinel(sentinel),
+        )
+    }
 }
 
 #[cfg(test)]

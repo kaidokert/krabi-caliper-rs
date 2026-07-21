@@ -169,6 +169,7 @@ mod atmega2560 {
             false,
         );
         let stack = unsafe { stack_probe.measure() };
+        let passed = passed && !stack.overflowed;
 
         report_footprint(reporter, config, passed, stack, timer1)?;
         Ok(passed)

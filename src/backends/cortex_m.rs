@@ -160,7 +160,7 @@ pub use dwt::{DwtCycleCounter, DwtMeasurementPlatform, measure_in_critical_secti
 mod footprint {
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    use cortex_m::peripheral::{SYST, syst::SystClkSource};
+    use cortex_m::peripheral::{SCB, SYST, syst::SystClkSource};
 
     use crate::report::{Field, MeasurementRecord, OutcomeRecord, StackRecord, StackReporter};
     use crate::stack::{StackMeasurement, paint_cortex_m_runtime};
@@ -169,7 +169,14 @@ mod footprint {
     const SYSTICK_RELOAD: u32 = 0x00ff_ffff;
     static SYSTICK_WRAPS: AtomicU32 = AtomicU32::new(0);
 
-    fn extend_systick(wraps: u32, current: u32) -> u64 {
+    fn extend_systick(wraps: u32, current: u32, overflow_pending: bool) -> u64 {
+        // A pending exception can precede its handler. A high down-counter value
+        // distinguishes that case from an overflow occurring after the sample.
+        let wraps = if overflow_pending && current > SYSTICK_RELOAD / 2 {
+            wraps.wrapping_add(1)
+        } else {
+            wraps
+        };
         wraps as u64 * (SYSTICK_RELOAD as u64 + 1) + (SYSTICK_RELOAD as u64 - current as u64)
     }
 
@@ -187,6 +194,7 @@ mod footprint {
     impl SysTickCycleCounter {
         pub fn start(syst: &mut SYST, frequency_hz: Option<u64>) -> Self {
             SYSTICK_WRAPS.store(0, Ordering::SeqCst);
+            SCB::clear_pendst();
             syst.set_clock_source(SystClkSource::Core);
             syst.set_reload(SYSTICK_RELOAD);
             syst.clear_current();
@@ -208,7 +216,7 @@ mod footprint {
                 let current = SYST::get_current();
                 let wraps_after = SYSTICK_WRAPS.load(Ordering::SeqCst);
                 if wraps_before == wraps_after {
-                    return extend_systick(wraps_before, current);
+                    return extend_systick(wraps_before, current, SCB::is_pendst_pending());
                 }
             }
         }
@@ -280,10 +288,13 @@ mod footprint {
 
         #[cfg(all(feature = "cortex-m-dwt", not(krabi_caliper_armv6m)))]
         let mut dwt = if config.enable_dwt {
-            super::DwtCycleCounter::enable(
-                &mut peripherals.DCB,
-                &mut peripherals.DWT,
-                config.frequency_hz,
+            Some(
+                super::DwtCycleCounter::enable(
+                    &mut peripherals.DCB,
+                    &mut peripherals.DWT,
+                    config.frequency_hz,
+                )
+                .ok_or(FootprintError::CounterUnavailable)?,
             )
         } else {
             None
@@ -305,6 +316,7 @@ mod footprint {
         let dwt_measurement = None;
         let systick_measurement = systick.elapsed_since_start();
         let stack = unsafe { stack_probe.measure() };
+        let passed = passed && !stack.overflowed;
         let mut reporter = reporter();
 
         report_footprint(
