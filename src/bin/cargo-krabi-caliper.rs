@@ -4,6 +4,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "ctgrind")]
+use krabi_caliper::host::CommandRunner;
+#[cfg(feature = "ctgrind")]
+use krabi_caliper::host::ctgrind::CtgrindCommand;
 use krabi_caliper::host::panic_audit::{
     ArtifactKind, DEFAULT_FORBIDDEN_TARGETS, PanicAuditConfig, run as run_panic_audit,
 };
@@ -29,6 +33,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Execute a fixture binary under the canonical Valgrind policy.
+    #[cfg(feature = "ctgrind")]
+    Ctgrind {
+        binary: PathBuf,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long, default_value = "valgrind")]
+        valgrind: OsString,
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        /// Additional reviewed Valgrind option, for example a suppression file.
+        #[arg(long = "valgrind-arg", allow_hyphen_values = true)]
+        valgrind_args: Vec<OsString>,
+    },
     /// Build positive and negative-control artifacts and audit panic call sites.
     PanicAudit {
         #[arg(long, default_value = ".")]
@@ -233,6 +251,25 @@ fn resolve_config(config: Option<PathBuf>) -> PathBuf {
 
 fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
     match cli.command {
+        #[cfg(feature = "ctgrind")]
+        Command::Ctgrind {
+            binary,
+            cwd,
+            valgrind,
+            timeout_seconds,
+            valgrind_args,
+        } => {
+            let mut command = CtgrindCommand::new(binary, cwd);
+            command.valgrind = valgrind;
+            command.timeout = std::time::Duration::from_secs(timeout_seconds);
+            command.extra_args = valgrind_args;
+            let spec = command.command_spec();
+            println!("+ (cd {} && {})", spec.cwd.display(), spec.display());
+            let output = CommandRunner.run(&spec)?;
+            print!("{}", output.stdout_lossy());
+            eprint!("{}", output.stderr_lossy());
+            Ok(output.success())
+        }
         Command::PanicAudit {
             workspace,
             package,
@@ -509,6 +546,31 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ctgrind")]
+    #[test]
+    fn parses_ctgrind_command_and_valgrind_options() {
+        let parsed = Cli::try_parse_from([
+            "cargo-krabi-caliper",
+            "ctgrind",
+            "target/release/gate",
+            "--timeout-seconds",
+            "45",
+            "--valgrind-arg=--suppressions=ct.supp",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            parsed.command,
+            Command::Ctgrind {
+                binary,
+                timeout_seconds: 45,
+                valgrind_args,
+                ..
+            } if binary.as_os_str() == "target/release/gate"
+                && valgrind_args == [OsString::from("--suppressions=ct.supp")]
+        ));
+    }
 
     #[test]
     fn accepts_cargo_external_subcommand_argument_shape() {
