@@ -107,6 +107,9 @@ mod dwt {
     }
 
     /// DWT-backed benchmark platform with interrupt exclusion and barriers.
+    ///
+    /// The measured operation runs with interrupts disabled. It must not wait
+    /// for interrupt-driven I/O, timers, executors, or background work.
     pub struct DwtMeasurementPlatform<'dwt> {
         counter: DwtCycleCounter<'dwt>,
     }

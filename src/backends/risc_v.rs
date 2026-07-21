@@ -139,7 +139,11 @@ pub unsafe fn run_benchmark<const N: usize, R: BenchmarkReporter>(
     unsafe { benchmark.run_with_stack(&mut platform, reporter, stack, stack_config, operation) }
 }
 
-/// Parks a QEMU-style RISC-V target after reporting.
+/// Debugger-safe terminal loop for RISC-V measurement firmware.
+///
+/// This intentionally avoids `wfi`: attached debuggers can interact poorly
+/// with architectural wait instructions. A command runner should terminate
+/// the target after observing its completion record.
 pub fn park() -> ! {
     loop {
         core::hint::spin_loop();

@@ -26,7 +26,7 @@ fn timer_measurement(ticks: u64, frequency_hz: Option<u64>, wrapped: bool) -> Me
 mod atmega2560 {
     use core::cell::Cell;
 
-    use avr_device::atmega2560::TC1;
+    use avr_device::atmega2560::{CPU, TC1};
     use avr_device::interrupt::Mutex;
 
     use super::{extend_timer16, timer_measurement};
@@ -131,12 +131,11 @@ mod atmega2560 {
     }
 
     /// Terminates a simavr fixture after reporting without burning host CPU.
-    pub fn park_simavr() -> ! {
+    pub fn park_simavr(cpu: &CPU) -> ! {
         avr_device::interrupt::disable();
+        cpu.smcr.write(|writer| writer.se().set_bit());
         loop {
-            // SAFETY: interrupts are disabled and sleep is the terminal
-            // instruction expected by the simulator.
-            unsafe { core::arch::asm!("sleep") }
+            avr_device::asm::sleep();
         }
     }
 }
