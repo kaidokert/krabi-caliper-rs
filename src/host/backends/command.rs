@@ -1,3 +1,4 @@
+use std::eprintln;
 use std::ffi::{OsStr, OsString};
 use std::format;
 use std::io::{self, Read};
@@ -31,6 +32,7 @@ pub struct CommandSpec {
     pub timeout: Duration,
     pub completion_marker: Option<Vec<u8>>,
     pub completion_action: CompletionAction,
+    pub silent: bool,
 }
 
 impl CommandSpec {
@@ -44,6 +46,7 @@ impl CommandSpec {
             timeout: Duration::from_secs(60),
             completion_marker: None,
             completion_action: CompletionAction::Kill,
+            silent: false,
         }
     }
 
@@ -79,6 +82,12 @@ impl CommandSpec {
 
     pub const fn completion_action(mut self, action: CompletionAction) -> Self {
         self.completion_action = action;
+        self
+    }
+
+    /// Suppresses the default command announcement before execution.
+    pub const fn silent(mut self, silent: bool) -> Self {
+        self.silent = silent;
         self
     }
 
@@ -260,6 +269,9 @@ impl CommandRunner {
         stderr: Stdio,
     ) -> Result<ManagedChild, CommandError> {
         let display = spec.display();
+        if !spec.silent {
+            eprintln!("+ (cd {} && {display})", spec.cwd.display());
+        }
         let mut command = configured_command(spec, stdout, stderr);
         let child = command
             .group_spawn()

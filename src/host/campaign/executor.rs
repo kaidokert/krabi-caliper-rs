@@ -2,10 +2,16 @@
 pub struct CampaignSelection {
     pub quick: bool,
     pub cases: Vec<String>,
+    pub silent: bool,
 }
 
 pub struct CampaignExecutor {
     runner: CommandRunner,
+}
+
+struct RunContext<'a> {
+    environment: &'a ReproducibilityMetadata,
+    silent: bool,
 }
 
 impl Default for CampaignExecutor {
@@ -53,7 +59,7 @@ impl CampaignExecutor {
             validate_constant_time_config(policy)?;
             profile.constant_time = Some(policy.clone());
         }
-        let environment = self.collect_environment(workspace, &profile);
+        let environment = self.collect_environment(workspace, &profile, selection.silent);
         let mut cases = expand_cases(&campaign, selection)?;
         for case in &mut cases {
             let mut features = profile.build_features.clone();
@@ -77,7 +83,10 @@ impl CampaignExecutor {
                 workspace,
                 &campaign_dir,
                 &case,
-                &environment,
+                RunContext {
+                    environment: &environment,
+                    silent: selection.silent,
+                },
             )?;
             let passed = report.status == CaseStatus::Pass;
             reports.push(report);
@@ -101,9 +110,10 @@ impl CampaignExecutor {
         workspace: &Path,
         campaign_dir: &Path,
         case: &ExpandedCase,
-        environment: &ReproducibilityMetadata,
+        context: RunContext<'_>,
     ) -> Result<CaseReport, CampaignError> {
-        let mut environment = environment.clone();
+        let mut environment = context.environment.clone();
+        let silent = context.silent;
         environment.build.features = case.features.clone();
         let (campaign_name, profile_name) = run_identity;
         let case_dir = artifact_child(campaign_dir, &case.id, "expanded case id")?;
@@ -117,7 +127,7 @@ impl CampaignExecutor {
             path: case_dir.clone(),
             source,
         })?;
-        let build = cargo_build_spec(profile, workspace, case);
+        let build = cargo_build_spec(profile, workspace, case).silent(silent);
         let build_display = build.display();
         let build_output = self.runner.run(&build)?;
         write_bytes(&case_dir.join("build-stdout.log"), &build_output.stdout)?;
@@ -165,7 +175,7 @@ impl CampaignExecutor {
         let footprint = artifact_footprint(&built_artifact)?;
         let mut prepare_commands = Vec::new();
         for (index, prepare) in profile.prepare.iter().enumerate() {
-            let spec = configured_runner_command(prepare, workspace, &built_artifact);
+            let spec = configured_runner_command(prepare, workspace, &built_artifact).silent(silent);
             prepare_commands.push(spec.display());
             let output = self.runner.run(&spec)?;
             write_bytes(
@@ -209,7 +219,7 @@ impl CampaignExecutor {
         if let Some(seconds) = case.delay_before_run_seconds {
             std::thread::sleep(Duration::from_secs(seconds));
         }
-        let run = runner_spec(profile, workspace, case, &built_artifact)?;
+        let run = runner_spec(profile, workspace, case, &built_artifact)?.silent(silent);
         let run_display = run.display();
         let run_output = self.runner.run(&run)?;
         write_run_logs(&case_dir, &run_output)?;
@@ -259,6 +269,7 @@ impl CampaignExecutor {
         &self,
         workspace: &Path,
         profile: &ResolvedRunnerProfile,
+        silent: bool,
     ) -> ReproducibilityMetadata {
         let executable = profile
             .executable
@@ -268,7 +279,7 @@ impl CampaignExecutor {
                 RunnerKind::Command => "unknown",
             });
         let mut controlled_environment = profile.controlled_environment.clone();
-        if let Some(kernel) = command_value(workspace, "uname", &["-r"]) {
+        if let Some(kernel) = command_value(workspace, "uname", &["-r"], silent) {
             controlled_environment
                 .entry("host-kernel-release".to_string())
                 .or_insert(kernel);
@@ -283,9 +294,9 @@ impl CampaignExecutor {
                     .canonicalize()
                     .ok()
                     .map(|value| value.to_string_lossy().into_owned()),
-                repository: command_value(workspace, "git", &["remote", "get-url", "origin"]),
-                git_commit: command_value(workspace, "git", &["rev-parse", "HEAD"]),
-                dirty: command_output(workspace, "git", &["status", "--porcelain=v1"])
+                repository: command_value(workspace, "git", &["remote", "get-url", "origin"], silent),
+                git_commit: command_value(workspace, "git", &["rev-parse", "HEAD"], silent),
+                dirty: command_output(workspace, "git", &["status", "--porcelain=v1"], silent)
                     .map(|value| !value.is_empty()),
             },
             build: BuildMetadata {
@@ -295,12 +306,14 @@ impl CampaignExecutor {
                     "rustc",
                     &["--version"],
                     profile.toolchain.as_deref(),
+                    silent,
                 ),
                 cargo: command_value_with_toolchain(
                     workspace,
                     "cargo",
                     &["--version"],
                     profile.toolchain.as_deref(),
+                    silent,
                 ),
                 target: Some(profile.target.clone()),
                 optimization: Some(profile.cargo_profile.clone()),
@@ -311,7 +324,7 @@ impl CampaignExecutor {
                 board: profile.board.clone(),
                 mcu: profile.mcu.clone(),
                 runner: Some(executable.to_string()),
-                runner_version: command_value(workspace, executable, &["--version"]),
+                runner_version: command_value(workspace, executable, &["--version"], silent),
                 transport: profile.transport.clone(),
                 probe: profile.probe.clone(),
                 clock_frequency_hz: profile.clock_frequency_hz,
@@ -370,13 +383,13 @@ fn enrich_result(
     result.source = environment.source.clone();
 }
 
-fn command_value(workspace: &Path, program: &str, args: &[&str]) -> Option<String> {
-    let value = captured_command_output(workspace, program, args, None)?;
+fn command_value(workspace: &Path, program: &str, args: &[&str], silent: bool) -> Option<String> {
+    let value = captured_command_output(workspace, program, args, None, silent)?;
     (!value.is_empty()).then_some(value)
 }
 
 fn host_target(toolchain: Option<&str>) -> Option<String> {
-    captured_command_output(Path::new("."), "rustc", &["-vV"], toolchain)?
+    captured_command_output(Path::new("."), "rustc", &["-vV"], toolchain, true)?
         .lines()
         .find_map(|line| line.strip_prefix("host: ").map(ToString::to_string))
 }
@@ -386,12 +399,13 @@ fn command_value_with_toolchain(
     program: &str,
     args: &[&str],
     toolchain: Option<&str>,
+    silent: bool,
 ) -> Option<String> {
-    captured_command_output(workspace, program, args, toolchain)
+    captured_command_output(workspace, program, args, toolchain, silent)
 }
 
-fn command_output(workspace: &Path, program: &str, args: &[&str]) -> Option<String> {
-    captured_command_output(workspace, program, args, None)
+fn command_output(workspace: &Path, program: &str, args: &[&str], silent: bool) -> Option<String> {
+    captured_command_output(workspace, program, args, None, silent)
 }
 
 fn captured_command_output(
@@ -399,10 +413,12 @@ fn captured_command_output(
     program: &str,
     args: &[&str],
     toolchain: Option<&str>,
+    silent: bool,
 ) -> Option<String> {
     let mut spec = CommandSpec::new(program, workspace)
         .args(args.iter().copied())
-        .timeout(Duration::from_secs(5));
+        .timeout(Duration::from_secs(5))
+        .silent(silent);
     if let Some(toolchain) = toolchain {
         spec = spec.env("RUSTUP_TOOLCHAIN", toolchain);
     }

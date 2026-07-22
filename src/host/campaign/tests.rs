@@ -335,6 +335,7 @@ fn expands_complete_and_quick_campaign_matrices() {
         &CampaignSelection {
             quick: true,
             cases: Vec::new(),
+            silent: true,
         },
     )
     .unwrap();
@@ -408,6 +409,7 @@ fn unknown_case_selection_is_an_error() {
         &CampaignSelection {
             quick: false,
             cases: vec!["missing".to_string()],
+            silent: true,
         },
     )
     .unwrap_err();
