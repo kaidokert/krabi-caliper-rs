@@ -196,6 +196,7 @@ mod tests {
                 run_duration_ms: None,
                 status: CaseStatus::Pass,
                 error: None,
+                diagnostic: None,
                 result: Some(crate::host::RunResult {
                     welch_analyses: vec![WelchAnalysis {
                         fixture: "fixture".to_string(),

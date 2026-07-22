@@ -68,6 +68,8 @@ pub struct CaseReport {
     pub run_duration_ms: Option<u128>,
     pub status: CaseStatus,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
     pub result: Option<RunResult>,
 }
 
@@ -122,6 +124,26 @@ impl CampaignReport {
             }
             if let Some(identity) = &environment.target.configuration_identity {
                 output.push_str(&format!("- Configuration identity: `{identity}`\n\n"));
+            }
+        }
+        let failed = self
+            .cases
+            .iter()
+            .filter(|case| case.status != CaseStatus::Pass)
+            .collect::<Vec<_>>();
+        if !failed.is_empty() {
+            output.push_str("## Failures\n\n");
+            for case in failed {
+                output.push_str(&format!("### `{}` — `{:?}`\n\n", case.id, case.status));
+                output.push_str(&format!("**Reason:** {}\n\n", failure_reason(case)));
+                output.push_str("**Command:**\n\n```console\n");
+                output.push_str(failure_command(case));
+                output.push_str("\n```\n\n");
+                if let Some(diagnostic) = case.diagnostic.as_deref() {
+                    output.push_str("**Diagnostic excerpt:**\n\n```text\n");
+                    output.push_str(&fenced_text(diagnostic));
+                    output.push_str("\n```\n\n");
+                }
             }
         }
         output.push_str(
@@ -322,6 +344,49 @@ impl CampaignReport {
         }
         output
     }
+}
+
+impl CaseReport {
+    pub fn render_failure_markdown(&self) -> String {
+        let mut output = format!(
+            "# Embedded measurement failure\n\n- Case: `{}`\n- Status: **{:?}**\n- Reason: {}\n\n## Command\n\n```console\n{}\n```\n",
+            self.id,
+            self.status,
+            failure_reason(self),
+            failure_command(self),
+        );
+        if let Some(diagnostic) = self.diagnostic.as_deref() {
+            output.push_str("\n## Diagnostic excerpt\n\n```text\n");
+            output.push_str(&fenced_text(diagnostic));
+            output.push_str("\n```\n");
+        }
+        output.push_str("\nFull command output is retained in the adjacent log files.\n");
+        output
+    }
+}
+
+fn failure_reason(case: &CaseReport) -> &str {
+    case.error.as_deref().unwrap_or(match case.status {
+        CaseStatus::WorkloadFail => "target reported a failing workload outcome",
+        CaseStatus::MeasurementError => "target reported invalid measurement evidence",
+        CaseStatus::BuildFailed => "build command failed",
+        CaseStatus::RunFailed => "runner command failed",
+        CaseStatus::TimedOut => "command timed out",
+        CaseStatus::ProtocolError => "target output did not satisfy the protocol",
+        CaseStatus::MissingTerminalRecord => "target emitted no matching terminal record",
+        CaseStatus::Pass => "case passed",
+    })
+}
+
+fn failure_command(case: &CaseReport) -> &str {
+    case.run_command
+        .as_deref()
+        .or_else(|| case.prepare_commands.last().map(String::as_str))
+        .unwrap_or(&case.build_command)
+}
+
+fn fenced_text(value: &str) -> String {
+    value.trim().replace("```", "` ` `")
 }
 
 fn metric_policy(policy: MetricPolicy) -> &'static str {

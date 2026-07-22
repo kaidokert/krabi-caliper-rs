@@ -106,6 +106,12 @@ impl CampaignExecutor {
         environment.build.features = case.features.clone();
         let (campaign_name, profile_name) = run_identity;
         let case_dir = artifact_root.join(campaign_name).join(&case.id);
+        if case_dir.exists() {
+            fs::remove_dir_all(&case_dir).map_err(|source| CampaignError::Io {
+                path: case_dir.clone(),
+                source,
+            })?;
+        }
         fs::create_dir_all(&case_dir).map_err(|source| CampaignError::Io {
             path: case_dir.clone(),
             source,
@@ -138,10 +144,11 @@ impl CampaignExecutor {
                 build_duration_ms: build_output.duration.as_millis(),
                 run_duration_ms: None,
                 status,
-                error: Some(build_output.combined_lossy()),
+                error: Some(command_failure_reason("build command", &build_output)),
+                diagnostic: diagnostic_excerpt(&build_output),
                 result: None,
             };
-            write_case_metadata(&case_dir, &report)?;
+            write_case_artifacts(&case_dir, &report)?;
             return Ok(report);
         }
         let built_artifact = artifact_from_build_output(case, &build_output.stdout)?;
@@ -190,13 +197,11 @@ impl CampaignExecutor {
                     } else {
                         CaseStatus::RunFailed
                     },
-                    error: Some(format!(
-                        "prepare command failed: {}",
-                        output.combined_lossy()
-                    )),
+                    error: Some(command_failure_reason("prepare command", &output)),
+                    diagnostic: diagnostic_excerpt(&output),
                     result: None,
                 };
-                write_case_metadata(&case_dir, &report)?;
+                write_case_artifacts(&case_dir, &report)?;
                 return Ok(report);
             }
         }
@@ -240,9 +245,12 @@ impl CampaignExecutor {
             run_duration_ms: Some(run_output.duration.as_millis()),
             status,
             error,
+            diagnostic: (status != CaseStatus::Pass)
+                .then(|| diagnostic_excerpt(&run_output))
+                .flatten(),
             result,
         };
-        write_case_metadata(&case_dir, &report)?;
+        write_case_artifacts(&case_dir, &report)?;
         Ok(report)
     }
 
@@ -679,14 +687,14 @@ fn classify_run(
     if output.timed_out {
         return (
             CaseStatus::TimedOut,
-            Some("runner timed out".to_string()),
+            Some(command_failure_reason("runner command", output)),
             parsed.ok(),
         );
     }
     if !output.success() {
         return (
             CaseStatus::RunFailed,
-            Some(format!("runner exited with {:?}", output.status)),
+            Some(command_failure_reason("runner command", output)),
             parsed.ok(),
         );
     }
@@ -831,6 +839,55 @@ fn write_case_metadata(path: &Path, report: &CaseReport) -> Result<(), CampaignE
         &path.join("metadata.json"),
         &serde_json::to_string_pretty(report).map_err(CampaignError::Json)?,
     )
+}
+
+fn write_case_artifacts(path: &Path, report: &CaseReport) -> Result<(), CampaignError> {
+    write_case_metadata(path, report)?;
+    if report.status != CaseStatus::Pass {
+        write_text(&path.join("report.md"), &report.render_failure_markdown())?;
+    }
+    Ok(())
+}
+
+fn command_failure_reason(phase: &str, output: &CommandOutput) -> String {
+    if output.timed_out {
+        format!(
+            "{phase} timed out after {:.1} seconds",
+            output.duration.as_secs_f64()
+        )
+    } else {
+        format!("{phase} exited with {}", display_exit_status(output.status))
+    }
+}
+
+fn display_exit_status(status: Option<std::process::ExitStatus>) -> String {
+    match status.and_then(|status| status.code()) {
+        Some(code) => format!("status {code}"),
+        None => status.map_or_else(|| "no exit status".to_string(), |status| status.to_string()),
+    }
+}
+
+fn diagnostic_excerpt(output: &CommandOutput) -> Option<String> {
+    let bytes = if !output.stderr.is_empty() {
+        &output.stderr
+    } else if !output.stdout.is_empty() {
+        &output.stdout
+    } else {
+        return None;
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(60);
+    let mut excerpt = lines[start..].join("\n");
+    const MAX_BYTES: usize = 12_000;
+    if excerpt.len() > MAX_BYTES {
+        let mut boundary = excerpt.len() - MAX_BYTES;
+        while !excerpt.is_char_boundary(boundary) {
+            boundary += 1;
+        }
+        excerpt = format!("…{}", &excerpt[boundary..]);
+    }
+    (!excerpt.trim().is_empty()).then_some(excerpt)
 }
 
 fn write_campaign_artifacts(path: &Path, report: &CampaignReport) -> Result<(), CampaignError> {
