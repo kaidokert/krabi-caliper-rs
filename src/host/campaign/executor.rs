@@ -68,13 +68,14 @@ impl CampaignExecutor {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("target/krabi-caliper")),
         );
+        let campaign_dir = artifact_child(&artifact_root, campaign_name, "campaign name")?;
         let mut reports = Vec::new();
         for case in cases {
             let report = self.run_case(
                 (campaign_name, &campaign.profile),
                 &profile,
                 workspace,
-                &artifact_root,
+                &campaign_dir,
                 &case,
                 &environment,
             )?;
@@ -89,7 +90,7 @@ impl CampaignExecutor {
             profile: campaign.profile.clone(),
             cases: reports,
         };
-        write_campaign_artifacts(&artifact_root.join(campaign_name), &report)?;
+        write_campaign_artifacts(&campaign_dir, &report)?;
         Ok(report)
     }
 
@@ -98,14 +99,14 @@ impl CampaignExecutor {
         run_identity: (&str, &str),
         profile: &ResolvedRunnerProfile,
         workspace: &Path,
-        artifact_root: &Path,
+        campaign_dir: &Path,
         case: &ExpandedCase,
         environment: &ReproducibilityMetadata,
     ) -> Result<CaseReport, CampaignError> {
         let mut environment = environment.clone();
         environment.build.features = case.features.clone();
         let (campaign_name, profile_name) = run_identity;
-        let case_dir = artifact_root.join(campaign_name).join(&case.id);
+        let case_dir = artifact_child(campaign_dir, &case.id, "expanded case id")?;
         if case_dir.exists() {
             fs::remove_dir_all(&case_dir).map_err(|source| CampaignError::Io {
                 path: case_dir.clone(),
@@ -145,7 +146,7 @@ impl CampaignExecutor {
                 run_duration_ms: None,
                 status,
                 error: Some(command_failure_reason("build command", &build_output)),
-                diagnostic: diagnostic_excerpt(&build_output),
+                diagnostic: diagnostic_excerpt(&build_output, false),
                 result: None,
             };
             write_case_artifacts(&case_dir, &report)?;
@@ -198,7 +199,7 @@ impl CampaignExecutor {
                         CaseStatus::RunFailed
                     },
                     error: Some(command_failure_reason("prepare command", &output)),
-                    diagnostic: diagnostic_excerpt(&output),
+                    diagnostic: diagnostic_excerpt(&output, true),
                     result: None,
                 };
                 write_case_artifacts(&case_dir, &report)?;
@@ -246,7 +247,7 @@ impl CampaignExecutor {
             status,
             error,
             diagnostic: (status != CaseStatus::Pass)
-                .then(|| diagnostic_excerpt(&run_output))
+                .then(|| diagnostic_excerpt(&run_output, true))
                 .flatten(),
             result,
         };
@@ -867,7 +868,14 @@ fn display_exit_status(status: Option<std::process::ExitStatus>) -> String {
     }
 }
 
-fn diagnostic_excerpt(output: &CommandOutput) -> Option<String> {
+fn diagnostic_excerpt(output: &CommandOutput, include_both_streams: bool) -> Option<String> {
+    if include_both_streams && !output.stdout.is_empty() && !output.stderr.is_empty() {
+        return Some(format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            stream_excerpt(&output.stdout),
+            stream_excerpt(&output.stderr)
+        ));
+    }
     let bytes = if !output.stderr.is_empty() {
         &output.stderr
     } else if !output.stdout.is_empty() {
@@ -875,11 +883,15 @@ fn diagnostic_excerpt(output: &CommandOutput) -> Option<String> {
     } else {
         return None;
     };
+    Some(stream_excerpt(bytes))
+}
+
+fn stream_excerpt(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let lines = text.lines().collect::<Vec<_>>();
-    let start = lines.len().saturating_sub(60);
+    let start = lines.len().saturating_sub(40);
     let mut excerpt = lines[start..].join("\n");
-    const MAX_BYTES: usize = 12_000;
+    const MAX_BYTES: usize = 6_000;
     if excerpt.len() > MAX_BYTES {
         let mut boundary = excerpt.len() - MAX_BYTES;
         while !excerpt.is_char_boundary(boundary) {
@@ -887,7 +899,12 @@ fn diagnostic_excerpt(output: &CommandOutput) -> Option<String> {
         }
         excerpt = format!("…{}", &excerpt[boundary..]);
     }
-    (!excerpt.trim().is_empty()).then_some(excerpt)
+    excerpt
+}
+
+fn artifact_child(root: &Path, component: &str, kind: &str) -> Result<PathBuf, CampaignError> {
+    validate_artifact_component(kind, component)?;
+    Ok(root.join(component))
 }
 
 fn write_campaign_artifacts(path: &Path, report: &CampaignReport) -> Result<(), CampaignError> {

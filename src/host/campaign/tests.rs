@@ -230,6 +230,40 @@ cases = [{ name = "fixture", example = "fixture" }]
 }
 
 #[test]
+fn rejects_artifact_identifiers_that_can_escape_the_output_directory() {
+    for input in [
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+[campaigns."../escape"]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+[campaigns.test]
+profile = "host"
+cases = [{ name = "../../../escape", example = "fixture" }]
+"#,
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+[campaigns.test]
+profile = "host"
+matrix = { size = ["../../escape"] }
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    ] {
+        let error = parse(input).validate().unwrap_err().to_string();
+        assert!(error.contains("must be one safe path component"), "{error}");
+    }
+}
+
+#[test]
 fn rejects_ambiguous_cases_and_constant_time_policy() {
     let ambiguous = parse(
         r#"
@@ -591,7 +625,7 @@ fn run_failures_show_the_command_reason_and_target_output() {
 runner = "command"
 target = "host"
 executable = "sh"
-args = ["-c", "printf 'PANIC: reporter rejected reserved field\\n'; exit 7"]
+args = ["-c", "printf 'PANIC: reporter rejected reserved field\\n'; printf 'emulator warning\\n' >&2; exit 7"]
 
 [campaigns.failing]
 profile = "host"
@@ -612,7 +646,10 @@ cases = [{ name = "fixture", example = "fixture" }]
     let markdown = report.render_markdown();
     assert!(markdown.contains("runner command exited with status 7"));
     assert!(markdown.contains("sh -c"));
+    assert!(markdown.contains("--- stdout ---"));
     assert!(markdown.contains("PANIC: reporter rejected reserved field"));
+    assert!(markdown.contains("--- stderr ---"));
+    assert!(markdown.contains("emulator warning"));
     std::fs::remove_dir_all(workspace).unwrap();
 }
 
