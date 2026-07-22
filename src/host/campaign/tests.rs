@@ -230,6 +230,40 @@ cases = [{ name = "fixture", example = "fixture" }]
 }
 
 #[test]
+fn rejects_artifact_identifiers_that_can_escape_the_output_directory() {
+    for input in [
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+[campaigns."../escape"]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+[campaigns.test]
+profile = "host"
+cases = [{ name = "../../../escape", example = "fixture" }]
+"#,
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+[campaigns.test]
+profile = "host"
+matrix = { size = ["../../escape"] }
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    ] {
+        let error = parse(input).validate().unwrap_err().to_string();
+        assert!(error.contains("must be one safe path component"), "{error}");
+    }
+}
+
+#[test]
 fn rejects_ambiguous_cases_and_constant_time_policy() {
     let ambiguous = parse(
         r#"
@@ -301,6 +335,7 @@ fn expands_complete_and_quick_campaign_matrices() {
         &CampaignSelection {
             quick: true,
             cases: Vec::new(),
+            silent: true,
         },
     )
     .unwrap();
@@ -374,6 +409,7 @@ fn unknown_case_selection_is_an_error() {
         &CampaignSelection {
             quick: false,
             cases: vec!["missing".to_string()],
+            silent: true,
         },
     )
     .unwrap_err();
@@ -508,4 +544,148 @@ cases = [{ name = "fixture", example = "fixture" }]
 
     let profile = config.resolve_profile("avr").unwrap();
     assert_eq!(profile.completion_marker.as_deref(), Some("EM_OUTCOME"));
+}
+
+#[cfg(unix)]
+fn failure_workspace(name: &str, source: &str) -> PathBuf {
+    let workspace =
+        std::env::temp_dir().join(format!("krabi-caliper-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(workspace.join("examples")).unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "campaign-failure-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[example]]
+name = "fixture"
+path = "examples/fixture.rs"
+
+[workspace]
+"#,
+    )
+    .unwrap();
+    std::fs::write(workspace.join("examples/fixture.rs"), source).unwrap();
+    workspace
+}
+
+#[cfg(unix)]
+#[test]
+fn build_failures_are_obvious_and_replace_stale_reports() {
+    let workspace = failure_workspace(
+        "build-failure-test",
+        "compile_error!(\"deliberate build failure\");\nfn main() {}\n",
+    );
+    let stale_dir = workspace.join("target/krabi-caliper/failing/fixture");
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    std::fs::write(stale_dir.join("report.md"), "# stale PASS report\n").unwrap();
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+executable = "sh"
+args = ["-c", "exit 0"]
+
+[campaigns.failing]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(
+            &config,
+            "failing",
+            &workspace,
+            &CampaignSelection::default(),
+        )
+        .unwrap();
+
+    assert_eq!(report.cases[0].status, CaseStatus::BuildFailed);
+    let markdown = report.render_markdown();
+    assert!(markdown.contains("## Failures"));
+    assert!(markdown.contains("build command exited with status"));
+    assert!(markdown.contains("cargo build"));
+    assert!(markdown.contains("deliberate build failure"));
+    let case_report = std::fs::read_to_string(stale_dir.join("report.md")).unwrap();
+    assert!(case_report.starts_with("# Embedded measurement failure"));
+    assert!(!case_report.contains("stale PASS"));
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn run_failures_show_the_command_reason_and_target_output() {
+    let workspace = failure_workspace("run-failure-test", "fn main() {}\n");
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+executable = "sh"
+args = ["-c", "printf 'PANIC: reporter rejected reserved field\\n'; printf 'emulator warning\\n' >&2; exit 7"]
+
+[campaigns.failing]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(
+            &config,
+            "failing",
+            &workspace,
+            &CampaignSelection::default(),
+        )
+        .unwrap();
+
+    assert_eq!(report.cases[0].status, CaseStatus::RunFailed);
+    let markdown = report.render_markdown();
+    assert!(markdown.contains("runner command exited with status 7"));
+    assert!(markdown.contains("sh -c"));
+    assert!(markdown.contains("--- stdout ---"));
+    assert!(markdown.contains("PANIC: reporter rejected reserved field"));
+    assert!(markdown.contains("--- stderr ---"));
+    assert!(markdown.contains("emulator warning"));
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn timeouts_report_the_command_and_elapsed_deadline() {
+    let workspace = failure_workspace("timeout-test", "fn main() {}\n");
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+executable = "sh"
+args = ["-c", "sleep 5"]
+timeout-seconds = 1
+
+[campaigns.failing]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(
+            &config,
+            "failing",
+            &workspace,
+            &CampaignSelection::default(),
+        )
+        .unwrap();
+
+    assert_eq!(report.cases[0].status, CaseStatus::TimedOut);
+    let markdown = report.render_markdown();
+    assert!(markdown.contains("runner command timed out after"));
+    assert!(markdown.contains("sh -c"));
+    std::fs::remove_dir_all(workspace).unwrap();
 }

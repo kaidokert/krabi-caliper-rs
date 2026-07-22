@@ -2,10 +2,16 @@
 pub struct CampaignSelection {
     pub quick: bool,
     pub cases: Vec<String>,
+    pub silent: bool,
 }
 
 pub struct CampaignExecutor {
     runner: CommandRunner,
+}
+
+struct RunContext<'a> {
+    environment: &'a ReproducibilityMetadata,
+    silent: bool,
 }
 
 impl Default for CampaignExecutor {
@@ -53,7 +59,7 @@ impl CampaignExecutor {
             validate_constant_time_config(policy)?;
             profile.constant_time = Some(policy.clone());
         }
-        let environment = self.collect_environment(workspace, &profile);
+        let environment = self.collect_environment(workspace, &profile, selection.silent);
         let mut cases = expand_cases(&campaign, selection)?;
         for case in &mut cases {
             let mut features = profile.build_features.clone();
@@ -68,15 +74,19 @@ impl CampaignExecutor {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("target/krabi-caliper")),
         );
+        let campaign_dir = artifact_child(&artifact_root, campaign_name, "campaign name")?;
         let mut reports = Vec::new();
         for case in cases {
             let report = self.run_case(
                 (campaign_name, &campaign.profile),
                 &profile,
                 workspace,
-                &artifact_root,
+                &campaign_dir,
                 &case,
-                &environment,
+                RunContext {
+                    environment: &environment,
+                    silent: selection.silent,
+                },
             )?;
             let passed = report.status == CaseStatus::Pass;
             reports.push(report);
@@ -89,7 +99,7 @@ impl CampaignExecutor {
             profile: campaign.profile.clone(),
             cases: reports,
         };
-        write_campaign_artifacts(&artifact_root.join(campaign_name), &report)?;
+        write_campaign_artifacts(&campaign_dir, &report)?;
         Ok(report)
     }
 
@@ -98,19 +108,26 @@ impl CampaignExecutor {
         run_identity: (&str, &str),
         profile: &ResolvedRunnerProfile,
         workspace: &Path,
-        artifact_root: &Path,
+        campaign_dir: &Path,
         case: &ExpandedCase,
-        environment: &ReproducibilityMetadata,
+        context: RunContext<'_>,
     ) -> Result<CaseReport, CampaignError> {
-        let mut environment = environment.clone();
+        let mut environment = context.environment.clone();
+        let silent = context.silent;
         environment.build.features = case.features.clone();
         let (campaign_name, profile_name) = run_identity;
-        let case_dir = artifact_root.join(campaign_name).join(&case.id);
+        let case_dir = artifact_child(campaign_dir, &case.id, "expanded case id")?;
+        if case_dir.exists() {
+            fs::remove_dir_all(&case_dir).map_err(|source| CampaignError::Io {
+                path: case_dir.clone(),
+                source,
+            })?;
+        }
         fs::create_dir_all(&case_dir).map_err(|source| CampaignError::Io {
             path: case_dir.clone(),
             source,
         })?;
-        let build = cargo_build_spec(profile, workspace, case);
+        let build = cargo_build_spec(profile, workspace, case).silent(silent);
         let build_display = build.display();
         let build_output = self.runner.run(&build)?;
         write_bytes(&case_dir.join("build-stdout.log"), &build_output.stdout)?;
@@ -138,10 +155,11 @@ impl CampaignExecutor {
                 build_duration_ms: build_output.duration.as_millis(),
                 run_duration_ms: None,
                 status,
-                error: Some(build_output.combined_lossy()),
+                error: Some(command_failure_reason("build command", &build_output)),
+                diagnostic: diagnostic_excerpt(&build_output, false),
                 result: None,
             };
-            write_case_metadata(&case_dir, &report)?;
+            write_case_artifacts(&case_dir, &report)?;
             return Ok(report);
         }
         let built_artifact = artifact_from_build_output(case, &build_output.stdout)?;
@@ -157,7 +175,7 @@ impl CampaignExecutor {
         let footprint = artifact_footprint(&built_artifact)?;
         let mut prepare_commands = Vec::new();
         for (index, prepare) in profile.prepare.iter().enumerate() {
-            let spec = configured_runner_command(prepare, workspace, &built_artifact);
+            let spec = configured_runner_command(prepare, workspace, &built_artifact).silent(silent);
             prepare_commands.push(spec.display());
             let output = self.runner.run(&spec)?;
             write_bytes(
@@ -190,20 +208,18 @@ impl CampaignExecutor {
                     } else {
                         CaseStatus::RunFailed
                     },
-                    error: Some(format!(
-                        "prepare command failed: {}",
-                        output.combined_lossy()
-                    )),
+                    error: Some(command_failure_reason("prepare command", &output)),
+                    diagnostic: diagnostic_excerpt(&output, true),
                     result: None,
                 };
-                write_case_metadata(&case_dir, &report)?;
+                write_case_artifacts(&case_dir, &report)?;
                 return Ok(report);
             }
         }
         if let Some(seconds) = case.delay_before_run_seconds {
             std::thread::sleep(Duration::from_secs(seconds));
         }
-        let run = runner_spec(profile, workspace, case, &built_artifact)?;
+        let run = runner_spec(profile, workspace, case, &built_artifact)?.silent(silent);
         let run_display = run.display();
         let run_output = self.runner.run(&run)?;
         write_run_logs(&case_dir, &run_output)?;
@@ -240,9 +256,12 @@ impl CampaignExecutor {
             run_duration_ms: Some(run_output.duration.as_millis()),
             status,
             error,
+            diagnostic: (status != CaseStatus::Pass)
+                .then(|| diagnostic_excerpt(&run_output, true))
+                .flatten(),
             result,
         };
-        write_case_metadata(&case_dir, &report)?;
+        write_case_artifacts(&case_dir, &report)?;
         Ok(report)
     }
 
@@ -250,6 +269,7 @@ impl CampaignExecutor {
         &self,
         workspace: &Path,
         profile: &ResolvedRunnerProfile,
+        silent: bool,
     ) -> ReproducibilityMetadata {
         let executable = profile
             .executable
@@ -259,7 +279,7 @@ impl CampaignExecutor {
                 RunnerKind::Command => "unknown",
             });
         let mut controlled_environment = profile.controlled_environment.clone();
-        if let Some(kernel) = command_value(workspace, "uname", &["-r"]) {
+        if let Some(kernel) = command_value(workspace, "uname", &["-r"], silent) {
             controlled_environment
                 .entry("host-kernel-release".to_string())
                 .or_insert(kernel);
@@ -274,9 +294,9 @@ impl CampaignExecutor {
                     .canonicalize()
                     .ok()
                     .map(|value| value.to_string_lossy().into_owned()),
-                repository: command_value(workspace, "git", &["remote", "get-url", "origin"]),
-                git_commit: command_value(workspace, "git", &["rev-parse", "HEAD"]),
-                dirty: command_output(workspace, "git", &["status", "--porcelain=v1"])
+                repository: command_value(workspace, "git", &["remote", "get-url", "origin"], silent),
+                git_commit: command_value(workspace, "git", &["rev-parse", "HEAD"], silent),
+                dirty: command_output(workspace, "git", &["status", "--porcelain=v1"], silent)
                     .map(|value| !value.is_empty()),
             },
             build: BuildMetadata {
@@ -286,12 +306,14 @@ impl CampaignExecutor {
                     "rustc",
                     &["--version"],
                     profile.toolchain.as_deref(),
+                    silent,
                 ),
                 cargo: command_value_with_toolchain(
                     workspace,
                     "cargo",
                     &["--version"],
                     profile.toolchain.as_deref(),
+                    silent,
                 ),
                 target: Some(profile.target.clone()),
                 optimization: Some(profile.cargo_profile.clone()),
@@ -302,7 +324,7 @@ impl CampaignExecutor {
                 board: profile.board.clone(),
                 mcu: profile.mcu.clone(),
                 runner: Some(executable.to_string()),
-                runner_version: command_value(workspace, executable, &["--version"]),
+                runner_version: command_value(workspace, executable, &["--version"], silent),
                 transport: profile.transport.clone(),
                 probe: profile.probe.clone(),
                 clock_frequency_hz: profile.clock_frequency_hz,
@@ -361,13 +383,13 @@ fn enrich_result(
     result.source = environment.source.clone();
 }
 
-fn command_value(workspace: &Path, program: &str, args: &[&str]) -> Option<String> {
-    let value = captured_command_output(workspace, program, args, None)?;
+fn command_value(workspace: &Path, program: &str, args: &[&str], silent: bool) -> Option<String> {
+    let value = captured_command_output(workspace, program, args, None, silent)?;
     (!value.is_empty()).then_some(value)
 }
 
 fn host_target(toolchain: Option<&str>) -> Option<String> {
-    captured_command_output(Path::new("."), "rustc", &["-vV"], toolchain)?
+    captured_command_output(Path::new("."), "rustc", &["-vV"], toolchain, true)?
         .lines()
         .find_map(|line| line.strip_prefix("host: ").map(ToString::to_string))
 }
@@ -377,12 +399,13 @@ fn command_value_with_toolchain(
     program: &str,
     args: &[&str],
     toolchain: Option<&str>,
+    silent: bool,
 ) -> Option<String> {
-    captured_command_output(workspace, program, args, toolchain)
+    captured_command_output(workspace, program, args, toolchain, silent)
 }
 
-fn command_output(workspace: &Path, program: &str, args: &[&str]) -> Option<String> {
-    captured_command_output(workspace, program, args, None)
+fn command_output(workspace: &Path, program: &str, args: &[&str], silent: bool) -> Option<String> {
+    captured_command_output(workspace, program, args, None, silent)
 }
 
 fn captured_command_output(
@@ -390,10 +413,12 @@ fn captured_command_output(
     program: &str,
     args: &[&str],
     toolchain: Option<&str>,
+    silent: bool,
 ) -> Option<String> {
     let mut spec = CommandSpec::new(program, workspace)
         .args(args.iter().copied())
-        .timeout(Duration::from_secs(5));
+        .timeout(Duration::from_secs(5))
+        .silent(silent);
     if let Some(toolchain) = toolchain {
         spec = spec.env("RUSTUP_TOOLCHAIN", toolchain);
     }
@@ -679,14 +704,14 @@ fn classify_run(
     if output.timed_out {
         return (
             CaseStatus::TimedOut,
-            Some("runner timed out".to_string()),
+            Some(command_failure_reason("runner command", output)),
             parsed.ok(),
         );
     }
     if !output.success() {
         return (
             CaseStatus::RunFailed,
-            Some(format!("runner exited with {:?}", output.status)),
+            Some(command_failure_reason("runner command", output)),
             parsed.ok(),
         );
     }
@@ -831,6 +856,71 @@ fn write_case_metadata(path: &Path, report: &CaseReport) -> Result<(), CampaignE
         &path.join("metadata.json"),
         &serde_json::to_string_pretty(report).map_err(CampaignError::Json)?,
     )
+}
+
+fn write_case_artifacts(path: &Path, report: &CaseReport) -> Result<(), CampaignError> {
+    write_case_metadata(path, report)?;
+    if report.status != CaseStatus::Pass {
+        write_text(&path.join("report.md"), &report.render_failure_markdown())?;
+    }
+    Ok(())
+}
+
+fn command_failure_reason(phase: &str, output: &CommandOutput) -> String {
+    if output.timed_out {
+        format!(
+            "{phase} timed out after {:.1} seconds",
+            output.duration.as_secs_f64()
+        )
+    } else {
+        format!("{phase} exited with {}", display_exit_status(output.status))
+    }
+}
+
+fn display_exit_status(status: Option<std::process::ExitStatus>) -> String {
+    match status.and_then(|status| status.code()) {
+        Some(code) => format!("status {code}"),
+        None => status.map_or_else(|| "no exit status".to_string(), |status| status.to_string()),
+    }
+}
+
+fn diagnostic_excerpt(output: &CommandOutput, include_both_streams: bool) -> Option<String> {
+    if include_both_streams && !output.stdout.is_empty() && !output.stderr.is_empty() {
+        return Some(format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            stream_excerpt(&output.stdout),
+            stream_excerpt(&output.stderr)
+        ));
+    }
+    let bytes = if !output.stderr.is_empty() {
+        &output.stderr
+    } else if !output.stdout.is_empty() {
+        &output.stdout
+    } else {
+        return None;
+    };
+    Some(stream_excerpt(bytes))
+}
+
+fn stream_excerpt(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(40);
+    let mut excerpt = lines[start..].join("\n");
+    const MAX_BYTES: usize = 6_000;
+    if excerpt.len() > MAX_BYTES {
+        let mut boundary = excerpt.len() - MAX_BYTES;
+        while !excerpt.is_char_boundary(boundary) {
+            boundary += 1;
+        }
+        excerpt = format!("…{}", &excerpt[boundary..]);
+    }
+    excerpt
+}
+
+fn artifact_child(root: &Path, component: &str, kind: &str) -> Result<PathBuf, CampaignError> {
+    validate_artifact_component(kind, component)?;
+    Ok(root.join(component))
 }
 
 fn write_campaign_artifacts(path: &Path, report: &CampaignReport) -> Result<(), CampaignError> {

@@ -785,6 +785,7 @@ mod tests {
                 run_duration_ms: Some(1),
                 status: CaseStatus::Pass,
                 error: None,
+                diagnostic: None,
                 result: Some(result),
             }],
         }

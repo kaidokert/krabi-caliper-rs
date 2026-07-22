@@ -15,6 +15,7 @@ impl ToolkitConfig {
             self.resolve_profile(name)?;
         }
         for (name, campaign) in &self.campaigns {
+            validate_artifact_component("campaign name", name)?;
             if !self.profiles.contains_key(&campaign.profile) {
                 return Err(CampaignError::MissingProfile(campaign.profile.clone()));
             }
@@ -36,10 +37,14 @@ impl ToolkitConfig {
             );
             validate_cases(name, campaign, cases)?;
             for (axis, values) in &campaign.matrix {
+                validate_artifact_component("matrix axis", axis)?;
                 if values.is_empty() {
                     return Err(CampaignError::InvalidConfig(format!(
                         "campaign {name:?} matrix axis {axis:?} has no values"
                     )));
+                }
+                for value in values {
+                    validate_artifact_component("matrix value", value)?;
                 }
             }
             validate_matrix_features(name, campaign)?;
@@ -122,6 +127,7 @@ fn validate_cases(
     }
     let mut names = BTreeSet::new();
     for case in cases {
+        validate_artifact_component("case name", &case.name)?;
         if !names.insert(case.name.as_str()) {
             return Err(CampaignError::InvalidConfig(format!(
                 "campaign {campaign_name:?} has duplicate case {:?}",
@@ -151,6 +157,24 @@ fn validate_cases(
         if let Some(baseline) = case.baseline.as_deref() {
             validate_baseline(campaign_name, &case.name, baseline, &names)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_artifact_component(kind: &str, value: &str) -> Result<(), CampaignError> {
+    let path = Path::new(value);
+    let mut components = path.components();
+    let single_normal_component = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if value.is_empty()
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains('\0')
+        || !single_normal_component
+    {
+        return Err(CampaignError::InvalidConfig(format!(
+            "{kind} {value:?} must be one safe path component"
+        )));
     }
     Ok(())
 }

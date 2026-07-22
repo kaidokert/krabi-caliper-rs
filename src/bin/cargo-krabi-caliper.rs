@@ -100,6 +100,9 @@ enum Command {
         quick: bool,
         #[arg(long)]
         case: Vec<String>,
+        /// Suppress command announcements while retaining reports and logs.
+        #[arg(long)]
+        silent: bool,
     },
     Compare {
         current: PathBuf,
@@ -266,7 +269,6 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             command.timeout = std::time::Duration::from_secs(timeout_seconds);
             command.extra_args = valgrind_args;
             let spec = command.command_spec();
-            println!("+ (cd {} && {})", spec.cwd.display(), spec.display());
             let output = CommandRunner.run(&spec)?;
             std::io::stdout().write_all(&output.stdout)?;
             std::io::stderr().write_all(&output.stderr)?;
@@ -335,6 +337,7 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             workspace,
             quick,
             case,
+            silent,
         } => {
             let config = resolve_config(config);
             let config_text = fs::read_to_string(&config)?;
@@ -343,7 +346,11 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
                 &config,
                 &campaign,
                 &workspace,
-                &CampaignSelection { quick, cases: case },
+                &CampaignSelection {
+                    quick,
+                    cases: case,
+                    silent,
+                },
             )?;
             print!("{}", report.render_markdown());
             Ok(report.success())
@@ -587,6 +594,14 @@ mod tests {
             parsed.command,
             Command::Run { campaign, .. } if campaign == "demo"
         ));
+    }
+
+    #[test]
+    fn accepts_silent_campaign_execution() {
+        let parsed =
+            Cli::try_parse_from(["cargo-krabi-caliper", "run", "demo", "--silent"]).unwrap();
+
+        assert!(matches!(parsed.command, Command::Run { silent: true, .. }));
     }
 
     #[test]
