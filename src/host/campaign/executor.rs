@@ -156,7 +156,8 @@ impl CampaignExecutor {
                 run_duration_ms: None,
                 status,
                 error: Some(command_failure_reason("build command", &build_output)),
-                diagnostic: diagnostic_excerpt(&build_output, false),
+                stdout: build_output.stdout_lossy(),
+                stderr: build_output.stderr_lossy(),
                 result: None,
             };
             write_case_artifacts(&case_dir, &report)?;
@@ -209,7 +210,8 @@ impl CampaignExecutor {
                         CaseStatus::RunFailed
                     },
                     error: Some(command_failure_reason("prepare command", &output)),
-                    diagnostic: diagnostic_excerpt(&output, true),
+                    stdout: output.stdout_lossy(),
+                    stderr: output.stderr_lossy(),
                     result: None,
                 };
                 write_case_artifacts(&case_dir, &report)?;
@@ -256,9 +258,16 @@ impl CampaignExecutor {
             run_duration_ms: Some(run_output.duration.as_millis()),
             status,
             error,
-            diagnostic: (status != CaseStatus::Pass)
-                .then(|| diagnostic_excerpt(&run_output, true))
-                .flatten(),
+            stdout: if status != CaseStatus::Pass {
+                run_output.stdout_lossy()
+            } else {
+                String::new()
+            },
+            stderr: if status != CaseStatus::Pass {
+                run_output.stderr_lossy()
+            } else {
+                String::new()
+            },
             result,
         };
         write_case_artifacts(&case_dir, &report)?;
@@ -882,40 +891,6 @@ fn display_exit_status(status: Option<std::process::ExitStatus>) -> String {
         Some(code) => format!("status {code}"),
         None => status.map_or_else(|| "no exit status".to_string(), |status| status.to_string()),
     }
-}
-
-fn diagnostic_excerpt(output: &CommandOutput, include_both_streams: bool) -> Option<String> {
-    if include_both_streams && !output.stdout.is_empty() && !output.stderr.is_empty() {
-        return Some(format!(
-            "--- stdout ---\n{}\n--- stderr ---\n{}",
-            stream_excerpt(&output.stdout),
-            stream_excerpt(&output.stderr)
-        ));
-    }
-    let bytes = if !output.stderr.is_empty() {
-        &output.stderr
-    } else if !output.stdout.is_empty() {
-        &output.stdout
-    } else {
-        return None;
-    };
-    Some(stream_excerpt(bytes))
-}
-
-fn stream_excerpt(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    let lines = text.lines().collect::<Vec<_>>();
-    let start = lines.len().saturating_sub(40);
-    let mut excerpt = lines[start..].join("\n");
-    const MAX_BYTES: usize = 6_000;
-    if excerpt.len() > MAX_BYTES {
-        let mut boundary = excerpt.len() - MAX_BYTES;
-        while !excerpt.is_char_boundary(boundary) {
-            boundary += 1;
-        }
-        excerpt = format!("…{}", &excerpt[boundary..]);
-    }
-    excerpt
 }
 
 fn artifact_child(root: &Path, component: &str, kind: &str) -> Result<PathBuf, CampaignError> {

@@ -627,7 +627,7 @@ fn run_failures_show_the_command_reason_and_target_output() {
 runner = "command"
 target = "host"
 executable = "sh"
-args = ["-c", "printf 'PANIC: reporter rejected reserved field\\n'; printf 'emulator warning\\n' >&2; exit 7"]
+args = ["-c", "printf 'first target line\\n'; printf '%07000d\\n' 0; printf 'PANIC: reporter rejected reserved field\\n'; printf 'emulator warning\\n' >&2; exit 7"]
 
 [campaigns.failing]
 profile = "host"
@@ -648,10 +648,12 @@ cases = [{ name = "fixture", example = "fixture" }]
     let markdown = report.render_markdown();
     assert!(markdown.contains("runner command exited with status 7"));
     assert!(markdown.contains("sh -c"));
-    assert!(markdown.contains("--- stdout ---"));
+    assert!(markdown.contains("#### stdout"));
+    assert!(markdown.contains("first target line"));
     assert!(markdown.contains("PANIC: reporter rejected reserved field"));
-    assert!(markdown.contains("--- stderr ---"));
+    assert!(markdown.contains("#### stderr"));
     assert!(markdown.contains("emulator warning"));
+    assert!(report.cases[0].stdout.len() > 6_000);
     std::fs::remove_dir_all(workspace).unwrap();
 }
 
