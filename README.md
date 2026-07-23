@@ -17,10 +17,16 @@ debug probes, and hardware topology.
 
 ## Use it
 
+Measurement fixtures built as examples, tests, or benchmarks can keep Caliper
+as a development dependency:
+
 ```toml
 [dev-dependencies]
 krabi-caliper = { version = "0.1", features = ["cortex-m", "semihosting", "stack"] }
 ```
+
+Use `[dependencies]` instead when instrumentation is part of a normal library
+or binary target.
 
 Install the host tooling and run a configured campaign:
 

@@ -8,12 +8,16 @@ raw output, metadata, and reports needed to interpret that evidence.
 
 ## Target integration
 
-Select only the facilities used by the target:
+For measurement fixtures built as examples, tests, or benchmarks, select only
+the target facilities used and keep them out of the normal dependency graph:
 
 ```toml
 [dev-dependencies]
 krabi-caliper = { version = "0.1", features = ["cortex-m", "semihosting", "stack"] }
 ```
+
+Use `[dependencies]` instead when instrumentation is compiled into a normal
+library or binary target.
 
 Application-owned counters can be adapted without adopting a particular HAL:
 
@@ -110,8 +114,8 @@ In particular:
 
 - DWT cycle counts wrap at 32 bits.
 - ARMv6-M cores do not provide the DWT cycle counter.
-- ATmega2560 Timer1 wrap extension requires its overflow handler and enabled
-  global interrupts.
+- ATmega2560 Timer1 wrap extension requires its overflow handler and global
+  interrupts to be enabled.
 - Debugger output must remain outside measured intervals.
 - Cycle-count agreement is useful regression evidence, not proof of identical
   execution traces.
