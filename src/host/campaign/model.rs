@@ -68,8 +68,10 @@ pub struct CaseReport {
     pub run_duration_ms: Option<u128>,
     pub status: CaseStatus,
     pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostic: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stdout: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr: String,
     pub result: Option<RunResult>,
 }
 
@@ -139,11 +141,8 @@ impl CampaignReport {
                 output.push_str("**Command:**\n\n```console\n");
                 output.push_str(failure_command(case));
                 output.push_str("\n```\n\n");
-                if let Some(diagnostic) = case.diagnostic.as_deref() {
-                    output.push_str("**Diagnostic excerpt:**\n\n```text\n");
-                    output.push_str(&fenced_text(diagnostic));
-                    output.push_str("\n```\n\n");
-                }
+                render_output_stream(&mut output, "stdout", &case.stdout, 4);
+                render_output_stream(&mut output, "stderr", &case.stderr, 4);
             }
         }
         output.push_str(
@@ -355,14 +354,24 @@ impl CaseReport {
             failure_reason(self),
             failure_command(self),
         );
-        if let Some(diagnostic) = self.diagnostic.as_deref() {
-            output.push_str("\n## Diagnostic excerpt\n\n```text\n");
-            output.push_str(&fenced_text(diagnostic));
-            output.push_str("\n```\n");
-        }
-        output.push_str("\nFull command output is retained in the adjacent log files.\n");
+        render_output_stream(&mut output, "stdout", &self.stdout, 2);
+        render_output_stream(&mut output, "stderr", &self.stderr, 2);
         output
     }
+}
+
+fn render_output_stream(output: &mut String, name: &str, contents: &str, heading_level: usize) {
+    output.push('\n');
+    output.push_str(&"#".repeat(heading_level));
+    output.push(' ');
+    output.push_str(name);
+    output.push_str("\n\n```text\n");
+    if contents.is_empty() {
+        output.push_str("(empty)");
+    } else {
+        output.push_str(&fenced_text(contents));
+    }
+    output.push_str("\n```\n");
 }
 
 fn failure_reason(case: &CaseReport) -> &str {
