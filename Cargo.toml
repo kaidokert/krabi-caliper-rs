@@ -9,6 +9,9 @@ repository = "https://github.com/kaidokert/krabi-caliper-rs"
 keywords = ["embedded", "benchmark", "no-std", "profiling"]
 categories = ["embedded", "no-std", "development-tools::profiling"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 host = ["dep:serde", "serde/std", "dep:serde_json", "dep:object", "dep:rustc-demangle", "dep:command-group", "dep:regex"]
