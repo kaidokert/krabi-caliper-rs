@@ -1,5 +1,7 @@
 # Krabi Caliper
 
+[![Rust CI](https://github.com/kaidokert/krabi-caliper-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/kaidokert/krabi-caliper-rs/actions/workflows/ci.yml)
+
 Measurement tools for embedded Rust firmware and the host processes that build,
 run, and analyse it.
 
