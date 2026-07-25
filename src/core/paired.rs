@@ -8,6 +8,23 @@ pub enum Side {
     B,
 }
 
+/// Lifecycle phase for one paired-acquisition call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplePhase {
+    Warmup,
+    Recorded,
+}
+
+/// Position of one call in the paired acquisition sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SampleContext {
+    pub side: Side,
+    pub phase: SamplePhase,
+    pub block: usize,
+    pub position: usize,
+    pub ordinal: usize,
+}
+
 /// One balanced block that cancels first-order ordering drift.
 pub const ABBA: [Side; 4] = [Side::A, Side::B, Side::B, Side::A];
 /// The complementary balanced block.
@@ -61,6 +78,20 @@ impl<const N: usize> PairedRunner<N> {
 
     pub fn run(
         self,
+        measure: impl FnMut(Side) -> (Measurement, bool),
+    ) -> Result<PairedRun<N>, RunError> {
+        self.run_conditioned(|_| {}, measure)
+    }
+
+    /// Runs paired acquisition with an untimed callback before every sample.
+    ///
+    /// The callback runs immediately before `measure`, including during
+    /// warmups. It can establish an application-defined cache or peripheral
+    /// state without placing target-specific policy in the measurement
+    /// platform.
+    pub fn run_conditioned(
+        self,
+        mut before_sample: impl FnMut(SampleContext),
         mut measure: impl FnMut(Side) -> (Measurement, bool),
     ) -> Result<PairedRun<N>, RunError> {
         if N == 0 {
@@ -79,7 +110,18 @@ impl<const N: usize> PairedRunner<N> {
             .ok_or(RunError::BlockCountOverflow)?;
         while block < total_blocks {
             let order = if block % 2 == 0 { ABBA } else { BAAB };
-            for side in order {
+            for (position, side) in order.into_iter().enumerate() {
+                before_sample(SampleContext {
+                    side,
+                    phase: if block < self.warmup_blocks {
+                        SamplePhase::Warmup
+                    } else {
+                        SamplePhase::Recorded
+                    },
+                    block,
+                    position,
+                    ordinal: block * 4 + position,
+                });
                 let (measurement, ok) = measure(side);
                 if block >= self.warmup_blocks {
                     outputs_ok &= ok;
@@ -302,6 +344,44 @@ mod tests {
         assert_eq!(&order[8..], &ABBA);
         assert_eq!(run.samples.a.len(), 2);
         assert_eq!(run.samples.b.len(), 2);
+    }
+
+    #[test]
+    fn conditioned_runner_exposes_untimed_sample_context() {
+        use core::cell::Cell;
+
+        let mut contexts = [SampleContext {
+            side: Side::A,
+            phase: SamplePhase::Warmup,
+            block: 0,
+            position: 0,
+            ordinal: 0,
+        }; 8];
+        let current = Cell::new(contexts[0]);
+        let mut conditioned = 0;
+        let mut measured = 0;
+        PairedRunner::<2>::new()
+            .warmup_blocks(1)
+            .run_conditioned(
+                |context| {
+                    contexts[conditioned] = context;
+                    current.set(context);
+                    conditioned += 1;
+                },
+                |side| {
+                    assert_eq!(current.get().side, side);
+                    measured += 1;
+                    (cycles(measured as u64), true)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(conditioned, 8);
+        assert_eq!(measured, 8);
+        assert_eq!(contexts[0].phase, SamplePhase::Warmup);
+        assert_eq!(contexts[3].position, 3);
+        assert_eq!(contexts[4].phase, SamplePhase::Recorded);
+        assert_eq!(contexts[7].ordinal, 7);
     }
 
     #[test]
