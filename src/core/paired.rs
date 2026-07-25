@@ -16,6 +16,8 @@ pub enum SamplePhase {
 }
 
 /// Position of one call in the paired acquisition sequence.
+///
+/// `ordinal` includes warmup samples and equals `block * 4 + position`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleContext {
     pub side: Side,
@@ -78,9 +80,9 @@ impl<const N: usize> PairedRunner<N> {
 
     pub fn run(
         self,
-        measure: impl FnMut(Side) -> (Measurement, bool),
+        mut measure: impl FnMut(Side) -> (Measurement, bool),
     ) -> Result<PairedRun<N>, RunError> {
-        self.run_conditioned(|_| {}, measure)
+        self.run_conditioned(&mut (), |_, _| {}, |_, side| measure(side))
     }
 
     /// Runs paired acquisition with an untimed callback before every sample.
@@ -88,11 +90,13 @@ impl<const N: usize> PairedRunner<N> {
     /// The callback runs immediately before `measure`, including during
     /// warmups. It can establish an application-defined cache or peripheral
     /// state without placing target-specific policy in the measurement
-    /// platform.
-    pub fn run_conditioned(
+    /// platform. Both callbacks receive `state` sequentially, allowing them to
+    /// share one application-owned peripheral without interior mutability.
+    pub fn run_conditioned<S>(
         self,
-        mut before_sample: impl FnMut(SampleContext),
-        mut measure: impl FnMut(Side) -> (Measurement, bool),
+        state: &mut S,
+        mut before_sample: impl FnMut(&mut S, SampleContext),
+        mut measure: impl FnMut(&mut S, Side) -> (Measurement, bool),
     ) -> Result<PairedRun<N>, RunError> {
         if N == 0 {
             return Err(RunError::ZeroSampleCapacity);
@@ -111,18 +115,21 @@ impl<const N: usize> PairedRunner<N> {
         while block < total_blocks {
             let order = if block % 2 == 0 { ABBA } else { BAAB };
             for (position, side) in order.into_iter().enumerate() {
-                before_sample(SampleContext {
-                    side,
-                    phase: if block < self.warmup_blocks {
-                        SamplePhase::Warmup
-                    } else {
-                        SamplePhase::Recorded
+                before_sample(
+                    state,
+                    SampleContext {
+                        side,
+                        phase: if block < self.warmup_blocks {
+                            SamplePhase::Warmup
+                        } else {
+                            SamplePhase::Recorded
+                        },
+                        block,
+                        position,
+                        ordinal: block * 4 + position,
                     },
-                    block,
-                    position,
-                    ordinal: block * 4 + position,
-                });
-                let (measurement, ok) = measure(side);
+                );
+                let (measurement, ok) = measure(state, side);
                 if block >= self.warmup_blocks {
                     outputs_ok &= ok;
                     samples
@@ -363,12 +370,13 @@ mod tests {
         PairedRunner::<2>::new()
             .warmup_blocks(1)
             .run_conditioned(
-                |context| {
+                &mut (),
+                |_, context| {
                     contexts[conditioned] = context;
                     current.set(context);
                     conditioned += 1;
                 },
-                |side| {
+                |_, side| {
                     assert_eq!(current.get().side, side);
                     measured += 1;
                     (cycles(measured as u64), true)

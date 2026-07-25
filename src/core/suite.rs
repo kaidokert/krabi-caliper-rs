@@ -140,14 +140,17 @@ where
     /// Runs a positive fixture with an untimed callback before every sample.
     ///
     /// Use this to normalize application-owned cache, accelerator, or
-    /// peripheral state. The callback also runs for warmup samples.
-    pub fn positive_conditioned<I: ?Sized>(
+    /// peripheral state. The callback also runs for warmup samples. Both
+    /// callbacks receive `state` sequentially so they can safely share one
+    /// mutable application-owned resource.
+    pub fn positive_conditioned<I: ?Sized, S>(
         &mut self,
         fixture: &str,
         input_a: &I,
         input_b: &I,
-        before_sample: impl FnMut(SampleContext, &I),
-        operation: impl FnMut(&I) -> bool,
+        state: &mut S,
+        before_sample: impl FnMut(&mut S, SampleContext, &I),
+        operation: impl FnMut(&mut S, &I) -> bool,
     ) -> Result<bool, SuiteError<R::Error>> {
         self.fixture_conditioned(
             FixtureSpec {
@@ -161,6 +164,7 @@ where
                 ticks: self.config.positive_max_spread,
                 require_overlap: self.config.positive_require_overlap,
             },
+            state,
             before_sample,
             operation,
         )
@@ -230,17 +234,22 @@ where
     }
 
     /// Runs a custom fixture with untimed per-sample state conditioning.
-    pub fn fixture_conditioned<I: ?Sized>(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "custom fixtures expose the fixture, policy, shared state, and both lifecycle callbacks"
+    )]
+    pub fn fixture_conditioned<I: ?Sized, S>(
         &mut self,
         spec: FixtureSpec<'_>,
         input_a: &I,
         input_b: &I,
         policy: impl ComparisonPolicy,
-        mut before_sample: impl FnMut(SampleContext, &I),
-        mut operation: impl FnMut(&I) -> bool,
+        state: &mut S,
+        mut before_sample: impl FnMut(&mut S, SampleContext, &I),
+        mut operation: impl FnMut(&mut S, &I) -> bool,
     ) -> Result<bool, SuiteError<R::Error>> {
         let run =
-            self.run_pair_conditioned(input_a, input_b, &mut before_sample, &mut operation)?;
+            self.run_pair_conditioned(input_a, input_b, state, &mut before_sample, &mut operation)?;
         self.record_fixture(spec, run, policy)
     }
 
@@ -332,34 +341,51 @@ where
         input_b: &I,
         operation: &mut impl FnMut(&I) -> bool,
     ) -> Result<crate::paired::PairedRun<N>, SuiteError<R::Error>> {
-        self.run_pair_conditioned(input_a, input_b, &mut |_, _| {}, operation)
+        PairedRunner::<N>::new()
+            .warmup_blocks(self.config.warmup_blocks)
+            .run(|side| {
+                let input = match side {
+                    Side::A => input_a,
+                    Side::B => input_b,
+                };
+                let (measurement, outputs_ok) = self
+                    .platform
+                    .measure(self.config.batches, || operation(black_box(input)));
+                let within_limit = self
+                    .max_sample_ticks
+                    .is_none_or(|limit| measurement.ticks < limit);
+                (measurement, outputs_ok && within_limit)
+            })
+            .map_err(SuiteError::Runner)
     }
 
-    fn run_pair_conditioned<I: ?Sized>(
+    fn run_pair_conditioned<I: ?Sized, S>(
         &mut self,
         input_a: &I,
         input_b: &I,
-        before_sample: &mut impl FnMut(SampleContext, &I),
-        operation: &mut impl FnMut(&I) -> bool,
+        state: &mut S,
+        before_sample: &mut impl FnMut(&mut S, SampleContext, &I),
+        operation: &mut impl FnMut(&mut S, &I) -> bool,
     ) -> Result<crate::paired::PairedRun<N>, SuiteError<R::Error>> {
         PairedRunner::<N>::new()
             .warmup_blocks(self.config.warmup_blocks)
             .run_conditioned(
-                |context| {
+                state,
+                |state, context| {
                     let input = match context.side {
                         Side::A => input_a,
                         Side::B => input_b,
                     };
-                    before_sample(context, black_box(input));
+                    before_sample(state, context, input);
                 },
-                |side| {
+                |state, side| {
                     let input = match side {
                         Side::A => input_a,
                         Side::B => input_b,
                     };
                     let (measurement, outputs_ok) = self
                         .platform
-                        .measure(self.config.batches, || operation(black_box(input)));
+                        .measure(self.config.batches, || operation(state, black_box(input)));
                     let within_limit = self
                         .max_sample_ticks
                         .is_none_or(|limit| measurement.ticks < limit);
@@ -628,7 +654,13 @@ mod tests {
         }
 
         let measuring = Cell::new(false);
-        let conditioned = Cell::new(0);
+        #[derive(Default)]
+        struct SharedState {
+            conditioned: usize,
+            measured: usize,
+        }
+
+        let mut state = SharedState::default();
         let mut platform = BoundaryPlatform {
             measuring: &measuring,
         };
@@ -657,19 +689,22 @@ mod tests {
                     "conditioned",
                     &1_u32,
                     &2_u32,
-                    |context, input| {
+                    &mut state,
+                    |state, context, input| {
                         assert!(!measuring.get());
                         assert_eq!(context.side == Side::A, *input == 1);
-                        conditioned.set(conditioned.get() + 1);
+                        state.conditioned += 1;
                     },
-                    |_| {
+                    |state, _| {
                         assert!(measuring.get());
+                        state.measured += 1;
                         true
                     },
                 )
                 .unwrap()
         );
-        assert_eq!(conditioned.get(), 8);
+        assert_eq!(state.conditioned, 8);
+        assert_eq!(state.measured, 8);
     }
 
     #[test]
