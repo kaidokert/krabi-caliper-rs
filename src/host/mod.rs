@@ -10,8 +10,6 @@ mod compare;
 pub mod ct_asm;
 #[cfg(feature = "ctgrind")]
 pub mod ctgrind;
-#[cfg(feature = "ctgrind")]
-mod ctgrind_macros;
 mod elf;
 pub mod isa;
 mod model;
