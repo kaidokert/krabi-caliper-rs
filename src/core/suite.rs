@@ -5,7 +5,8 @@ use core::hint::black_box;
 use crate::Unit;
 pub use crate::core::benchmark::MeasurementPlatform;
 use crate::paired::{
-    Comparison, ComparisonPolicy, DisjointRanges, MaxSpread, PairedRunner, RunError, Side,
+    Comparison, ComparisonPolicy, DisjointRanges, MaxSpread, PairedRunner, RunError, SampleContext,
+    Side,
 };
 use crate::report::{
     Event, Field, PairedDiagnostic, PairedReporter, PairedResult, RunStart, RunSummary,
@@ -136,6 +137,39 @@ where
         )
     }
 
+    /// Runs a positive fixture with an untimed callback before every sample.
+    ///
+    /// Use this to normalize application-owned cache, accelerator, or
+    /// peripheral state. The callback also runs for warmup samples. Both
+    /// callbacks receive `state` sequentially so they can safely share one
+    /// mutable application-owned resource.
+    pub fn positive_conditioned<I: ?Sized, S>(
+        &mut self,
+        fixture: &str,
+        input_a: &I,
+        input_b: &I,
+        state: &mut S,
+        before_sample: impl FnMut(&mut S, SampleContext, &I),
+        operation: impl FnMut(&mut S, &I) -> bool,
+    ) -> Result<bool, SuiteError<R::Error>> {
+        self.fixture_conditioned(
+            FixtureSpec {
+                name: fixture,
+                class: "positive",
+                policy: "max-spread",
+            },
+            input_a,
+            input_b,
+            MaxSpread {
+                ticks: self.config.positive_max_spread,
+                require_overlap: self.config.positive_require_overlap,
+            },
+            state,
+            before_sample,
+            operation,
+        )
+    }
+
     /// Runs a positive fixture while preparing each selected input outside the
     /// measured region.
     ///
@@ -196,6 +230,26 @@ where
         mut operation: impl FnMut(&I) -> bool,
     ) -> Result<bool, SuiteError<R::Error>> {
         let run = self.run_pair(input_a, input_b, &mut operation)?;
+        self.record_fixture(spec, run, policy)
+    }
+
+    /// Runs a custom fixture with untimed per-sample state conditioning.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "custom fixtures expose the fixture, policy, shared state, and both lifecycle callbacks"
+    )]
+    pub fn fixture_conditioned<I: ?Sized, S>(
+        &mut self,
+        spec: FixtureSpec<'_>,
+        input_a: &I,
+        input_b: &I,
+        policy: impl ComparisonPolicy,
+        state: &mut S,
+        mut before_sample: impl FnMut(&mut S, SampleContext, &I),
+        mut operation: impl FnMut(&mut S, &I) -> bool,
+    ) -> Result<bool, SuiteError<R::Error>> {
+        let run =
+            self.run_pair_conditioned(input_a, input_b, state, &mut before_sample, &mut operation)?;
         self.record_fixture(spec, run, policy)
     }
 
@@ -302,6 +356,42 @@ where
                     .is_none_or(|limit| measurement.ticks < limit);
                 (measurement, outputs_ok && within_limit)
             })
+            .map_err(SuiteError::Runner)
+    }
+
+    fn run_pair_conditioned<I: ?Sized, S>(
+        &mut self,
+        input_a: &I,
+        input_b: &I,
+        state: &mut S,
+        before_sample: &mut impl FnMut(&mut S, SampleContext, &I),
+        operation: &mut impl FnMut(&mut S, &I) -> bool,
+    ) -> Result<crate::paired::PairedRun<N>, SuiteError<R::Error>> {
+        PairedRunner::<N>::new()
+            .warmup_blocks(self.config.warmup_blocks)
+            .run_conditioned(
+                state,
+                |state, context| {
+                    let input = match context.side {
+                        Side::A => input_a,
+                        Side::B => input_b,
+                    };
+                    before_sample(state, context, input);
+                },
+                |state, side| {
+                    let input = match side {
+                        Side::A => input_a,
+                        Side::B => input_b,
+                    };
+                    let (measurement, outputs_ok) = self
+                        .platform
+                        .measure(self.config.batches, || operation(state, black_box(input)));
+                    let within_limit = self
+                        .max_sample_ticks
+                        .is_none_or(|limit| measurement.ticks < limit);
+                    (measurement, outputs_ok && within_limit)
+                },
+            )
             .map_err(SuiteError::Runner)
     }
 
@@ -542,6 +632,79 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(suite.finish().unwrap().passed, 1);
+    }
+
+    #[test]
+    fn sample_conditioning_runs_outside_the_measured_region() {
+        struct BoundaryPlatform<'a> {
+            measuring: &'a Cell<bool>,
+        }
+
+        impl MeasurementPlatform for BoundaryPlatform<'_> {
+            fn measure(
+                &mut self,
+                _batches: usize,
+                mut operation: impl FnMut() -> bool,
+            ) -> (Measurement, bool) {
+                self.measuring.set(true);
+                let output_ok = operation();
+                self.measuring.set(false);
+                (Measurement::new(100, Unit::CoreCycles), output_ok)
+            }
+        }
+
+        let measuring = Cell::new(false);
+        #[derive(Default)]
+        struct SharedState {
+            conditioned: usize,
+            measured: usize,
+        }
+
+        let mut state = SharedState::default();
+        let mut platform = BoundaryPlatform {
+            measuring: &measuring,
+        };
+        let mut reporter = TextReporter::new(String::new());
+        let mut suite = PairedSuite::<_, _, 2>::start(
+            &mut platform,
+            &mut reporter,
+            PairedSuiteConfig {
+                suite: "conditioned-suite",
+                target: "host",
+                board: None,
+                unit: Unit::CoreCycles,
+                frequency_hz: None,
+                warmup_blocks: 1,
+                batches: 1,
+                positive_max_spread: 0,
+                positive_require_overlap: true,
+                fields: PairedSuiteFields::default(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            suite
+                .positive_conditioned(
+                    "conditioned",
+                    &1_u32,
+                    &2_u32,
+                    &mut state,
+                    |state, context, input| {
+                        assert!(!measuring.get());
+                        assert_eq!(context.side == Side::A, *input == 1);
+                        state.conditioned += 1;
+                    },
+                    |state, _| {
+                        assert!(measuring.get());
+                        state.measured += 1;
+                        true
+                    },
+                )
+                .unwrap()
+        );
+        assert_eq!(state.conditioned, 8);
+        assert_eq!(state.measured, 8);
     }
 
     #[test]
