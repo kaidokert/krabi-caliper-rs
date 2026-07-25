@@ -1,5 +1,7 @@
 # Krabi Caliper
 
+[![crate](https://img.shields.io/crates/v/krabi-caliper.svg)](https://crates.io/crates/krabi-caliper)
+[![documentation](https://docs.rs/krabi-caliper/badge.svg)](https://docs.rs/krabi-caliper/)
 [![Rust CI](https://github.com/kaidokert/krabi-caliper-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/kaidokert/krabi-caliper-rs/actions/workflows/ci.yml)
 
 Measurement tools for embedded Rust firmware and the host processes that build,
