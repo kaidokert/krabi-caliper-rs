@@ -90,6 +90,22 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Build a relocatable campaign bundle without accessing its runner.
+    Build {
+        campaign: String,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        quick: bool,
+        #[arg(long)]
+        case: Vec<String>,
+        #[arg(long)]
+        silent: bool,
+    },
     Run {
         campaign: String,
         #[arg(long)]
@@ -100,6 +116,9 @@ enum Command {
         quick: bool,
         #[arg(long)]
         case: Vec<String>,
+        /// Execute a previously built campaign bundle without invoking Cargo.
+        #[arg(long)]
+        prepared: Option<PathBuf>,
         /// Suppress command announcements while retaining reports and logs.
         #[arg(long)]
         silent: bool,
@@ -331,10 +350,11 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             println!("{}: PASS", path.display());
             Ok(true)
         }
-        Command::Run {
+        Command::Build {
             campaign,
             config,
             workspace,
+            output,
             quick,
             case,
             silent,
@@ -342,7 +362,7 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             let config = resolve_config(config);
             let config_text = fs::read_to_string(&config)?;
             let config: ToolkitConfig = toml::from_str(&config_text)?;
-            let report = CampaignExecutor::default().run(
+            let manifest = CampaignExecutor::default().build_prepared(
                 &config,
                 &campaign,
                 &workspace,
@@ -351,7 +371,34 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
                     cases: case,
                     silent,
                 },
+                &output,
             )?;
+            println!("{}", manifest.display());
+            Ok(true)
+        }
+        Command::Run {
+            campaign,
+            config,
+            workspace,
+            quick,
+            case,
+            prepared,
+            silent,
+        } => {
+            let config = resolve_config(config);
+            let config_text = fs::read_to_string(&config)?;
+            let config: ToolkitConfig = toml::from_str(&config_text)?;
+            let selection = CampaignSelection {
+                quick,
+                cases: case,
+                silent,
+            };
+            let executor = CampaignExecutor::default();
+            let report = if let Some(prepared) = prepared {
+                executor.run_prepared(&config, &campaign, &workspace, &selection, &prepared)?
+            } else {
+                executor.run(&config, &campaign, &workspace, &selection)?
+            };
             print!("{}", report.render_markdown());
             Ok(report.success())
         }
@@ -602,6 +649,42 @@ mod tests {
             Cli::try_parse_from(["cargo-krabi-caliper", "run", "demo", "--silent"]).unwrap();
 
         assert!(matches!(parsed.command, Command::Run { silent: true, .. }));
+    }
+
+    #[test]
+    fn parses_prepared_campaign_build_and_execution() {
+        let build = Cli::try_parse_from([
+            "cargo-krabi-caliper",
+            "build",
+            "demo",
+            "--output",
+            "prepared",
+        ])
+        .unwrap();
+        assert!(matches!(
+            build.command,
+            Command::Build {
+                campaign,
+                output,
+                ..
+            } if campaign == "demo" && output.as_os_str() == "prepared"
+        ));
+
+        let run = Cli::try_parse_from([
+            "cargo-krabi-caliper",
+            "run",
+            "demo",
+            "--prepared",
+            "prepared/manifest.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            run.command,
+            Command::Run {
+                prepared: Some(path),
+                ..
+            } if path.as_os_str() == "prepared/manifest.json"
+        ));
     }
 
     #[test]

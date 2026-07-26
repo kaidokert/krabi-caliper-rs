@@ -494,6 +494,143 @@ cases = [{ name = "external", example = "external-fixture", expected-benchmark =
     std::fs::remove_dir_all(workspace).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn prepared_campaign_builds_then_executes_without_cargo() {
+    let workspace = std::env::temp_dir().join(format!(
+        "krabi-caliper-prepared-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(workspace.join("examples")).unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "prepared-campaign-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[example]]
+name = "prepared-fixture"
+path = "examples/prepared-fixture.rs"
+
+[workspace]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("examples/prepared-fixture.rs"),
+        "fn main() {}\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join(".gitignore"), "/target/\n/Cargo.lock\n").unwrap();
+    for args in [
+        &["init"][..],
+        &["config", "user.email", "fixture@example.invalid"],
+        &["config", "user.name", "Fixture"],
+        &["add", "."][..],
+        &["commit", "-m", "fixture"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let config = parse(
+        r#"
+[profiles.prepared]
+runner = "command"
+target = "host"
+executable = "sh"
+args = [
+  "-c",
+  "printf '%s\n' 'EM_OUTCOME schema:1 benchmark:prepared-fixture status:PASS'",
+  "prepared-wrapper",
+  "{artifact}",
+]
+
+[campaigns.prepared]
+profile = "prepared"
+cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark = "prepared-fixture" }]
+"#,
+    );
+    let bundle = std::env::temp_dir().join(format!(
+        "krabi-caliper-prepared-bundle-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&bundle);
+    let executor = CampaignExecutor::default();
+    let manifest = executor
+        .build_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &bundle,
+        )
+        .unwrap();
+    let prepared = read_prepared_campaign(&manifest).unwrap();
+    assert_eq!(prepared.cases.len(), 1);
+
+    let report = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap();
+    assert!(report.success());
+
+    std::fs::write(
+        bundle.join(&prepared.cases[0].artifact),
+        b"tampered artifact",
+    )
+    .unwrap();
+    let error = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("wrong digest"));
+    std::fs::remove_dir_all(bundle).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn prepared_build_resolution_does_not_require_runner_bindings() {
+    let config = parse(
+        r#"
+[profiles.hardware]
+runner = "command"
+target = "thumbv7em-none-eabihf"
+executable = "probe-rs"
+args = ["run", "--probe", "${RUNTIME_ONLY_PROBE}", "{artifact}"]
+
+[campaigns.test]
+profile = "hardware"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    assert_eq!(
+        config.resolve_build_profile("hardware").unwrap().target,
+        "thumbv7em-none-eabihf"
+    );
+    assert!(config.resolve_profile("hardware").is_err());
+}
+
 #[test]
 fn executor_revalidates_declarative_input_before_running() {
     let config = parse(

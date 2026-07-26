@@ -23,6 +23,146 @@ impl Default for CampaignExecutor {
 }
 
 impl CampaignExecutor {
+    pub fn build_prepared(
+        &self,
+        config: &ToolkitConfig,
+        campaign_name: &str,
+        workspace: &Path,
+        selection: &CampaignSelection,
+        output_dir: &Path,
+    ) -> Result<PathBuf, CampaignError> {
+        let (campaign, mut cases) = selected_campaign(config, campaign_name, selection)?;
+        let mut profile = config.resolve_build_profile(&campaign.profile)?;
+        if profile.target == "host" {
+            profile.target = host_target(profile.toolchain.as_deref()).ok_or_else(|| {
+                CampaignError::InvalidConfig(
+                    "target=host requires a discoverable rustc host triple".to_string(),
+                )
+            })?;
+        }
+        for case in &mut cases {
+            let mut features = profile.build_features.clone();
+            features.append(&mut case.features);
+            features.sort();
+            features.dedup();
+            case.features = features;
+        }
+        let source = SourceMetadata {
+            workspace: None,
+            repository: command_value(
+                workspace,
+                "git",
+                &["remote", "get-url", "origin"],
+                selection.silent,
+            ),
+            git_commit: command_value(
+                workspace,
+                "git",
+                &["rev-parse", "HEAD"],
+                selection.silent,
+            ),
+            dirty: command_output(
+                workspace,
+                "git",
+                &["--no-optional-locks", "status", "--porcelain=v1"],
+                selection.silent,
+            )
+            .map(|value| !value.is_empty()),
+        };
+        if source.git_commit.is_none() || source.dirty != Some(false) {
+            return Err(CampaignError::InvalidConfig(
+                "prepared campaigns require a clean Git commit".to_string(),
+            ));
+        }
+        let build = BuildMetadata {
+            toolchain: profile.toolchain.clone(),
+            rustc: command_value_with_toolchain(
+                workspace,
+                "rustc",
+                &["--version"],
+                profile.toolchain.as_deref(),
+                selection.silent,
+            ),
+            cargo: command_value_with_toolchain(
+                workspace,
+                "cargo",
+                &["--version"],
+                profile.toolchain.as_deref(),
+                selection.silent,
+            ),
+            target: Some(profile.target.clone()),
+            optimization: Some(profile.cargo_profile.clone()),
+            features: Vec::new(),
+        };
+        if output_dir.exists() {
+            fs::remove_dir_all(output_dir).map_err(|source| CampaignError::Io {
+                path: output_dir.to_path_buf(),
+                source,
+            })?;
+        }
+        fs::create_dir_all(output_dir).map_err(|source| CampaignError::Io {
+            path: output_dir.to_path_buf(),
+            source,
+        })?;
+        let mut prepared_cases = Vec::new();
+        for case in cases {
+            let case_dir = artifact_child(output_dir, &case.id, "expanded case id")?;
+            fs::create_dir_all(&case_dir).map_err(|source| CampaignError::Io {
+                path: case_dir.clone(),
+                source,
+            })?;
+            let spec = prepared_cargo_build_spec(&profile, workspace, &case)
+                .silent(selection.silent);
+            let build_command = spec.display();
+            let output = self.runner.run(&spec)?;
+            write_bytes(&case_dir.join("build-stdout.log"), &output.stdout)?;
+            write_bytes(&case_dir.join("build-stderr.log"), &output.stderr)?;
+            if !output.success() {
+                return Err(CampaignError::InvalidConfig(command_failure_reason(
+                    "build command",
+                    &output,
+                )));
+            }
+            let artifact = artifact_from_build_output(&case, &output.stdout)?;
+            let filename = if profile.artifact_extension.is_empty() {
+                "firmware".to_string()
+            } else {
+                format!("firmware.{}", profile.artifact_extension)
+            };
+            let retained = case_dir.join(filename);
+            fs::copy(&artifact, &retained).map_err(|source| CampaignError::Io {
+                path: retained.clone(),
+                source,
+            })?;
+            prepared_cases.push(PreparedCase {
+                case,
+                artifact: retained
+                    .strip_prefix(output_dir)
+                    .unwrap_or(&retained)
+                    .to_path_buf(),
+                sha256: prepared_sha256(&retained)?,
+                footprint: artifact_footprint(&retained)?,
+                build_command,
+                build_duration_ms: output.duration.as_millis(),
+            });
+        }
+        let prepared = PreparedCampaign {
+            schema: PREPARED_CAMPAIGN_SCHEMA,
+            campaign: campaign_name.to_string(),
+            profile: campaign.profile,
+            source,
+            build,
+            cases: prepared_cases,
+        };
+        let manifest = output_dir.join("manifest.json");
+        write_text(
+            &manifest,
+            &serde_json::to_string_pretty(&prepared)
+                .map_err(|error| CampaignError::InvalidConfig(error.to_string()))?,
+        )?;
+        Ok(manifest)
+    }
+
     pub fn run(
         &self,
         config: &ToolkitConfig,
@@ -97,6 +237,131 @@ impl CampaignExecutor {
         let report = CampaignReport {
             campaign: campaign_name.to_string(),
             profile: campaign.profile.clone(),
+            cases: reports,
+        };
+        write_campaign_artifacts(&campaign_dir, &report)?;
+        Ok(report)
+    }
+
+    pub fn run_prepared(
+        &self,
+        config: &ToolkitConfig,
+        campaign_name: &str,
+        workspace: &Path,
+        selection: &CampaignSelection,
+        manifest_path: &Path,
+    ) -> Result<CampaignReport, CampaignError> {
+        config.validate()?;
+        let prepared = read_prepared_campaign(manifest_path)?;
+        if prepared.campaign != campaign_name {
+            return Err(CampaignError::InvalidConfig(format!(
+                "prepared campaign is {:?}, not {campaign_name:?}",
+                prepared.campaign
+            )));
+        }
+        let (campaign, mut cases) = selected_campaign(config, campaign_name, selection)?;
+        if prepared.profile != campaign.profile {
+            return Err(CampaignError::InvalidConfig(
+                "prepared campaign profile does not match configuration".to_string(),
+            ));
+        }
+        let mut profile = config.resolve_profile(&campaign.profile)?;
+        if let Some(policy) = &campaign.constant_time {
+            profile.constant_time = Some(policy.clone());
+        }
+        for case in &mut cases {
+            let mut features = profile.build_features.clone();
+            features.append(&mut case.features);
+            features.sort();
+            features.dedup();
+            case.features = features;
+        }
+        if cases.len() != prepared.cases.len()
+            || cases
+                .iter()
+                .zip(&prepared.cases)
+                .any(|(case, prepared)| case != &prepared.case)
+        {
+            return Err(CampaignError::InvalidConfig(
+                "prepared cases do not match the selected campaign".to_string(),
+            ));
+        }
+        let commit = command_value(
+            workspace,
+            "git",
+            &["rev-parse", "HEAD"],
+            selection.silent,
+        );
+        let dirty = command_output(
+            workspace,
+            "git",
+            &["--no-optional-locks", "status", "--porcelain=v1"],
+            selection.silent,
+        )
+        .map(|value| !value.is_empty());
+        if commit != prepared.source.git_commit || dirty != Some(false) {
+            return Err(CampaignError::InvalidConfig(
+                "prepared source does not match the clean execution checkout".to_string(),
+            ));
+        }
+        let environment = self.collect_environment(workspace, &profile, selection.silent);
+        let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+        let artifact_root = workspace.join(
+            campaign
+                .artifact_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("target/krabi-caliper")),
+        );
+        let campaign_dir = artifact_child(&artifact_root, campaign_name, "campaign name")?;
+        let mut reports = Vec::new();
+        for prepared_case in &prepared.cases {
+            let artifact = manifest_dir.join(&prepared_case.artifact);
+            let canonical_manifest_dir =
+                manifest_dir
+                    .canonicalize()
+                    .map_err(|source| CampaignError::Io {
+                        path: manifest_dir.to_path_buf(),
+                        source,
+                    })?;
+            let canonical_artifact =
+                artifact
+                    .canonicalize()
+                    .map_err(|source| CampaignError::Io {
+                        path: artifact.clone(),
+                        source,
+                    })?;
+            if !canonical_artifact.starts_with(&canonical_manifest_dir)
+                || !canonical_artifact.is_file()
+                || prepared_sha256(&canonical_artifact)? != prepared_case.sha256
+            {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "prepared artifact for {:?} is missing or has the wrong digest",
+                    prepared_case.case.id
+                )));
+            }
+            let mut case_environment = environment.clone();
+            case_environment.source = prepared.source.clone();
+            case_environment.build = prepared.build.clone();
+            case_environment.build.features = prepared_case.case.features.clone();
+            let report = self.run_prepared_case(
+                (campaign_name, &campaign.profile),
+                &profile,
+                workspace,
+                &campaign_dir,
+                prepared_case,
+                &canonical_artifact,
+                case_environment,
+                selection.silent,
+            )?;
+            let passed = report.status == CaseStatus::Pass;
+            reports.push(report);
+            if !passed && !campaign.continue_on_failure {
+                break;
+            }
+        }
+        let report = CampaignReport {
+            campaign: campaign_name.to_string(),
+            profile: campaign.profile,
             cases: reports,
         };
         write_campaign_artifacts(&campaign_dir, &report)?;
@@ -274,6 +539,149 @@ impl CampaignExecutor {
         Ok(report)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "prepared execution carries explicit campaign, profile, artifact, and evidence inputs"
+    )]
+    fn run_prepared_case(
+        &self,
+        run_identity: (&str, &str),
+        profile: &ResolvedRunnerProfile,
+        workspace: &Path,
+        campaign_dir: &Path,
+        prepared: &PreparedCase,
+        artifact: &Path,
+        environment: ReproducibilityMetadata,
+        silent: bool,
+    ) -> Result<CaseReport, CampaignError> {
+        let case = &prepared.case;
+        let (campaign_name, profile_name) = run_identity;
+        let case_dir = artifact_child(campaign_dir, &case.id, "expanded case id")?;
+        if case_dir.exists() {
+            fs::remove_dir_all(&case_dir).map_err(|source| CampaignError::Io {
+                path: case_dir.clone(),
+                source,
+            })?;
+        }
+        fs::create_dir_all(&case_dir).map_err(|source| CampaignError::Io {
+            path: case_dir.clone(),
+            source,
+        })?;
+        let retained_artifact = case_dir.join(if profile.artifact_extension.is_empty() {
+            "firmware".to_string()
+        } else {
+            format!("firmware.{}", profile.artifact_extension)
+        });
+        fs::copy(artifact, &retained_artifact).map_err(|source| CampaignError::Io {
+            path: retained_artifact.clone(),
+            source,
+        })?;
+        let mut prepare_commands = Vec::new();
+        for (index, prepare) in profile.prepare.iter().enumerate() {
+            let spec = configured_runner_command(prepare, workspace, artifact).silent(silent);
+            prepare_commands.push(spec.display());
+            let output = self.runner.run(&spec)?;
+            write_bytes(
+                &case_dir.join(format!("prepare-{index}-stdout.log")),
+                &output.stdout,
+            )?;
+            write_bytes(
+                &case_dir.join(format!("prepare-{index}-stderr.log")),
+                &output.stderr,
+            )?;
+            if !output.success() {
+                let report = CaseReport {
+                    id: case.id.clone(),
+                    name: case.name.clone(),
+                    cargo_target: case.cargo_target.clone(),
+                    environment,
+                    features: case.features.clone(),
+                    parameters: case.parameters.clone(),
+                    artifact: Some(retained_artifact),
+                    footprint: prepared.footprint,
+                    baseline: case.baseline.clone(),
+                    build_command: prepared.build_command.clone(),
+                    prepare_commands,
+                    delay_before_run_seconds: case.delay_before_run_seconds,
+                    run_command: None,
+                    build_duration_ms: prepared.build_duration_ms,
+                    run_duration_ms: None,
+                    status: if output.timed_out {
+                        CaseStatus::TimedOut
+                    } else {
+                        CaseStatus::RunFailed
+                    },
+                    error: Some(command_failure_reason("prepare command", &output)),
+                    stdout: output.stdout_lossy(),
+                    stderr: output.stderr_lossy(),
+                    result: None,
+                };
+                write_case_artifacts(&case_dir, &report)?;
+                return Ok(report);
+            }
+        }
+        if let Some(seconds) = case.delay_before_run_seconds {
+            std::thread::sleep(Duration::from_secs(seconds));
+        }
+        let run = runner_spec(profile, workspace, case, artifact)?.silent(silent);
+        let run_display = run.display();
+        let run_output = self.runner.run(&run)?;
+        write_run_logs(&case_dir, &run_output)?;
+        let combined = run_output.combined_lossy();
+        let parsed = parse(&combined).map(|mut result| {
+            result.correlate_external(profile.require_external_measurements);
+            enrich_result(
+                &mut result,
+                campaign_name,
+                profile_name,
+                case,
+                &environment,
+            );
+            result
+        });
+        let (status, error, result) = classify_run(profile, case, &run_output, parsed);
+        if let Some(result) = &result {
+            write_text(
+                &case_dir.join("result.json"),
+                &render_json(result)
+                    .map_err(|error| CampaignError::InvalidConfig(error.to_string()))?,
+            )?;
+            write_text(&case_dir.join("report.md"), &render_markdown(result))?;
+        }
+        let report = CaseReport {
+            id: case.id.clone(),
+            name: case.name.clone(),
+            cargo_target: case.cargo_target.clone(),
+            environment,
+            features: case.features.clone(),
+            parameters: case.parameters.clone(),
+            artifact: Some(retained_artifact),
+            footprint: prepared.footprint,
+            baseline: case.baseline.clone(),
+            build_command: prepared.build_command.clone(),
+            prepare_commands,
+            delay_before_run_seconds: case.delay_before_run_seconds,
+            run_command: Some(run_display),
+            build_duration_ms: prepared.build_duration_ms,
+            run_duration_ms: Some(run_output.duration.as_millis()),
+            status,
+            error,
+            stdout: if status != CaseStatus::Pass {
+                run_output.stdout_lossy()
+            } else {
+                String::new()
+            },
+            stderr: if status != CaseStatus::Pass {
+                run_output.stderr_lossy()
+            } else {
+                String::new()
+            },
+            result,
+        };
+        write_case_artifacts(&case_dir, &report)?;
+        Ok(report)
+    }
+
     fn collect_environment(
         &self,
         workspace: &Path,
@@ -305,8 +713,13 @@ impl CampaignExecutor {
                     .map(|value| value.to_string_lossy().into_owned()),
                 repository: command_value(workspace, "git", &["remote", "get-url", "origin"], silent),
                 git_commit: command_value(workspace, "git", &["rev-parse", "HEAD"], silent),
-                dirty: command_output(workspace, "git", &["status", "--porcelain=v1"], silent)
-                    .map(|value| !value.is_empty()),
+                dirty: command_output(
+                    workspace,
+                    "git",
+                    &["--no-optional-locks", "status", "--porcelain=v1"],
+                    silent,
+                )
+                .map(|value| !value.is_empty()),
             },
             build: BuildMetadata {
                 toolchain: profile.toolchain.clone(),
@@ -390,6 +803,38 @@ fn enrich_result(
     }
     result.build = environment.build.clone();
     result.source = environment.source.clone();
+}
+
+fn selected_campaign(
+    config: &ToolkitConfig,
+    campaign_name: &str,
+    selection: &CampaignSelection,
+) -> Result<(CampaignConfig, Vec<ExpandedCase>), CampaignError> {
+    let mut campaign = config
+        .campaigns
+        .get(campaign_name)
+        .cloned()
+        .ok_or_else(|| CampaignError::MissingCampaign(campaign_name.to_string()))?;
+    if let Some(case_set) = &campaign.case_set {
+        if !campaign.cases.is_empty() {
+            return Err(CampaignError::InvalidConfig(format!(
+                "campaign {campaign_name:?} cannot specify both cases and case-set"
+            )));
+        }
+        campaign.cases = config.case_sets.get(case_set).cloned().ok_or_else(|| {
+            CampaignError::InvalidConfig(format!("unknown case-set {case_set:?}"))
+        })?;
+    }
+    if !config.profiles.contains_key(&campaign.profile) {
+        return Err(CampaignError::MissingProfile(campaign.profile.clone()));
+    }
+    validate_cases(campaign_name, &campaign, &campaign.cases)?;
+    validate_matrix_features(campaign_name, &campaign)?;
+    if let Some(policy) = &campaign.constant_time {
+        validate_constant_time_config(policy)?;
+    }
+    let cases = expand_cases(&campaign, selection)?;
+    Ok((campaign, cases))
 }
 
 fn command_value(workspace: &Path, program: &str, args: &[&str], silent: bool) -> Option<String> {
@@ -567,12 +1012,45 @@ fn cargo_build_spec(
     workspace: &Path,
     case: &ExpandedCase,
 ) -> CommandSpec {
+    cargo_build_spec_fields(
+        &profile.target,
+        profile.toolchain.as_deref(),
+        &profile.cargo_profile,
+        profile.target_dir.as_deref(),
+        workspace,
+        case,
+    )
+}
+
+fn prepared_cargo_build_spec(
+    profile: &ResolvedBuildProfile,
+    workspace: &Path,
+    case: &ExpandedCase,
+) -> CommandSpec {
+    cargo_build_spec_fields(
+        &profile.target,
+        profile.toolchain.as_deref(),
+        &profile.cargo_profile,
+        profile.target_dir.as_deref(),
+        workspace,
+        case,
+    )
+}
+
+fn cargo_build_spec_fields(
+    target: &str,
+    toolchain: Option<&str>,
+    cargo_profile: &str,
+    target_dir: Option<&Path>,
+    workspace: &Path,
+    case: &ExpandedCase,
+) -> CommandSpec {
     let mut args = vec![
         OsString::from("build"),
         OsString::from("--profile"),
-        OsString::from(&profile.cargo_profile),
+        OsString::from(cargo_profile),
         OsString::from("--target"),
-        OsString::from(&profile.target),
+        OsString::from(target),
         OsString::from("--no-default-features"),
         OsString::from("--message-format=json-render-diagnostics"),
     ];
@@ -585,10 +1063,10 @@ fn cargo_build_spec(
     let mut spec = CommandSpec::new("cargo", workspace)
         .args(args)
         .timeout(Duration::from_secs(600));
-    if let Some(toolchain) = &profile.toolchain {
+    if let Some(toolchain) = toolchain {
         spec = spec.env("RUSTUP_TOOLCHAIN", toolchain);
     }
-    if let Some(target_dir) = &profile.target_dir {
+    if let Some(target_dir) = target_dir {
         spec = spec.env("CARGO_TARGET_DIR", workspace.join(target_dir));
     }
     spec

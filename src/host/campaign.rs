@@ -77,6 +77,7 @@ const fn continue_on_failure() -> bool {
 }
 
 include!("campaign/model.rs");
+include!("campaign/prepared.rs");
 include!("campaign/executor.rs");
 
 #[cfg(test)]
