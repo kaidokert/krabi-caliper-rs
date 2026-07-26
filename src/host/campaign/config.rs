@@ -14,6 +14,17 @@ impl ToolkitConfig {
         for name in self.profiles.keys() {
             self.resolve_profile(name)?;
         }
+        self.validate_campaigns()
+    }
+
+    fn validate_for_build(&self) -> Result<(), CampaignError> {
+        for name in self.profiles.keys() {
+            self.resolve_build_profile(name)?;
+        }
+        self.validate_campaigns()
+    }
+
+    fn validate_campaigns(&self) -> Result<(), CampaignError> {
         for (name, campaign) in &self.campaigns {
             validate_artifact_component("campaign name", name)?;
             if !self.profiles.contains_key(&campaign.profile) {
@@ -493,7 +504,7 @@ pub enum ConfiguredU64 {
     Binding(String),
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ConstantTimeConfig {
     #[serde(default = "default_welch_threshold")]

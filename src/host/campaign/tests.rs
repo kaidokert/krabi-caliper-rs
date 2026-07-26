@@ -291,6 +291,19 @@ minimum-samples-per-class = 1
 "#,
     );
     assert!(invalid_ct.validate().is_err());
+
+    let invalid_profile_ct = parse(
+        r#"
+[profiles.qemu]
+preset = "qemu-cortex-m3"
+[profiles.qemu.constant-time]
+minimum-samples-per-class = 1
+[campaigns.test]
+profile = "qemu"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    assert!(invalid_profile_ct.validate_for_build().is_err());
 }
 
 fn matrix_campaign() -> CampaignConfig {
@@ -492,6 +505,348 @@ cases = [{ name = "external", example = "external-fixture", expected-benchmark =
     assert!(output_dir.join("report.csv").is_file());
     assert!(output_dir.join("results.json").is_file());
     std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn prepared_campaign_builds_then_executes_without_cargo() {
+    let workspace = std::env::temp_dir().join(format!(
+        "krabi-caliper-prepared-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(workspace.join("examples")).unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "prepared-campaign-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[example]]
+name = "prepared-fixture"
+path = "examples/prepared-fixture.rs"
+
+[workspace]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("examples/prepared-fixture.rs"),
+        "fn main() {}\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join(".gitignore"), "/target/\n/Cargo.lock\n").unwrap();
+    for args in [
+        &["init"][..],
+        &["config", "user.email", "fixture@example.invalid"],
+        &["config", "user.name", "Fixture"],
+        &["add", "."][..],
+        &["commit", "-m", "fixture"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let config = parse(
+        r#"
+[profiles.prepared]
+runner = "command"
+target = "host"
+executable = "sh"
+args = [
+  "-c",
+  "printf '%s\n' 'EM_OUTCOME schema:1 benchmark:prepared-fixture status:PASS'",
+  "prepared-wrapper",
+  "{artifact}",
+]
+
+[campaigns.prepared]
+profile = "prepared"
+constant-time = { gate = false, welch-threshold = 4.5 }
+cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark = "prepared-fixture" }]
+"#,
+    );
+    let bundle = workspace.join("target/prepared");
+    let _ = std::fs::remove_dir_all(&bundle);
+    let executor = CampaignExecutor::default();
+    executor
+        .build_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &bundle,
+        )
+        .unwrap();
+    let manifest = executor
+        .build_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &bundle,
+        )
+        .unwrap();
+    let prepared = read_prepared_campaign(&manifest).unwrap();
+    assert_eq!(prepared.cases.len(), 1);
+
+    let report = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap();
+    assert!(report.success());
+    assert_ne!(
+        report.cases[0].environment.build.target.as_deref(),
+        Some("host")
+    );
+
+    let mut root_prepared = prepared.clone();
+    for case in &mut root_prepared.cases {
+        case.artifact = PathBuf::from("target/prepared").join(&case.artifact);
+    }
+    let root_manifest = workspace.join("manifest.json");
+    std::fs::write(
+        &root_manifest,
+        serde_json::to_string_pretty(&root_prepared).unwrap(),
+    )
+    .unwrap();
+    let report = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &root_manifest,
+        )
+        .unwrap();
+    assert!(report.success());
+    std::fs::remove_file(root_manifest).unwrap();
+
+    let mut mismatched = prepared.clone();
+    mismatched.build.target = Some("wrong-target".to_string());
+    std::fs::write(
+        &manifest,
+        serde_json::to_string_pretty(&mismatched).unwrap(),
+    )
+    .unwrap();
+    let error = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("build target"));
+
+    mismatched.build.target = prepared.build.target.clone();
+    mismatched.build.optimization = Some("wrong-profile".to_string());
+    std::fs::write(
+        &manifest,
+        serde_json::to_string_pretty(&mismatched).unwrap(),
+    )
+    .unwrap();
+    let error = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("build profile"));
+
+    mismatched.build.optimization = prepared.build.optimization.clone();
+    mismatched.build.toolchain = Some("wrong-toolchain".to_string());
+    std::fs::write(
+        &manifest,
+        serde_json::to_string_pretty(&mismatched).unwrap(),
+    )
+    .unwrap();
+    let error = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("build toolchain"));
+
+    mismatched.build.toolchain = prepared.build.toolchain.clone();
+    mismatched.constant_time.as_mut().unwrap().welch_threshold = 9.0;
+    std::fs::write(
+        &manifest,
+        serde_json::to_string_pretty(&mismatched).unwrap(),
+    )
+    .unwrap();
+    let error = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("constant-time policy"));
+
+    std::fs::write(&manifest, serde_json::to_string_pretty(&prepared).unwrap()).unwrap();
+
+    std::fs::write(
+        bundle.join(&prepared.cases[0].artifact),
+        b"tampered artifact",
+    )
+    .unwrap();
+    let error = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("wrong digest"));
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn prepared_output_cannot_erase_workspace_content() {
+    let workspace = std::env::temp_dir().join(format!(
+        "krabi-caliper-output-safety-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+
+    let source = workspace.join("src");
+    let target = workspace.join("target");
+    for unsafe_output in [&workspace, workspace.parent().unwrap(), &source, &target] {
+        let error = safe_prepared_output(&workspace, unsafe_output).unwrap_err();
+        assert!(error.to_string().contains("prepared output"));
+    }
+    assert_eq!(
+        safe_prepared_output(&workspace, &workspace.join("target/prepared")).unwrap(),
+        workspace.join("target/prepared")
+    );
+
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn prepared_output_rejects_symlinks_without_deleting_the_destination() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "krabi-caliper-output-symlink-test-{}",
+        std::process::id()
+    ));
+    let workspace = root.join("workspace");
+    let destination = root.join("destination");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(workspace.join("target")).unwrap();
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::write(destination.join("keep"), "must survive").unwrap();
+    symlink(&destination, workspace.join("target/prepared")).unwrap();
+
+    let error = safe_prepared_output(&workspace, &workspace.join("target/prepared")).unwrap_err();
+    assert!(error.to_string().contains("must not contain symlinks"));
+    assert_eq!(
+        std::fs::read_to_string(destination.join("keep")).unwrap(),
+        "must survive"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn prepared_output_rejects_nonempty_unowned_directories() {
+    let output = std::env::temp_dir().join(format!(
+        "krabi-caliper-unowned-output-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&output);
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(output.join("keep"), "must survive").unwrap();
+
+    let error = reset_prepared_output(&output).unwrap_err();
+    assert!(error.to_string().contains("unowned prepared output"));
+    assert_eq!(
+        std::fs::read_to_string(output.join("keep")).unwrap(),
+        "must survive"
+    );
+
+    std::fs::remove_dir_all(output).unwrap();
+}
+
+#[test]
+fn bare_manifest_filename_uses_the_current_directory() {
+    assert_eq!(
+        manifest_directory(Path::new("manifest.json")),
+        Path::new(".")
+    );
+}
+
+#[test]
+fn prepared_build_validation_checks_unselected_campaigns() {
+    let config = parse(
+        r#"
+[profiles.valid]
+preset = "qemu-cortex-m3"
+
+[campaigns.valid]
+profile = "valid"
+cases = [{ name = "fixture", example = "fixture" }]
+
+[campaigns.invalid]
+profile = "missing"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let error = config.validate_for_build().unwrap_err();
+    assert!(error.to_string().contains("missing"));
+}
+
+#[test]
+fn prepared_build_resolution_does_not_require_runner_bindings() {
+    let config = parse(
+        r#"
+[profiles.hardware]
+runner = "command"
+target = "thumbv7em-none-eabihf"
+executable = "probe-rs"
+args = ["run", "--probe", "${RUNTIME_ONLY_PROBE}", "{artifact}"]
+
+[campaigns.test]
+profile = "hardware"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    assert_eq!(
+        config.resolve_build_profile("hardware").unwrap().target,
+        "thumbv7em-none-eabihf"
+    );
+    assert!(config.resolve_profile("hardware").is_err());
 }
 
 #[test]

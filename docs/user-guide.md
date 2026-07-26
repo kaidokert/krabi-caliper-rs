@@ -86,6 +86,23 @@ Commands are announced by default and complete stdout and stderr are retained
 for failed builds and runs. Use `--silent` only when command announcements are
 not wanted.
 
+For a scarce hardware runner, build the firmware on a hosted runner and pass
+the prepared bundle to the hardware job:
+
+```sh
+# Hosted build job
+cargo krabi-caliper build smoke --output target/prepared
+
+# Hardware execution job, after downloading the complete prepared directory
+cargo krabi-caliper run smoke --prepared target/prepared/manifest.json
+```
+
+Prepared execution does not invoke Cargo. It requires the same clean source
+commit, verifies the selected cases and every firmware SHA-256 digest, and
+resolves runner-only bindings such as probe selectors only in the execution
+job. CI remains responsible for artifact transfer and for acquiring any
+hardware lock after the bundle has been downloaded.
+
 Host facilities include Cargo artifact discovery, timeouts, retained logs, ELF
 footprint extraction, comparisons, JSON/CSV/Markdown reports, CT-grind
 integration, panic-path auditing, Welch analysis, and combined DWT/ETM
