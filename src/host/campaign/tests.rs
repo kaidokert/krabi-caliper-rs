@@ -591,6 +591,28 @@ cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark =
         Some("host")
     );
 
+    let mut root_prepared = prepared.clone();
+    for case in &mut root_prepared.cases {
+        case.artifact = PathBuf::from("target/prepared").join(&case.artifact);
+    }
+    let root_manifest = workspace.join("manifest.json");
+    std::fs::write(
+        &root_manifest,
+        serde_json::to_string_pretty(&root_prepared).unwrap(),
+    )
+    .unwrap();
+    let report = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &root_manifest,
+        )
+        .unwrap();
+    assert!(report.success());
+    std::fs::remove_file(root_manifest).unwrap();
+
     let mut mismatched = prepared.clone();
     mismatched.build.target = Some("wrong-target".to_string());
     std::fs::write(
@@ -713,6 +735,34 @@ fn prepared_output_rejects_symlinks_without_deleting_the_destination() {
     );
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn prepared_output_rejects_nonempty_unowned_directories() {
+    let output = std::env::temp_dir().join(format!(
+        "krabi-caliper-unowned-output-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&output);
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(output.join("keep"), "must survive").unwrap();
+
+    let error = reset_prepared_output(&output).unwrap_err();
+    assert!(error.to_string().contains("unowned prepared output"));
+    assert_eq!(
+        std::fs::read_to_string(output.join("keep")).unwrap(),
+        "must survive"
+    );
+
+    std::fs::remove_dir_all(output).unwrap();
+}
+
+#[test]
+fn bare_manifest_filename_uses_the_current_directory() {
+    assert_eq!(
+        manifest_directory(Path::new("manifest.json")),
+        Path::new(".")
+    );
 }
 
 #[test]

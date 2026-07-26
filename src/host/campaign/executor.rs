@@ -97,16 +97,12 @@ impl CampaignExecutor {
             features: Vec::new(),
         };
         let output_dir = safe_prepared_output(workspace, output_dir)?;
-        if output_dir.exists() {
-            fs::remove_dir_all(&output_dir).map_err(|source| CampaignError::Io {
-                path: output_dir.clone(),
-                source,
-            })?;
-        }
+        reset_prepared_output(&output_dir)?;
         fs::create_dir_all(&output_dir).map_err(|source| CampaignError::Io {
             path: output_dir.clone(),
             source,
         })?;
+        write_text(&output_dir.join(PREPARED_OUTPUT_MARKER), "krabi-caliper\n")?;
         let mut prepared_cases = Vec::new();
         for case in cases {
             let case_dir = artifact_child(&output_dir, &case.id, "expanded case id")?;
@@ -312,7 +308,14 @@ impl CampaignExecutor {
             ));
         }
         let environment = self.collect_environment(workspace, &profile, selection.silent);
-        let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+        let manifest_dir = manifest_directory(manifest_path);
+        let canonical_manifest_dir =
+            manifest_dir
+                .canonicalize()
+                .map_err(|source| CampaignError::Io {
+                    path: manifest_dir.to_path_buf(),
+                    source,
+                })?;
         let artifact_root = workspace.join(
             campaign
                 .artifact_dir
@@ -323,13 +326,6 @@ impl CampaignExecutor {
         let mut reports = Vec::new();
         for prepared_case in &prepared.cases {
             let artifact = manifest_dir.join(&prepared_case.artifact);
-            let canonical_manifest_dir =
-                manifest_dir
-                    .canonicalize()
-                    .map_err(|source| CampaignError::Io {
-                        path: manifest_dir.to_path_buf(),
-                        source,
-                    })?;
             let canonical_artifact =
                 artifact
                     .canonicalize()
@@ -905,6 +901,30 @@ fn reject_symlinked_output(output: &Path) -> Result<(), CampaignError> {
     Ok(())
 }
 
+fn reset_prepared_output(output: &Path) -> Result<(), CampaignError> {
+    if !output.exists() {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(output).map_err(|source| CampaignError::Io {
+        path: output.to_path_buf(),
+        source,
+    })?;
+    let empty = entries.next().is_none();
+    let owned = fs::read_to_string(output.join(PREPARED_OUTPUT_MARKER))
+        .is_ok_and(|value| value == "krabi-caliper\n")
+        || read_prepared_campaign(&output.join("manifest.json")).is_ok();
+    if !empty && !owned {
+        return Err(CampaignError::InvalidConfig(format!(
+            "refusing to replace non-empty, unowned prepared output {}",
+            output.display()
+        )));
+    }
+    fs::remove_dir_all(output).map_err(|source| CampaignError::Io {
+        path: output.to_path_buf(),
+        source,
+    })
+}
+
 fn normalized_absolute(path: &Path) -> Result<PathBuf, CampaignError> {
     use std::path::Component;
 
@@ -931,8 +951,16 @@ fn normalized_absolute(path: &Path) -> Result<PathBuf, CampaignError> {
     Ok(normalized)
 }
 
+fn manifest_directory(manifest: &Path) -> &Path {
+    match manifest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 fn git_dirty_excluding(workspace: &Path, manifest: &Path, silent: bool) -> Option<bool> {
-    let manifest_dir = manifest.parent()?.canonicalize().ok()?;
+    let manifest = manifest.canonicalize().ok()?;
+    let manifest_dir = manifest.parent()?;
     let workspace = workspace.canonicalize().ok()?;
     let mut arguments = vec![
         "--no-optional-locks".to_string(),
@@ -942,7 +970,12 @@ fn git_dirty_excluding(workspace: &Path, manifest: &Path, silent: bool) -> Optio
         ".".to_string(),
     ];
     if let Ok(relative) = manifest_dir.strip_prefix(&workspace) {
-        arguments.push(format!(":(exclude){}", relative.to_string_lossy()));
+        let excluded = if relative.as_os_str().is_empty() {
+            manifest.strip_prefix(&workspace).ok()?
+        } else {
+            relative
+        };
+        arguments.push(format!(":(exclude){}", excluded.to_string_lossy()));
     }
     let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     command_output(&workspace, "git", &arguments, silent).map(|value| !value.is_empty())

@@ -1,4 +1,5 @@
 const PREPARED_CAMPAIGN_SCHEMA: u32 = 1;
+const PREPARED_OUTPUT_MARKER: &str = ".krabi-caliper-prepared";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreparedCampaign {
