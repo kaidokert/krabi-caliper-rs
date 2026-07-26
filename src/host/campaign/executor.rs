@@ -35,7 +35,7 @@ impl CampaignExecutor {
         let (campaign, mut cases) = selected_campaign(config, campaign_name, selection)?;
         let mut profile = config.resolve_build_profile(&campaign.profile)?;
         if profile.target == "host" {
-            profile.target = host_target(profile.toolchain.as_deref()).ok_or_else(|| {
+            profile.target = host_target(workspace, profile.toolchain.as_deref()).ok_or_else(|| {
                 CampaignError::InvalidConfig(
                     "target=host requires a discoverable rustc host triple".to_string(),
                 )
@@ -190,7 +190,7 @@ impl CampaignExecutor {
         }
         let mut profile = config.resolve_profile(&campaign.profile)?;
         if profile.target == "host" {
-            profile.target = host_target(profile.toolchain.as_deref()).ok_or_else(|| {
+            profile.target = host_target(workspace, profile.toolchain.as_deref()).ok_or_else(|| {
                 CampaignError::InvalidConfig(
                     "target=host requires a discoverable rustc host triple".to_string(),
                 )
@@ -269,13 +269,14 @@ impl CampaignExecutor {
         }
         let mut profile = config.resolve_profile(&campaign.profile)?;
         if profile.target == "host" {
-            profile.target = prepared.build.target.clone().ok_or_else(|| {
+            profile.target = host_target(workspace, profile.toolchain.as_deref()).ok_or_else(|| {
                 CampaignError::InvalidConfig(
-                    "prepared host campaign does not record its concrete target".to_string(),
+                    "target=host requires a discoverable rustc host triple".to_string(),
                 )
             })?;
             profile.configuration_identity = configuration_identity(&profile);
         }
+        validate_prepared_build(&prepared, &profile)?;
         if let Some(policy) = &campaign.constant_time {
             profile.constant_time = Some(policy.clone());
         }
@@ -861,9 +862,10 @@ fn safe_prepared_output(workspace: &Path, output: &Path) -> Result<PathBuf, Camp
             "prepared output must not be the workspace or one of its ancestors".to_string(),
         ));
     }
-    if output.starts_with(&workspace) && !output.starts_with(workspace.join("target")) {
+    let target = workspace.join("target");
+    if output.starts_with(&workspace) && (!output.starts_with(&target) || output == target) {
         return Err(CampaignError::InvalidConfig(
-            "prepared output inside the workspace must be under target/".to_string(),
+            "prepared output inside the workspace must be a child of target/".to_string(),
         ));
     }
     Ok(output)
@@ -917,10 +919,27 @@ fn command_value(workspace: &Path, program: &str, args: &[&str], silent: bool) -
     (!value.is_empty()).then_some(value)
 }
 
-fn host_target(toolchain: Option<&str>) -> Option<String> {
-    captured_command_output(Path::new("."), "rustc", &["-vV"], toolchain, true)?
+fn host_target(workspace: &Path, toolchain: Option<&str>) -> Option<String> {
+    captured_command_output(workspace, "rustc", &["-vV"], toolchain, true)?
         .lines()
         .find_map(|line| line.strip_prefix("host: ").map(ToString::to_string))
+}
+
+fn validate_prepared_build(
+    prepared: &PreparedCampaign,
+    profile: &ResolvedRunnerProfile,
+) -> Result<(), CampaignError> {
+    if prepared.build.target.as_deref() != Some(profile.target.as_str()) {
+        return Err(CampaignError::InvalidConfig(
+            "prepared build target does not match configuration".to_string(),
+        ));
+    }
+    if prepared.build.optimization.as_deref() != Some(profile.cargo_profile.as_str()) {
+        return Err(CampaignError::InvalidConfig(
+            "prepared build profile does not match configuration".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn command_value_with_toolchain(

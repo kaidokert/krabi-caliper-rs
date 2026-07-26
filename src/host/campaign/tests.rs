@@ -590,6 +590,43 @@ cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark =
         Some("host")
     );
 
+    let mut mismatched = prepared.clone();
+    mismatched.build.target = Some("wrong-target".to_string());
+    std::fs::write(
+        &manifest,
+        serde_json::to_string_pretty(&mismatched).unwrap(),
+    )
+    .unwrap();
+    let error = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("build target"));
+
+    mismatched.build.target = prepared.build.target.clone();
+    mismatched.build.optimization = Some("wrong-profile".to_string());
+    std::fs::write(
+        &manifest,
+        serde_json::to_string_pretty(&mismatched).unwrap(),
+    )
+    .unwrap();
+    let error = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("build profile"));
+    std::fs::write(&manifest, serde_json::to_string_pretty(&prepared).unwrap()).unwrap();
+
     std::fs::write(
         bundle.join(&prepared.cases[0].artifact),
         b"tampered artifact",
@@ -618,7 +655,8 @@ fn prepared_output_cannot_erase_workspace_content() {
     std::fs::create_dir_all(workspace.join("src")).unwrap();
 
     let source = workspace.join("src");
-    for unsafe_output in [&workspace, workspace.parent().unwrap(), &source] {
+    let target = workspace.join("target");
+    for unsafe_output in [&workspace, workspace.parent().unwrap(), &source, &target] {
         let error = safe_prepared_output(&workspace, unsafe_output).unwrap_err();
         assert!(error.to_string().contains("prepared output"));
     }
