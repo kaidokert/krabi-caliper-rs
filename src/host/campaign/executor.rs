@@ -42,6 +42,7 @@ impl CampaignExecutor {
             })?;
         }
         let constant_time = effective_constant_time(config, &campaign)?;
+        let output_dir = safe_prepared_output(workspace, output_dir)?;
         for case in &mut cases {
             let mut features = profile.build_features.clone();
             features.append(&mut case.features);
@@ -63,13 +64,7 @@ impl CampaignExecutor {
                 &["rev-parse", "HEAD"],
                 selection.silent,
             ),
-            dirty: command_output(
-                workspace,
-                "git",
-                &["--no-optional-locks", "status", "--porcelain=v1"],
-                selection.silent,
-            )
-            .map(|value| !value.is_empty()),
+            dirty: git_dirty_excluding_path(workspace, &output_dir, selection.silent),
         };
         if source.git_commit.is_none() || source.dirty != Some(false) {
             return Err(CampaignError::InvalidConfig(
@@ -96,7 +91,6 @@ impl CampaignExecutor {
             optimization: Some(profile.cargo_profile.clone()),
             features: Vec::new(),
         };
-        let output_dir = safe_prepared_output(workspace, output_dir)?;
         reset_prepared_output(&output_dir)?;
         fs::create_dir_all(&output_dir).map_err(|source| CampaignError::Io {
             path: output_dir.clone(),
@@ -962,6 +956,17 @@ fn git_dirty_excluding(workspace: &Path, manifest: &Path, silent: bool) -> Optio
     let manifest = manifest.canonicalize().ok()?;
     let manifest_dir = manifest.parent()?;
     let workspace = workspace.canonicalize().ok()?;
+    let excluded = if manifest_dir == workspace {
+        manifest
+    } else {
+        manifest_dir.to_path_buf()
+    };
+    git_dirty_excluding_path(&workspace, &excluded, silent)
+}
+
+fn git_dirty_excluding_path(workspace: &Path, excluded: &Path, silent: bool) -> Option<bool> {
+    let workspace = workspace.canonicalize().ok()?;
+    let excluded = normalized_absolute(excluded).ok()?;
     let mut arguments = vec![
         "--no-optional-locks".to_string(),
         "status".to_string(),
@@ -969,13 +974,10 @@ fn git_dirty_excluding(workspace: &Path, manifest: &Path, silent: bool) -> Optio
         "--".to_string(),
         ".".to_string(),
     ];
-    if let Ok(relative) = manifest_dir.strip_prefix(&workspace) {
-        let excluded = if relative.as_os_str().is_empty() {
-            manifest.strip_prefix(&workspace).ok()?
-        } else {
-            relative
-        };
-        arguments.push(format!(":(exclude){}", excluded.to_string_lossy()));
+    if let Ok(relative) = excluded.strip_prefix(&workspace)
+        && !relative.as_os_str().is_empty()
+    {
+        arguments.push(format!(":(exclude){}", relative.to_string_lossy()));
     }
     let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     command_output(&workspace, "git", &arguments, silent).map(|value| !value.is_empty())
@@ -1004,6 +1006,11 @@ fn validate_prepared_build(
     if prepared.build.optimization.as_deref() != Some(profile.cargo_profile.as_str()) {
         return Err(CampaignError::InvalidConfig(
             "prepared build profile does not match configuration".to_string(),
+        ));
+    }
+    if prepared.build.toolchain != profile.toolchain {
+        return Err(CampaignError::InvalidConfig(
+            "prepared build toolchain does not match configuration".to_string(),
         ));
     }
     if prepared.constant_time != profile.constant_time {

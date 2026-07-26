@@ -564,6 +564,15 @@ cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark =
     let bundle = workspace.join("target/prepared");
     let _ = std::fs::remove_dir_all(&bundle);
     let executor = CampaignExecutor::default();
+    executor
+        .build_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &bundle,
+        )
+        .unwrap();
     let manifest = executor
         .build_prepared(
             &config,
@@ -650,6 +659,24 @@ cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark =
     assert!(error.to_string().contains("build profile"));
 
     mismatched.build.optimization = prepared.build.optimization.clone();
+    mismatched.build.toolchain = Some("wrong-toolchain".to_string());
+    std::fs::write(
+        &manifest,
+        serde_json::to_string_pretty(&mismatched).unwrap(),
+    )
+    .unwrap();
+    let error = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("build toolchain"));
+
+    mismatched.build.toolchain = prepared.build.toolchain.clone();
     mismatched.constant_time.as_mut().unwrap().welch_threshold = 9.0;
     std::fs::write(
         &manifest,
