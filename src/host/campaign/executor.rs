@@ -862,27 +862,47 @@ fn safe_prepared_output(workspace: &Path, output: &Path) -> Result<PathBuf, Camp
         source,
     })?;
     let output = normalized_absolute(output)?;
-    let output = if output.exists() {
-        output.canonicalize().map_err(|source| CampaignError::Io {
-            path: output.clone(),
-            source,
-        })?
-    } else {
-        output
-    };
+    reject_symlinked_output(&output)?;
+    let resolved_output = output.canonicalize().unwrap_or_else(|_| output.clone());
 
-    if workspace.starts_with(&output) {
+    if workspace.starts_with(&resolved_output) {
         return Err(CampaignError::InvalidConfig(
             "prepared output must not be the workspace or one of its ancestors".to_string(),
         ));
     }
     let target = workspace.join("target");
-    if output.starts_with(&workspace) && (!output.starts_with(&target) || output == target) {
+    if resolved_output.starts_with(&workspace)
+        && (!resolved_output.starts_with(&target) || resolved_output == target)
+    {
         return Err(CampaignError::InvalidConfig(
             "prepared output inside the workspace must be a child of target/".to_string(),
         ));
     }
     Ok(output)
+}
+
+fn reject_symlinked_output(output: &Path) -> Result<(), CampaignError> {
+    let mut current = PathBuf::new();
+    for component in output.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "prepared output path must not contain symlinks: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CampaignError::Io {
+                    path: current,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normalized_absolute(path: &Path) -> Result<PathBuf, CampaignError> {

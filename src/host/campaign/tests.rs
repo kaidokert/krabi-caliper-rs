@@ -688,6 +688,33 @@ fn prepared_output_cannot_erase_workspace_content() {
     std::fs::remove_dir_all(workspace).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn prepared_output_rejects_symlinks_without_deleting_the_destination() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "krabi-caliper-output-symlink-test-{}",
+        std::process::id()
+    ));
+    let workspace = root.join("workspace");
+    let destination = root.join("destination");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(workspace.join("target")).unwrap();
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::write(destination.join("keep"), "must survive").unwrap();
+    symlink(&destination, workspace.join("target/prepared")).unwrap();
+
+    let error = safe_prepared_output(&workspace, &workspace.join("target/prepared")).unwrap_err();
+    assert!(error.to_string().contains("must not contain symlinks"));
+    assert_eq!(
+        std::fs::read_to_string(destination.join("keep")).unwrap(),
+        "must survive"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn prepared_build_validation_checks_unselected_campaigns() {
     let config = parse(
