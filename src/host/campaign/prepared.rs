@@ -40,6 +40,9 @@ impl ToolkitConfig {
     ) -> Result<ResolvedBuildProfile, CampaignError> {
         let mut visiting = Vec::new();
         let profile = self.inherited_profile(name, &mut visiting)?;
+        if let Some(policy) = &profile.constant_time {
+            validate_constant_time_config(policy)?;
+        }
         let preset = profile.preset.map(preset_values);
         let mut evidence = BTreeMap::new();
         let mut expand = |value: &str| {

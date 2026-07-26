@@ -291,6 +291,19 @@ minimum-samples-per-class = 1
 "#,
     );
     assert!(invalid_ct.validate().is_err());
+
+    let invalid_profile_ct = parse(
+        r#"
+[profiles.qemu]
+preset = "qemu-cortex-m3"
+[profiles.qemu.constant-time]
+minimum-samples-per-class = 1
+[campaigns.test]
+profile = "qemu"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    assert!(invalid_profile_ct.validate_for_build().is_err());
 }
 
 fn matrix_campaign() -> CampaignConfig {
