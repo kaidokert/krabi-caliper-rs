@@ -504,7 +504,7 @@ pub enum ConfiguredU64 {
     Binding(String),
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ConstantTimeConfig {
     #[serde(default = "default_welch_threshold")]

@@ -41,6 +41,7 @@ impl CampaignExecutor {
                 )
             })?;
         }
+        let constant_time = effective_constant_time(config, &campaign)?;
         for case in &mut cases {
             let mut features = profile.build_features.clone();
             features.append(&mut case.features);
@@ -154,6 +155,7 @@ impl CampaignExecutor {
             profile: campaign.profile,
             source,
             build,
+            constant_time,
             cases: prepared_cases,
         };
         let manifest = output_dir.join("manifest.json");
@@ -276,10 +278,10 @@ impl CampaignExecutor {
             })?;
             profile.configuration_identity = configuration_identity(&profile);
         }
-        validate_prepared_build(&prepared, &profile)?;
         if let Some(policy) = &campaign.constant_time {
             profile.constant_time = Some(policy.clone());
         }
+        validate_prepared_build(&prepared, &profile)?;
         for case in &mut cases {
             let mut features = profile.build_features.clone();
             features.append(&mut case.features);
@@ -842,6 +844,18 @@ fn selected_campaign(
     Ok((campaign, cases))
 }
 
+fn effective_constant_time(
+    config: &ToolkitConfig,
+    campaign: &CampaignConfig,
+) -> Result<Option<ConstantTimeConfig>, CampaignError> {
+    let mut visiting = Vec::new();
+    let profile = config.inherited_profile(&campaign.profile, &mut visiting)?;
+    Ok(campaign
+        .constant_time
+        .clone()
+        .or(profile.constant_time))
+}
+
 fn safe_prepared_output(workspace: &Path, output: &Path) -> Result<PathBuf, CampaignError> {
     let workspace = workspace.canonicalize().map_err(|source| CampaignError::Io {
         path: workspace.to_path_buf(),
@@ -937,6 +951,11 @@ fn validate_prepared_build(
     if prepared.build.optimization.as_deref() != Some(profile.cargo_profile.as_str()) {
         return Err(CampaignError::InvalidConfig(
             "prepared build profile does not match configuration".to_string(),
+        ));
+    }
+    if prepared.constant_time != profile.constant_time {
+        return Err(CampaignError::InvalidConfig(
+            "prepared constant-time policy does not match configuration".to_string(),
         ));
     }
     Ok(())

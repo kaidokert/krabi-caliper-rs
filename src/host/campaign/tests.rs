@@ -557,6 +557,7 @@ args = [
 
 [campaigns.prepared]
 profile = "prepared"
+constant-time = { gate = false, welch-threshold = 4.5 }
 cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark = "prepared-fixture" }]
 "#,
     );
@@ -625,6 +626,25 @@ cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark =
         )
         .unwrap_err();
     assert!(error.to_string().contains("build profile"));
+
+    mismatched.build.optimization = prepared.build.optimization.clone();
+    mismatched.constant_time.as_mut().unwrap().welch_threshold = 9.0;
+    std::fs::write(
+        &manifest,
+        serde_json::to_string_pretty(&mismatched).unwrap(),
+    )
+    .unwrap();
+    let error = executor
+        .run_prepared(
+            &config,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("constant-time policy"));
+
     std::fs::write(&manifest, serde_json::to_string_pretty(&prepared).unwrap()).unwrap();
 
     std::fs::write(

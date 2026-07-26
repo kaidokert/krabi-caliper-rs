@@ -7,6 +7,8 @@ pub struct PreparedCampaign {
     pub profile: String,
     pub source: SourceMetadata,
     pub build: BuildMetadata,
+    #[serde(default)]
+    pub constant_time: Option<ConstantTimeConfig>,
     pub cases: Vec<PreparedCase>,
 }
 
