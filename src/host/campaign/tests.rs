@@ -560,10 +560,7 @@ profile = "prepared"
 cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark = "prepared-fixture" }]
 "#,
     );
-    let bundle = std::env::temp_dir().join(format!(
-        "krabi-caliper-prepared-bundle-{}",
-        std::process::id()
-    ));
+    let bundle = workspace.join("target/prepared");
     let _ = std::fs::remove_dir_all(&bundle);
     let executor = CampaignExecutor::default();
     let manifest = executor
@@ -588,6 +585,10 @@ cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark =
         )
         .unwrap();
     assert!(report.success());
+    assert_ne!(
+        report.cases[0].environment.build.target.as_deref(),
+        Some("host")
+    );
 
     std::fs::write(
         bundle.join(&prepared.cases[0].artifact),
@@ -604,8 +605,50 @@ cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark =
         )
         .unwrap_err();
     assert!(error.to_string().contains("wrong digest"));
-    std::fs::remove_dir_all(bundle).unwrap();
     std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn prepared_output_cannot_erase_workspace_content() {
+    let workspace = std::env::temp_dir().join(format!(
+        "krabi-caliper-output-safety-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+
+    let source = workspace.join("src");
+    for unsafe_output in [&workspace, workspace.parent().unwrap(), &source] {
+        let error = safe_prepared_output(&workspace, unsafe_output).unwrap_err();
+        assert!(error.to_string().contains("prepared output"));
+    }
+    assert_eq!(
+        safe_prepared_output(&workspace, &workspace.join("target/prepared")).unwrap(),
+        workspace.join("target/prepared")
+    );
+
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn prepared_build_validation_checks_unselected_campaigns() {
+    let config = parse(
+        r#"
+[profiles.valid]
+preset = "qemu-cortex-m3"
+
+[campaigns.valid]
+profile = "valid"
+cases = [{ name = "fixture", example = "fixture" }]
+
+[campaigns.invalid]
+profile = "missing"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let error = config.validate_for_build().unwrap_err();
+    assert!(error.to_string().contains("missing"));
 }
 
 #[test]

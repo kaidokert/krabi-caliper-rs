@@ -31,6 +31,7 @@ impl CampaignExecutor {
         selection: &CampaignSelection,
         output_dir: &Path,
     ) -> Result<PathBuf, CampaignError> {
+        config.validate_for_build()?;
         let (campaign, mut cases) = selected_campaign(config, campaign_name, selection)?;
         let mut profile = config.resolve_build_profile(&campaign.profile)?;
         if profile.target == "host" {
@@ -94,19 +95,20 @@ impl CampaignExecutor {
             optimization: Some(profile.cargo_profile.clone()),
             features: Vec::new(),
         };
+        let output_dir = safe_prepared_output(workspace, output_dir)?;
         if output_dir.exists() {
-            fs::remove_dir_all(output_dir).map_err(|source| CampaignError::Io {
-                path: output_dir.to_path_buf(),
+            fs::remove_dir_all(&output_dir).map_err(|source| CampaignError::Io {
+                path: output_dir.clone(),
                 source,
             })?;
         }
-        fs::create_dir_all(output_dir).map_err(|source| CampaignError::Io {
-            path: output_dir.to_path_buf(),
+        fs::create_dir_all(&output_dir).map_err(|source| CampaignError::Io {
+            path: output_dir.clone(),
             source,
         })?;
         let mut prepared_cases = Vec::new();
         for case in cases {
-            let case_dir = artifact_child(output_dir, &case.id, "expanded case id")?;
+            let case_dir = artifact_child(&output_dir, &case.id, "expanded case id")?;
             fs::create_dir_all(&case_dir).map_err(|source| CampaignError::Io {
                 path: case_dir.clone(),
                 source,
@@ -137,7 +139,7 @@ impl CampaignExecutor {
             prepared_cases.push(PreparedCase {
                 case,
                 artifact: retained
-                    .strip_prefix(output_dir)
+                    .strip_prefix(&output_dir)
                     .unwrap_or(&retained)
                     .to_path_buf(),
                 sha256: prepared_sha256(&retained)?,
@@ -266,6 +268,14 @@ impl CampaignExecutor {
             ));
         }
         let mut profile = config.resolve_profile(&campaign.profile)?;
+        if profile.target == "host" {
+            profile.target = prepared.build.target.clone().ok_or_else(|| {
+                CampaignError::InvalidConfig(
+                    "prepared host campaign does not record its concrete target".to_string(),
+                )
+            })?;
+            profile.configuration_identity = configuration_identity(&profile);
+        }
         if let Some(policy) = &campaign.constant_time {
             profile.constant_time = Some(policy.clone());
         }
@@ -292,13 +302,7 @@ impl CampaignExecutor {
             &["rev-parse", "HEAD"],
             selection.silent,
         );
-        let dirty = command_output(
-            workspace,
-            "git",
-            &["--no-optional-locks", "status", "--porcelain=v1"],
-            selection.silent,
-        )
-        .map(|value| !value.is_empty());
+        let dirty = git_dirty_excluding(workspace, manifest_path, selection.silent);
         if commit != prepared.source.git_commit || dirty != Some(false) {
             return Err(CampaignError::InvalidConfig(
                 "prepared source does not match the clean execution checkout".to_string(),
@@ -835,6 +839,77 @@ fn selected_campaign(
     }
     let cases = expand_cases(&campaign, selection)?;
     Ok((campaign, cases))
+}
+
+fn safe_prepared_output(workspace: &Path, output: &Path) -> Result<PathBuf, CampaignError> {
+    let workspace = workspace.canonicalize().map_err(|source| CampaignError::Io {
+        path: workspace.to_path_buf(),
+        source,
+    })?;
+    let output = normalized_absolute(output)?;
+    let output = if output.exists() {
+        output.canonicalize().map_err(|source| CampaignError::Io {
+            path: output.clone(),
+            source,
+        })?
+    } else {
+        output
+    };
+
+    if workspace.starts_with(&output) {
+        return Err(CampaignError::InvalidConfig(
+            "prepared output must not be the workspace or one of its ancestors".to_string(),
+        ));
+    }
+    if output.starts_with(&workspace) && !output.starts_with(workspace.join("target")) {
+        return Err(CampaignError::InvalidConfig(
+            "prepared output inside the workspace must be under target/".to_string(),
+        ));
+    }
+    Ok(output)
+}
+
+fn normalized_absolute(path: &Path) -> Result<PathBuf, CampaignError> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| CampaignError::Io {
+                path: PathBuf::from("."),
+                source,
+            })?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn git_dirty_excluding(workspace: &Path, manifest: &Path, silent: bool) -> Option<bool> {
+    let manifest_dir = manifest.parent()?.canonicalize().ok()?;
+    let workspace = workspace.canonicalize().ok()?;
+    let mut arguments = vec![
+        "--no-optional-locks".to_string(),
+        "status".to_string(),
+        "--porcelain=v1".to_string(),
+        "--".to_string(),
+        ".".to_string(),
+    ];
+    if let Ok(relative) = manifest_dir.strip_prefix(&workspace) {
+        arguments.push(format!(":(exclude){}", relative.to_string_lossy()));
+    }
+    let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    command_output(&workspace, "git", &arguments, silent).map(|value| !value.is_empty())
 }
 
 fn command_value(workspace: &Path, program: &str, args: &[&str], silent: bool) -> Option<String> {

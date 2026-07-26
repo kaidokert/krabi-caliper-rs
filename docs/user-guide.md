@@ -91,10 +91,10 @@ the prepared bundle to the hardware job:
 
 ```sh
 # Hosted build job
-cargo krabi-caliper build smoke --output prepared
+cargo krabi-caliper build smoke --output target/prepared
 
 # Hardware execution job, after downloading the complete prepared directory
-cargo krabi-caliper run smoke --prepared prepared/manifest.json
+cargo krabi-caliper run smoke --prepared target/prepared/manifest.json
 ```
 
 Prepared execution does not invoke Cargo. It requires the same clean source
