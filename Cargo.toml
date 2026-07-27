@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/kaidokert/krabi-caliper-rs"
 keywords = ["embedded", "benchmark", "no-std", "profiling"]
 categories = ["embedded", "no-std", "development-tools::profiling"]
+exclude = [".github/actions/**", ".github/workflows/hw-ct.yml"]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -548,6 +548,9 @@ path = "examples/prepared-fixture.rs"
         assert!(
             std::process::Command::new("git")
                 .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
                 .current_dir(&workspace)
                 .output()
                 .unwrap()

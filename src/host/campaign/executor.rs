@@ -1046,6 +1046,11 @@ fn captured_command_output(
         .args(args.iter().copied())
         .timeout(Duration::from_secs(5))
         .silent(silent);
+    if program == "git" {
+        for key in ["GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"] {
+            spec = spec.env_remove(key);
+        }
+    }
     if let Some(toolchain) = toolchain {
         spec = spec.env("RUSTUP_TOOLCHAIN", toolchain);
     }
