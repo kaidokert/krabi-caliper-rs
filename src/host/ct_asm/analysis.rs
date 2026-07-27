@@ -88,10 +88,10 @@ pub fn split_blocks(text: &str) -> Vec<FunctionBlock> {
             continue;
         };
         if let Some(c) = RELOC_RE.captures(line) {
-            if let Some(last) = block.insns.last_mut() {
-                if last.call_target.is_none() {
-                    last.call_target = Some(normalize_target(&c[1]));
-                }
+            if let Some(last) = block.insns.last_mut()
+                && last.call_target.is_none()
+            {
+                last.call_target = Some(normalize_target(&c[1]));
             }
             continue;
         }
@@ -175,10 +175,10 @@ pub fn compute_reachable_symbols(blocks: &[FunctionBlock], calls: &[Regex]) -> H
                     .call_target
                     .clone()
                     .or_else(|| extract_target(&insn.full_line));
-                if let Some(target) = target {
-                    if !visited.contains(&target) {
-                        queue.push_back(target);
-                    }
+                if let Some(target) = target
+                    && !visited.contains(&target)
+                {
+                    queue.push_back(target);
                 }
             }
         }

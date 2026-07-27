@@ -597,16 +597,15 @@ fn llvm_objdump(toolchain: &str) -> PathBuf {
             .args(["--print", "sysroot"])
             .output(),
         host_triple(),
-    ) {
-        if sysroot.status.success() {
-            let p = Path::new(String::from_utf8_lossy(&sysroot.stdout).trim())
-                .join("lib/rustlib")
-                .join(host)
-                .join("bin")
-                .join(format!("llvm-objdump{}", env::consts::EXE_SUFFIX));
-            if p.exists() {
-                return p;
-            }
+    ) && sysroot.status.success()
+    {
+        let p = Path::new(String::from_utf8_lossy(&sysroot.stdout).trim())
+            .join("lib/rustlib")
+            .join(host)
+            .join("bin")
+            .join(format!("llvm-objdump{}", env::consts::EXE_SUFFIX));
+        if p.exists() {
+            return p;
         }
     }
     "llvm-objdump".into()

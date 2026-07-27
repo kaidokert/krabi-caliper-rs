@@ -35,12 +35,12 @@ impl ToolkitConfig {
                     "campaign {name:?} cannot specify both cases and case-set"
                 )));
             }
-            if let Some(case_set) = &campaign.case_set {
-                if !self.case_sets.contains_key(case_set) {
-                    return Err(CampaignError::InvalidConfig(format!(
-                        "campaign {name:?} references unknown case-set {case_set:?}"
-                    )));
-                }
+            if let Some(case_set) = &campaign.case_set
+                && !self.case_sets.contains_key(case_set)
+            {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "campaign {name:?} references unknown case-set {case_set:?}"
+                )));
             }
             let cases = campaign.case_set.as_ref().map_or_else(
                 || campaign.cases.as_slice(),

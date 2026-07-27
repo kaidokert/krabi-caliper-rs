@@ -1394,31 +1394,29 @@ fn classify_run(
             Some(result),
         );
     }
-    if let Some(expected) = &case.expected_benchmark {
-        if !result
+    if let Some(expected) = &case.expected_benchmark
+        && !result
             .outcomes
             .iter()
             .any(|value| &value.benchmark == expected)
-        {
-            return (
-                CaseStatus::MissingTerminalRecord,
-                Some(format!("no EM_OUTCOME record for {expected:?}")),
-                Some(result),
-            );
-        }
+    {
+        return (
+            CaseStatus::MissingTerminalRecord,
+            Some(format!("no EM_OUTCOME record for {expected:?}")),
+            Some(result),
+        );
     }
-    if let Some(expected) = &case.expected_suite {
-        if !result
+    if let Some(expected) = &case.expected_suite
+        && !result
             .summaries
             .iter()
             .any(|value| &value.suite == expected)
-        {
-            return (
-                CaseStatus::MissingTerminalRecord,
-                Some(format!("no EM_SUMMARY record for {expected:?}")),
-                Some(result),
-            );
-        }
+    {
+        return (
+            CaseStatus::MissingTerminalRecord,
+            Some(format!("no EM_SUMMARY record for {expected:?}")),
+            Some(result),
+        );
     }
     let constant_time_error = profile
         .constant_time
