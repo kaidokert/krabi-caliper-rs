@@ -567,7 +567,7 @@ fn build_fixtures<T: TargetPolicy>(spec: &T, config: DriverConfig<'_>) -> Result
         command.arg("--target").arg(spec.triple());
     }
     command.args(spec.extra_cargo_args());
-    eprintln!("[ct-driver] {:?}", command);
+    eprintln!("[ct-driver] {command:?}");
     let status = command.status().map_err(|e| e.to_string())?;
     if status.success() {
         Ok(())

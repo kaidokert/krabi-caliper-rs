@@ -246,7 +246,7 @@ fn build(
         command.arg("--example").arg(artifact_name.unwrap());
     }
     command.args(&config.extra_cargo_args);
-    eprintln!("[panic-audit] {:?}", command);
+    eprintln!("[panic-audit] {command:?}");
     let output = command.stdout(Stdio::piped()).output().map_err(error)?;
     if !output.status.success() {
         return Err(PanicAuditError(format!(
