@@ -62,10 +62,6 @@ on:
         default: 0.1.3
         type: string
 
-concurrency:
-  group: hw-ct-${{ github.repository }}-${{ inputs.rig }}
-  cancel-in-progress: false
-
 jobs:
   build:
     if: inputs.prepared
@@ -137,7 +133,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: krabi-hw-prepared-${{ github.run_id }}-${{ inputs.invocation-name }}
+          name: krabi-hw-prepared-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.invocation-name }}
           path: ${{ runner.temp }}/prepared
           if-no-files-found: error
           retention-days: 3
@@ -145,6 +141,9 @@ jobs:
   hardware:
     needs: build
     if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    concurrency:
+      group: hw-ct-${{ github.repository }}-${{ inputs.rig }}
+      cancel-in-progress: false
     runs-on: ${{ fromJSON(inputs.runner-labels-json) }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
@@ -164,7 +163,7 @@ jobs:
       - uses: actions/download-artifact@v4
         if: inputs.prepared
         with:
-          name: krabi-hw-prepared-${{ github.run_id }}-${{ inputs.invocation-name }}
+          name: krabi-hw-prepared-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.invocation-name }}
           path: ${{ runner.temp }}/prepared
 
       - uses: kaidokert/krabi-caliper-rs/.github/actions/krabi-hw-run@main
