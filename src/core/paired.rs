@@ -101,7 +101,7 @@ impl<const N: usize> PairedRunner<N> {
         if N == 0 {
             return Err(RunError::ZeroSampleCapacity);
         }
-        if N % 2 != 0 {
+        if !N.is_multiple_of(2) {
             return Err(RunError::OddSampleCapacity);
         }
 

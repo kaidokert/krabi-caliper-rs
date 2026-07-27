@@ -463,7 +463,7 @@ fn quote(value: &OsStr) -> String {
     {
         value.into_owned()
     } else {
-        format!("{:?}", value)
+        format!("{value:?}")
     }
 }
 

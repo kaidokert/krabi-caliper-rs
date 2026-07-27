@@ -43,7 +43,7 @@ See the [user guide](docs/user-guide.md) for target integration, campaign
 configuration, feature selection, and measurement contracts.
 
 Default features are empty. Krabi Caliper uses Rust 2024 and requires Rust
-1.86 or newer.
+1.88 or newer.
 
 ## License
 

@@ -567,7 +567,7 @@ fn build_fixtures<T: TargetPolicy>(spec: &T, config: DriverConfig<'_>) -> Result
         command.arg("--target").arg(spec.triple());
     }
     command.args(spec.extra_cargo_args());
-    eprintln!("[ct-driver] {:?}", command);
+    eprintln!("[ct-driver] {command:?}");
     let status = command.status().map_err(|e| e.to_string())?;
     if status.success() {
         Ok(())
@@ -597,16 +597,15 @@ fn llvm_objdump(toolchain: &str) -> PathBuf {
             .args(["--print", "sysroot"])
             .output(),
         host_triple(),
-    ) {
-        if sysroot.status.success() {
-            let p = Path::new(String::from_utf8_lossy(&sysroot.stdout).trim())
-                .join("lib/rustlib")
-                .join(host)
-                .join("bin")
-                .join(format!("llvm-objdump{}", env::consts::EXE_SUFFIX));
-            if p.exists() {
-                return p;
-            }
+    ) && sysroot.status.success()
+    {
+        let p = Path::new(String::from_utf8_lossy(&sysroot.stdout).trim())
+            .join("lib/rustlib")
+            .join(host)
+            .join("bin")
+            .join(format!("llvm-objdump{}", env::consts::EXE_SUFFIX));
+        if p.exists() {
+            return p;
         }
     }
     "llvm-objdump".into()

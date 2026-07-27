@@ -258,7 +258,7 @@ fn require_nonnegative_i32(response: &[u8], operation: &str) -> Result<(), Remot
 fn is_console_output(response: &[u8]) -> bool {
     response.first() == Some(&b'O')
         && response.len() > 1
-        && response[1..].len() % 2 == 0
+        && response[1..].len().is_multiple_of(2)
         && response[1..].iter().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -295,7 +295,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(bytes: &[u8]) -> Result<Vec<u8>, RemoteError> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(RemoteError("odd-length hexadecimal response".into()));
     }
     bytes
