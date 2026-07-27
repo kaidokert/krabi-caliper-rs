@@ -3,8 +3,8 @@ name: krabi-caliper hardware campaign
 on:
   workflow_call:
     inputs:
-      shared-ref:
-        description: Immutable krabi-caliper commit containing this workflow and action
+      invocation-name:
+        description: Unique human-readable name for this workflow invocation
         required: true
         type: string
       campaigns-json:
@@ -137,7 +137,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: krabi-hw-prepared-${{ github.run_id }}
+          name: krabi-hw-prepared-${{ github.run_id }}-${{ inputs.invocation-name }}
           path: ${{ runner.temp }}/prepared
           if-no-files-found: error
           retention-days: 3
@@ -161,21 +161,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check out shared hardware action
-        uses: actions/checkout@v4
-        with:
-          repository: kaidokert/krabi-caliper-rs
-          ref: ${{ inputs.shared-ref }}
-          path: .krabi-caliper-actions
-          persist-credentials: false
-
       - uses: actions/download-artifact@v4
         if: inputs.prepared
         with:
-          name: krabi-hw-prepared-${{ github.run_id }}
+          name: krabi-hw-prepared-${{ github.run_id }}-${{ inputs.invocation-name }}
           path: ${{ runner.temp }}/prepared
 
-      - uses: ./.krabi-caliper-actions/.github/actions/krabi-hw-run
+      - uses: kaidokert/krabi-caliper-rs/.github/actions/krabi-hw-run@main
         with:
           rig: ${{ inputs.rig }}
           campaigns: ${{ join(fromJSON(inputs.campaigns-json), ' ') }}
