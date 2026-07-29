@@ -31,7 +31,7 @@ inputs:
   caliper-version:
     description: Exact krabi-caliper CLI version required in the runner image
     required: false
-    default: 0.1.3
+    default: 0.1.5
   job-summary:
     description: Append rendered campaign reports to the GitHub job summary
     required: false

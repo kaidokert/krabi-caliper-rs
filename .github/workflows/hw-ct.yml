@@ -37,9 +37,9 @@ on:
         default: '["self-hosted","rig-stm32f407-dwt"]'
         type: string
       container-image:
-        description: Hardware job image
+        description: Hardware job image override; empty selects the image matching caliper-version
         required: false
-        default: ghcr.io/kaidokert/pi-hw-runner:latest
+        default: ""
         type: string
       container-options:
         description: Docker options for probe access and CPU control
@@ -59,7 +59,7 @@ on:
       caliper-version:
         description: Exact krabi-caliper CLI version used for build and run
         required: false
-        default: 0.1.3
+        default: 0.1.5
         type: string
       job-summary:
         description: Append rendered campaign reports to the GitHub job summary
@@ -159,7 +159,7 @@ jobs:
     permissions:
       contents: read
     container:
-      image: ${{ inputs.container-image }}
+      image: ${{ inputs.container-image != '' && inputs.container-image || format('ghcr.io/kaidokert/pi-hw-runner:caliper-{0}', inputs.caliper-version) }}
       options: ${{ inputs.container-options }}
       volumes:
         - /dev/bus/usb:/dev/bus/usb

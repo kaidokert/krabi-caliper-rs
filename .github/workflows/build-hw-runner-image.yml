@@ -1,0 +1,113 @@
+# Build the hardware-CT job image and publish it to GHCR, so no one hand-builds
+# it on the bench. Native arm64 (aarch64, matches the Pi runners); a QEMU
+# cross-build would be far too slow for the probe-rs + caliper compile.
+#
+# Publishes ghcr.io/kaidokert/pi-hw-runner:caliper-<version>. Stable releases
+# also advance :latest; manual dispatches do so only when explicitly requested.
+# Pull requests and mainline pushes build without publishing.
+#
+# The ghcr package must be PUBLIC (Packages → pi-hw-runner → visibility) so
+# benches pull it without credentials.
+name: build-hw-runner-image
+
+on:
+  release:
+    types: [published]      # a caliper release rebuilds the image at that version
+  workflow_dispatch:
+    inputs:
+      version:
+        description: krabi-caliper version to bake in
+        required: true
+        type: string
+      publish-latest:
+        description: Also advance the latest tag
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - hw-runner/**
+      - .github/workflows/build-hw-runner-image.yml
+  push:
+    branches: [main]
+    paths:
+      - hw-runner/**
+      - .github/workflows/build-hw-runner-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Non-publishing PR/main builds need a version already available on crates.io.
+  PUBLISHED_TEST_CALIPER_VERSION: 0.1.4
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve caliper version
+        id: ver
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH_LATEST: ${{ inputs.publish-latest }}
+        run: |
+          set -euo pipefail
+          publish=false
+          publish_latest=false
+          if [ "$EVENT_NAME" = "release" ]; then
+            v="${RELEASE_TAG#v}"
+            publish=true
+            if [ "$RELEASE_PRERELEASE" != "true" ]; then
+              publish_latest=true
+            fi
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            v="$INPUT_VERSION"
+            publish=true
+            publish_latest="$INPUT_PUBLISH_LATEST"
+          else
+            v="$PUBLISHED_TEST_CALIPER_VERSION"
+          fi
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "::error::invalid krabi-caliper version: $v"
+            exit 1
+          }
+          tags="ghcr.io/kaidokert/pi-hw-runner:caliper-$v"
+          if [ "$publish_latest" = "true" ]; then
+            tags+=$'\n'"ghcr.io/kaidokert/pi-hw-runner:latest"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "building krabi-caliper $v (publish=$publish, latest=$publish_latest)"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: steps.ver.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: hw-runner
+          platforms: linux/arm64
+          push: ${{ steps.ver.outputs.publish == 'true' }}
+          provenance: false
+          build-args: |
+            KRABI_CALIPER_VERSION=${{ steps.ver.outputs.version }}
+          tags: |
+            ${{ steps.ver.outputs.tags }}
