@@ -20,6 +20,7 @@ use std::vec::Vec;
 use cargo_metadata::Message;
 use serde::{Deserialize, Serialize};
 
+use super::render::format_duration;
 use super::{
     BuildMetadata, CommandError, CommandOutput, CommandRunner, CommandSpec, CompletionAction,
     ElfFootprint, MetricPolicy, RunResult, RunStatus, SourceMetadata, TargetMetadata, parse,
