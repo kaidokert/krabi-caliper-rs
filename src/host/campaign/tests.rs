@@ -504,6 +504,9 @@ cases = [{ name = "external", example = "external-fixture", expected-benchmark =
     assert!(output_dir.join("report.md").is_file());
     assert!(output_dir.join("report.csv").is_file());
     assert!(output_dir.join("results.json").is_file());
+    let markdown = std::fs::read_to_string(output_dir.join("report.md")).unwrap();
+    assert!(markdown.contains("| Measurements | Duration |"));
+    assert!(markdown.contains("| 456 simulator cycles | 28.500 µs |"));
     std::fs::remove_dir_all(workspace).unwrap();
 }
 

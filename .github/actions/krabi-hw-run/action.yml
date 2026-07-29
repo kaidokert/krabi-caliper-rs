@@ -32,6 +32,10 @@ inputs:
     description: Exact krabi-caliper CLI version required in the runner image
     required: false
     default: 0.1.3
+  job-summary:
+    description: Append rendered campaign reports to the GitHub job summary
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -47,6 +51,7 @@ runs:
         KRABI_ACTION_RIG_DIRECTORY: ${{ inputs.rig-directory }}
         KRABI_ACTION_LOCK_TIMEOUT: ${{ inputs.lock-timeout-seconds }}
         KRABI_ACTION_CALIPER_VERSION: ${{ inputs.caliper-version }}
+        KRABI_ACTION_JOB_SUMMARY: ${{ inputs.job-summary }}
       run: |
         set -euo pipefail
         export PATH="/usr/local/cargo/bin:$HOME/.cargo/bin:$PATH"
@@ -89,15 +94,26 @@ runs:
         cd "$GITHUB_WORKSPACE/$KRABI_ACTION_WORKING_DIRECTORY"
         for campaign in $KRABI_ACTION_CAMPAIGNS; do
           echo "::group::campaign $campaign"
+          report="$RUNNER_TEMP/krabi-caliper-$campaign.md"
+          set +e
           if [ "$KRABI_ACTION_PREPARED" = "true" ]; then
             manifest="$KRABI_ACTION_PREPARED_ROOT/$campaign/manifest.json"
             [ -f "$manifest" ] || {
               echo "::error::prepared manifest missing for $campaign ($manifest)"
               exit 1
             }
-            cargo krabi-caliper run "$campaign" --prepared "$manifest"
+            cargo krabi-caliper run "$campaign" --prepared "$manifest" | tee "$report"
+            status=$?
           else
-            cargo krabi-caliper run "$campaign"
+            cargo krabi-caliper run "$campaign" | tee "$report"
+            status=$?
           fi
+          set -e
           echo "::endgroup::"
+          if [ "$KRABI_ACTION_JOB_SUMMARY" = "true" ] && [ -s "$report" ]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
         done

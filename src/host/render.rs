@@ -299,7 +299,7 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
-fn format_duration(nanoseconds: u64) -> String {
+pub(super) fn format_duration(nanoseconds: u64) -> String {
     if nanoseconds >= 1_000_000_000 {
         format!("{:.6} s", nanoseconds as f64 / 1_000_000_000.0)
     } else if nanoseconds >= 1_000_000 {
