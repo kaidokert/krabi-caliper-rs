@@ -5,8 +5,8 @@
 # board- or bench-specific, so one image serves every rig.
 #
 # Built in CI (.github/workflows/build-hw-runner-image.yml) on a GitHub-hosted
-# arm64 runner and published to ghcr.io/kaidokert/pi-hw-runner:latest +
-# :caliper-<version>. Each repo's hw-ct workflow references it via `container:`.
+# arm64 runner and published as :caliper-<version>. Stable releases can also
+# advance :latest. Each repo's hw-ct workflow references it via `container:`.
 FROM rust:1-bookworm
 
 # probe-rs needs libusb + libudev (build + run). uhubctl for power-cycle recovery
@@ -33,7 +33,7 @@ RUN cargo install probe-rs-tools --version ${PROBE_RS_VERSION} --locked \
 # later crates.io release can't silently change what the image runs — the build
 # workflow overrides this ARG from the release tag. Needs cli + campaign features
 # (the cargo-krabi-caliper bin's required-features). Same in-layer cache cleanup.
-ARG KRABI_CALIPER_VERSION=0.1.4
+ARG KRABI_CALIPER_VERSION=0.1.5
 RUN cargo install krabi-caliper --version =${KRABI_CALIPER_VERSION} --locked --features cli,campaign \
  && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
 
