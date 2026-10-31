@@ -23,6 +23,70 @@ pub trait TargetPolicy {
     fn ladder_allowed_branches(&self) -> usize {
         0
     }
+    /// Accept conditional branches that close or exit a counted loop (see
+    /// [`is_counted_loop_branch`]) in the whole-surface scan. Off by default.
+    fn counted_loops(&self) -> bool {
+        false
+    }
+    /// Positive fixtures (regexes over the symbol) left out of the
+    /// whole-surface scan and its reachability roots. None by default.
+    fn excluded_fixtures(&self) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+/// Whole-surface scan options layered on any policy.
+#[derive(Debug, Clone, Copy)]
+pub struct Surface<T> {
+    pub policy: T,
+    /// Accept counted-loop branches (see [`is_counted_loop_branch`]).
+    pub counted_loops: bool,
+    /// Positive fixtures (regexes over the symbol) left out of the scan and of
+    /// the reachability roots: accepted per-target gaps. A pattern that matches
+    /// no fixture is an error, so stale entries surface.
+    pub excluded_fixtures: &'static [&'static str],
+}
+
+impl<T: TargetPolicy> TargetPolicy for Surface<T> {
+    fn triple(&self) -> &'static str {
+        self.policy.triple()
+    }
+    fn priority(&self) -> u8 {
+        self.policy.priority()
+    }
+    fn toolchain(&self) -> &'static str {
+        self.policy.toolchain()
+    }
+    fn forbidden(&self) -> &'static [&'static str] {
+        self.policy.forbidden()
+    }
+    fn allowed(&self) -> &'static [&'static str] {
+        self.policy.allowed()
+    }
+    fn thumb_it_blocks(&self) -> bool {
+        self.policy.thumb_it_blocks()
+    }
+    fn calls(&self) -> &'static [&'static str] {
+        self.policy.calls()
+    }
+    fn allowed_helpers(&self) -> &'static [&'static str] {
+        self.policy.allowed_helpers()
+    }
+    fn extra_allowed_helpers(&self) -> &'static [&'static str] {
+        self.policy.extra_allowed_helpers()
+    }
+    fn extra_cargo_args(&self) -> &'static [&'static str] {
+        self.policy.extra_cargo_args()
+    }
+    fn ladder_allowed_branches(&self) -> usize {
+        self.policy.ladder_allowed_branches()
+    }
+    fn counted_loops(&self) -> bool {
+        self.counted_loops
+    }
+    fn excluded_fixtures(&self) -> &'static [&'static str] {
+        self.excluded_fixtures
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -206,7 +270,40 @@ pub fn run_whole_surface<T: TargetPolicy>(
         Ok(patterns) => patterns,
         Err(error) => return usage_error(&error, false),
     };
-    let reachable = compute_reachable_symbols(&blocks, &patterns.call);
+    let loops = if spec.counted_loops() {
+        match LoopIsa::for_triple(triple.as_str()) {
+            Some(isa) => Some(isa),
+            None => {
+                return usage_error(
+                    &format!("counted-loop acceptance has no model for {triple}"),
+                    false,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let excluded = match spec
+        .excluded_fixtures()
+        .iter()
+        .map(|p| Regex::new(p).map_err(|e| format!("excluded fixture pattern {p:?}: {e}")))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(v) => v,
+        Err(e) => return usage_error(&e, false),
+    };
+    let exclusion = |symbol: &str| {
+        let symbol = symbol.trim_start_matches('_');
+        excluded.iter().position(|p| p.is_match(symbol))
+    };
+    let scan = |block: &FunctionBlock| {
+        scan_block_counted(block, &patterns, spec.thumb_it_blocks(), loops)
+    };
+    let reachable = compute_reachable_from(&blocks, &patterns.call, |symbol| {
+        is_positive_fixture(symbol) && exclusion(symbol).is_none()
+    });
+    let mut excluded_used = std::vec![false; excluded.len()];
+    let mut fixtures_excluded = 0;
     let mut fixture_count = 0;
     let mut fixture_violations = Vec::new();
     let mut neg_seen = BTreeSet::new();
@@ -214,10 +311,18 @@ pub fn run_whole_surface<T: TargetPolicy>(
     let mut helper_violations = Vec::new();
     let mut helpers_scanned = 0;
     let mut helpers_allowlisted = 0;
+    let mut counted_loop_branches = 0;
     for block in &blocks {
         if is_positive_fixture(&block.symbol) {
+            if let Some(i) = exclusion(&block.symbol) {
+                excluded_used[i] = true;
+                fixtures_excluded += 1;
+                continue;
+            }
             fixture_count += 1;
-            fixture_violations.extend(scan_block(block, &patterns, spec.thumb_it_blocks()));
+            let (found, accepted) = scan(block);
+            fixture_violations.extend(found);
+            counted_loop_branches += accepted;
             continue;
         }
         if is_negative_control(&block.symbol) {
@@ -230,7 +335,8 @@ pub fn run_whole_surface<T: TargetPolicy>(
             }
             let name = block.symbol.trim_start_matches('_').to_string();
             neg_seen.insert(name.clone());
-            if !scan_block(block, &patterns, spec.thumb_it_blocks()).is_empty() {
+            // Same acceptance as positives: a control must still trip.
+            if !scan(block).0.is_empty() {
                 neg_tripped.insert(name);
             }
             continue;
@@ -243,7 +349,9 @@ pub fn run_whole_surface<T: TargetPolicy>(
             continue;
         }
         helpers_scanned += 1;
-        helper_violations.extend(scan_block(block, &patterns, spec.thumb_it_blocks()));
+        let (found, accepted) = scan(block);
+        helper_violations.extend(found);
+        counted_loop_branches += accepted;
     }
     let report = WholeSurfaceReport {
         target: triple,
@@ -251,12 +359,25 @@ pub fn run_whole_surface<T: TargetPolicy>(
         negative_controls_checked: neg_seen.len(),
         helpers_scanned,
         helpers_allowlisted,
+        counted_loop_branches,
+        fixtures_excluded,
         ct_violations: fixture_violations.into_iter().map(Into::into).collect(),
         helper_violations: helper_violations.into_iter().map(Into::into).collect(),
         negative_controls_failed_to_trip: negative_failures(&neg_seen, &neg_tripped),
     };
     report.print_human();
     write_report(args.json_out.as_deref(), &report);
+    let stale: Vec<_> = spec
+        .excluded_fixtures()
+        .iter()
+        .zip(&excluded_used)
+        .filter(|(_, used)| !**used)
+        .map(|(p, _)| *p)
+        .collect();
+    if !stale.is_empty() {
+        eprintln!("error: excluded fixture patterns match no fixture: {stale:?}");
+        return ExitCode::FAILURE;
+    }
     if fixture_count == 0 || neg_seen.is_empty() {
         eprintln!(
             "error: fixture archive self-test failed: positive or negative fixture set is empty"
@@ -614,7 +735,11 @@ fn run_objdump<T: TargetPolicy>(spec: &T, archive: &Path) -> Result<String, Stri
     let mut command = Command::new(llvm_objdump(spec.toolchain()));
     command.args(["--disassemble", "--no-show-raw-insn", "--reloc"]);
     if spec.triple().starts_with("avr-") || spec.triple() == "avr-none" {
-        command.arg("--triple=avr");
+        // Without a CPU the disassembler only knows the base ISA, so `call`,
+        // `push`, `lds`/`sts` decode as `<unknown>` and the call graph is
+        // empty. avr6 is a decode superset; the scan does not depend on the
+        // build's `-C target-cpu`.
+        command.args(["--triple=avr", "--mcpu=atmega2560"]);
     }
     command.arg(archive);
     let out = command.output().map_err(|e| e.to_string())?;

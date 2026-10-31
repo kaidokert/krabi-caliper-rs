@@ -28,5 +28,6 @@ static TARGET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<(.+)>(?:\s+@\s+imm[^<]*)?\s*$").unwrap());
 
 include!("ct_asm/analysis.rs");
+include!("ct_asm/loops.rs");
 include!("ct_asm/driver.rs");
 include!("ct_asm/tests.rs");
