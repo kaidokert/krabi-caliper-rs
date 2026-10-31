@@ -13,7 +13,7 @@ the target facilities used and keep them out of the normal dependency graph:
 
 ```toml
 [dev-dependencies]
-krabi-caliper = { version = "0.1", features = ["cortex-m", "semihosting", "stack"] }
+krabi-caliper = { version = "0.2", features = ["cortex-m", "semihosting", "stack"] }
 ```
 
 Use `[dependencies]` instead when instrumentation is compiled into a normal
