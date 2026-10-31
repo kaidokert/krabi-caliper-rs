@@ -150,8 +150,11 @@ jobs:
   hardware:
     needs: build
     if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    # Keyed per ref and invocation: GitHub keeps one pending job per group,
+    # so a shared key lets another branch or matrix variant cancel this one.
+    # The rig lock in krabi-hw-run serialises access to the hardware.
     concurrency:
-      group: hw-ct-${{ github.repository }}-${{ inputs.rig }}
+      group: hw-ct-${{ github.repository }}-${{ github.ref }}-${{ inputs.rig }}-${{ inputs.invocation-name }}
       cancel-in-progress: false
     runs-on: ${{ fromJSON(inputs.runner-labels-json) }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
