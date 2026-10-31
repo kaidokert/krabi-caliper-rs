@@ -9,11 +9,11 @@
 // deciding it is either
 //
 // - an induction register: written inside the loop body only by a constant
-//   step (add/sub of an immediate, or load/store base writeback), and
-//   actually stepped at least once; or
+//   step (add/sub of an immediate, or load/store base writeback); or
 // - loop-invariant: never written inside the body.
 //
-// At least one deciding register must be an induction register.
+// Registers are read where the flags are set, not at the branch. At least
+// one deciding register must make net nonzero progress per iteration.
 //
 // What this does NOT establish: that the counter's initial value or the
 // invariant bound is public. `for _ in 0..secret` passes. Those are the
@@ -51,16 +51,27 @@ impl LoopIsa {
 struct Decision {
     /// Registers whose values decide the branch.
     regs: Vec<String>,
+    /// Offset of the instruction that reads them (the flag setter, or the
+    /// branch itself for compare-and-branch forms).
+    at: u64,
 }
 
 /// Effect of one instruction on one register.
 #[derive(Debug, PartialEq, Eq)]
 enum Effect {
     Untouched,
-    /// Constant step: `add r, r, #k`, base writeback, `inc`, ...
-    Step,
+    /// Constant step: `add r, r, #k`, base writeback, `inc`, ... with its
+    /// amount when exact (`None` for carry-dependent high bytes).
+    Step(Option<i64>),
     /// Any other write, including call clobbers and undecodable instructions.
     Clobber,
+}
+
+/// A register holding some counter's loop-entry value plus a net step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Counter {
+    origin: String,
+    delta: Option<i64>,
 }
 
 static THUMB_REG: LazyLock<Regex> =
@@ -125,27 +136,33 @@ pub fn is_counted_loop_branch(block: &FunctionBlock, index: usize, isa: LoopIsa)
     let straight_line = body
         .iter()
         .all(|i| i.offset == branch.offset || i.offset == tail || !is_branch(isa, &i.mnemonic));
-    let Some(at_branch) = counters_at_branch(isa, &body, &decision.regs, branch.offset, &predicated, straight_line)
+    let Some((at, end)) =
+        counters_at(isa, &body, &decision.regs, decision.at, &predicated, straight_line)
     else {
         return false;
     };
-    decision.regs.iter().all(|r| at_branch.contains_key(r))
-        && decision.regs.iter().any(|r| at_branch[r])
+    let progress = |c: &Counter| {
+        end.get(&c.origin).is_some_and(|e| {
+            e.origin == c.origin
+                && e.delta.is_some_and(|d| if isa == LoopIsa::Avr { d & 0xff != 0 } else { d != 0 })
+        })
+    };
+    decision.regs.iter().all(|r| at.contains_key(r))
+        && decision.regs.iter().any(|r| progress(&at[r]))
 }
 
-/// Registers holding a counter value (loop-entry value of some counter plus
-/// constant steps) where the branch reads them, each with whether it was
-/// stepped on the way. A register counts only if it again holds a counter value
+/// Registers holding a counter value where the decision reads them, and at
+/// the back edge. A register counts only if it again holds a counter value
 /// at the back edge, so the set is the greatest fixpoint of one body pass.
 /// Loaded data never enters it.
-fn counters_at_branch(
+fn counters_at(
     isa: LoopIsa,
     body: &[&Insn],
     decision: &[String],
-    branch_offset: u64,
+    decide_at: u64,
     predicated: &HashSet<u64>,
     straight_line: bool,
-) -> Option<HashMap<String, bool>> {
+) -> Option<(HashMap<String, Counter>, HashMap<String, Counter>)> {
     let mut universe: HashSet<String> = decision.iter().cloned().collect();
     for insn in body {
         universe.extend(operands(isa, insn).iter().filter_map(|o| reg(isa, o)));
@@ -160,32 +177,35 @@ fn counters_at_branch(
     }
     let mut entry = universe.clone();
     loop {
-        // Live counter registers and whether each was stepped this pass.
-        let mut live: HashMap<String, bool> = entry.iter().map(|r| (r.clone(), false)).collect();
-        let mut at_branch = None;
+        let mut live: HashMap<String, Counter> = entry
+            .iter()
+            .map(|r| (r.clone(), Counter { origin: r.clone(), delta: Some(0) }))
+            .collect();
+        let mut at_decision = None;
+        let mut previous: Option<&Insn> = None;
         for insn in body {
-            if insn.offset == branch_offset {
-                at_branch = Some(live.clone());
+            if insn.offset == decide_at {
+                at_decision = Some(live.clone());
             }
             let pairs = if straight_line { copy_pairs(isa, insn) } else { std::vec![] };
             let mut next = live.clone();
             for r in &universe {
                 if let Some((_, s)) = pairs.iter().find(|(d, _)| d == r) {
                     match live.get(s) {
-                        Some(&stepped) => next.insert(r.clone(), stepped),
+                        Some(c) => next.insert(r.clone(), c.clone()),
                         None => next.remove(r),
                     };
                     continue;
                 }
-                match effect(isa, insn, r) {
+                match effect(isa, insn, previous, r) {
                     Effect::Untouched => {}
                     // A predicated step is conditional, so not a constant one.
-                    Effect::Step if predicated.contains(&insn.offset) => {
+                    Effect::Step(_) if predicated.contains(&insn.offset) => {
                         next.remove(r);
                     }
-                    Effect::Step => {
-                        if let Some(stepped) = next.get_mut(r) {
-                            *stepped = true;
+                    Effect::Step(k) => {
+                        if let Some(c) = next.get_mut(r) {
+                            c.delta = c.delta.zip(k).map(|(d, k)| d.wrapping_add(k));
                         }
                     }
                     Effect::Clobber => {
@@ -194,17 +214,12 @@ fn counters_at_branch(
                 }
             }
             live = next;
+            previous = Some(insn);
         }
-        let narrowed: HashSet<String> = entry.iter().filter(|r| live.contains_key(*r)).cloned().collect();
+        let narrowed: HashSet<String> =
+            entry.iter().filter(|r| live.contains_key(*r)).cloned().collect();
         if narrowed.len() == entry.len() {
-            // A step after the branch (forward exit ahead of the increment)
-            // still moves the counter between iterations.
-            return at_branch.map(|mut at| {
-                for (r, stepped) in at.iter_mut() {
-                    *stepped |= live.get(r).copied().unwrap_or(false);
-                }
-                at
-            });
+            return at_decision.map(|at| (at, live));
         }
         entry = narrowed;
     }
@@ -438,15 +453,15 @@ fn reg(isa: LoopIsa, operand: &str) -> Option<String> {
 }
 
 fn x86_canonical(name: &str) -> Option<&'static str> {
-    const LEGACY: &[(&str, [&str; 4])] = &[
-        ("rax", ["rax", "eax", "ax", "al"]),
-        ("rbx", ["rbx", "ebx", "bx", "bl"]),
-        ("rcx", ["rcx", "ecx", "cx", "cl"]),
-        ("rdx", ["rdx", "edx", "dx", "dl"]),
-        ("rsi", ["rsi", "esi", "si", "sil"]),
-        ("rdi", ["rdi", "edi", "di", "dil"]),
-        ("rbp", ["rbp", "ebp", "bp", "bpl"]),
-        ("rsp", ["rsp", "esp", "sp", "spl"]),
+    const LEGACY: &[(&str, &[&str])] = &[
+        ("rax", &["rax", "eax", "ax", "al", "ah"]),
+        ("rbx", &["rbx", "ebx", "bx", "bl", "bh"]),
+        ("rcx", &["rcx", "ecx", "cx", "cl", "ch"]),
+        ("rdx", &["rdx", "edx", "dx", "dl", "dh"]),
+        ("rsi", &["rsi", "esi", "si", "sil"]),
+        ("rdi", &["rdi", "edi", "di", "dil"]),
+        ("rbp", &["rbp", "ebp", "bp", "bpl"]),
+        ("rsp", &["rsp", "esp", "sp", "spl"]),
     ];
     for (canonical, names) in LEGACY {
         if names.contains(&name) {
@@ -469,6 +484,23 @@ fn is_imm(isa: LoopIsa, operand: &str) -> bool {
             HEX_IMM.is_match(o) || o.parse::<i64>().is_ok()
         }
     }
+}
+
+/// Value of an immediate operand, when it is one.
+fn imm_value(isa: LoopIsa, operand: &str) -> Option<i64> {
+    if !is_imm(isa, operand) {
+        return None;
+    }
+    let o = operand.trim_start_matches(['#', '$']);
+    let (negative, o) = match o.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, o),
+    };
+    let magnitude = match o.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok()? as i64,
+        None => o.parse::<i64>().ok()?,
+    };
+    Some(if negative { magnitude.wrapping_neg() } else { magnitude })
 }
 
 /// Caller-saved registers a call may clobber.
@@ -512,6 +544,7 @@ fn decision(
 ) -> Option<Decision> {
     let ops = operands(isa, branch);
     let m = base_mnemonic(isa, &branch.mnemonic);
+    let on_branch = |regs| Some(Decision { regs, at: branch.offset });
     match isa {
         LoopIsa::RiscV => {
             // Compare-and-branch: every register operand decides.
@@ -520,13 +553,16 @@ fn decision(
                 .filter_map(|o| reg(isa, o))
                 .filter(|r| r != "zero" && r != "x0")
                 .collect();
-            Some(Decision { regs })
+            on_branch(regs)
         }
-        LoopIsa::Thumb | LoopIsa::AArch64 if matches!(m, "cbz" | "cbnz") => Some(Decision {
-            regs: std::vec![reg(isa, ops.first()?)?],
-        }),
+        LoopIsa::Thumb | LoopIsa::AArch64 if matches!(m, "cbz" | "cbnz") => {
+            on_branch(std::vec![reg(isa, ops.first()?)?])
+        }
         LoopIsa::AArch64 if matches!(m, "tbz" | "tbnz") => None,
-        LoopIsa::Avr => avr_decision(before),
+        LoopIsa::X86_64 if matches!(m, "jcxz" | "jecxz" | "jrcxz") => {
+            on_branch(std::vec!["rcx".to_string()])
+        }
+        LoopIsa::Avr => avr_decision(before, m),
         _ => {
             let setter = before.iter().rev().find_map(|i| {
                 if predicated.contains(&i.offset) {
@@ -538,10 +574,29 @@ fn decision(
                 }
             });
             match setter? {
-                (FlagRole::Sets, insn) => flag_setter_regs(isa, insn),
+                (FlagRole::Sets, insn) if setter_covers(isa, insn, m) => Some(Decision {
+                    regs: flag_setter_regs(isa, insn)?,
+                    at: insn.offset,
+                }),
                 _ => None,
             }
         }
+    }
+}
+
+/// Does `setter` write every flag `branch` reads? x86 `inc`/`dec` leave CF
+/// alone; Thumb `tst`/`teq` leave V (and C, unless shifting).
+fn setter_covers(isa: LoopIsa, setter: &Insn, branch: &str) -> bool {
+    let m = base_mnemonic(isa, &setter.mnemonic);
+    match isa {
+        LoopIsa::X86_64 if matches!(x86_base(m), "inc" | "dec") => !matches!(
+            branch,
+            "jb" | "jc" | "jnae" | "jae" | "jnb" | "jnc" | "ja" | "jnbe" | "jbe" | "jna"
+        ),
+        LoopIsa::Thumb if matches!(m, "tst" | "teq") => {
+            matches!(branch, "beq" | "bne" | "bmi" | "bpl")
+        }
+        _ => true,
     }
 }
 
@@ -609,7 +664,7 @@ fn flags_role(isa: LoopIsa, insn: &Insn) -> FlagRole {
 }
 
 /// Registers decided on by a flag setter, when it is a form we model.
-fn flag_setter_regs(isa: LoopIsa, insn: &Insn) -> Option<Decision> {
+fn flag_setter_regs(isa: LoopIsa, insn: &Insn) -> Option<Vec<String>> {
     let ops = operands(isa, insn);
     let m = base_mnemonic(isa, &insn.mnemonic);
     let regs_of = |ops: &[String]| -> Option<Vec<String>> {
@@ -626,9 +681,7 @@ fn flag_setter_regs(isa: LoopIsa, insn: &Insn) -> Option<Decision> {
     };
     match isa {
         LoopIsa::Thumb | LoopIsa::AArch64 => match m {
-            "cmp" | "cmn" | "tst" => Some(Decision {
-                regs: regs_of(&ops)?,
-            }),
+            "cmp" | "cmn" | "tst" => regs_of(&ops),
             "adds" | "subs" => {
                 // `subs rD, rS, #k` flags reflect rS ± k; `subs r, #k` and
                 // `subs r, r, #k` step r itself.
@@ -637,34 +690,26 @@ fn flag_setter_regs(isa: LoopIsa, insn: &Insn) -> Option<Decision> {
                     [_, s, k] if is_imm(isa, k) => s,
                     _ => return None,
                 };
-                Some(Decision {
-                    regs: std::vec![reg(isa, source)?],
-                })
+                Some(std::vec![reg(isa, source)?])
             }
             _ => None,
         },
-        LoopIsa::X86_64 => {
-            match (x86_base(m), ops.as_slice()) {
-                ("cmp" | "test", [_, _]) => Some(Decision {
-                    regs: regs_of(&ops)?,
-                }),
-                ("add" | "sub", [k, d]) if is_imm(isa, k) => Some(Decision {
-                    regs: std::vec![reg(isa, d)?],
-                }),
-                ("inc" | "dec", [d]) => Some(Decision {
-                    regs: std::vec![reg(isa, d)?],
-                }),
-                _ => None,
-            }
-        }
+        LoopIsa::X86_64 => match (x86_base(m), ops.as_slice()) {
+            ("cmp" | "test", [_, _]) => regs_of(&ops),
+            ("add" | "sub", [k, d]) if is_imm(isa, k) => Some(std::vec![reg(isa, d)?]),
+            ("inc" | "dec", [d]) => Some(std::vec![reg(isa, d)?]),
+            _ => None,
+        },
         LoopIsa::RiscV | LoopIsa::Avr => None,
     }
 }
 
 /// AVR flags come from a carry chain: `cp/cpi/sub/subi` head, then any
 /// number of `cpc/sbc/sbci`, then the branch. Single-instruction counters
-/// (`dec`, `inc`, `sbiw`, `adiw`, `tst`) decide on their own register(s).
-fn avr_decision(before: &[&Insn]) -> Option<Decision> {
+/// (`dec`, `inc`, `sbiw`, `adiw`, `tst`) decide on their own register(s);
+/// `inc`/`dec`/`tst` leave C and H alone, so carry branches after them are
+/// rejected.
+fn avr_decision(before: &[&Insn], branch: &str) -> Option<Decision> {
     let isa = LoopIsa::Avr;
     let mut regs = Vec::new();
     for insn in before.iter().rev() {
@@ -682,6 +727,12 @@ fn avr_decision(before: &[&Insn]) -> Option<Decision> {
             "cp" | "sub" => {
                 regs.extend(ops.iter().filter_map(|o| reg(isa, o)));
             }
+            "dec" | "inc" | "tst"
+                if regs.is_empty()
+                    && matches!(branch, "brcs" | "brcc" | "brlo" | "brsh" | "brhs" | "brhc") =>
+            {
+                return None;
+            }
             "cpi" | "subi" | "dec" | "inc" | "tst" => {
                 regs.push(reg(isa, ops.first()?)?);
             }
@@ -698,7 +749,7 @@ fn avr_decision(before: &[&Insn]) -> Option<Decision> {
             }
             _ => return None,
         }
-        return Some(Decision { regs });
+        return Some(Decision { regs, at: insn.offset });
     }
     None
 }
@@ -710,7 +761,7 @@ fn avr_pair_high(low: &str) -> Option<String> {
 
 // ── Per-instruction effect on a register ────────────────────────────────────
 
-fn effect(isa: LoopIsa, insn: &Insn, target: &str) -> Effect {
+fn effect(isa: LoopIsa, insn: &Insn, previous: Option<&Insn>, target: &str) -> Effect {
     let m = base_mnemonic(isa, &insn.mnemonic);
     if m.starts_with('<') {
         return Effect::Clobber;
@@ -728,30 +779,43 @@ fn effect(isa: LoopIsa, insn: &Insn, target: &str) -> Effect {
         LoopIsa::RiscV => riscv_effect(m, &ops, target),
         LoopIsa::AArch64 => aarch64_effect(m, &ops, target),
         LoopIsa::X86_64 => x86_effect(m, &ops, target),
-        LoopIsa::Avr => avr_effect(m, &ops, target),
+        LoopIsa::Avr => avr_effect(m, &ops, previous, target),
     }
 }
 
-/// Base register of a `[base, ...]!` or `[base], #k` memory operand with
-/// writeback, when the writeback step is an immediate.
-fn arm_writeback(isa: LoopIsa, ops: &[String]) -> Option<(String, bool)> {
+/// Base register of a `[base, #k]!` or `[base], #k` memory operand with
+/// writeback, and the step when it is an immediate.
+fn arm_writeback(isa: LoopIsa, ops: &[String]) -> Option<(String, Option<i64>)> {
     for (i, op) in ops.iter().enumerate() {
         let Some(inner) = op.strip_prefix('[') else {
             continue;
         };
-        let pre = op.ends_with("]!");
         let close = inner.find(']')?;
-        let base = reg(isa, inner[..close].split(',').next()?)?;
-        let post = !pre && ops.get(i + 1).is_some();
-        if pre {
-            return Some((base, true));
+        let mut parts = inner[..close].split(',').map(str::trim);
+        let base = reg(isa, parts.next()?)?;
+        if op.ends_with("]!") {
+            let rest: Vec<&str> = parts.collect();
+            let step = match rest.as_slice() {
+                [] => Some(0),
+                [k] => imm_value(isa, k),
+                _ => None,
+            };
+            return Some((base, step));
         }
-        if post {
-            let step_is_imm = ops.get(i + 1).is_some_and(|k| is_imm(isa, k));
-            return Some((base, step_is_imm));
+        if let Some(k) = ops.get(i + 1) {
+            return Some((base, imm_value(isa, k)));
         }
     }
     None
+}
+
+/// Writeback through `base` as an effect on `target`.
+fn writeback_effect(writeback: Option<(String, Option<i64>)>, target: &str) -> Effect {
+    match writeback {
+        Some((base, Some(k))) if base == target => Effect::Step(Some(k)),
+        Some((base, None)) if base == target => Effect::Clobber,
+        _ => Effect::Untouched,
+    }
 }
 
 fn register_list(isa: LoopIsa, ops: &[String]) -> Vec<String> {
@@ -785,13 +849,14 @@ fn thumb_effect(m: &str, ops: &[String], target: &str) -> Effect {
     {
         return Effect::Untouched;
     }
+    let list_bytes = || 4 * register_list(isa, ops).len() as i64;
     if m == "push" {
-        return if target == "sp" { Effect::Step } else { Effect::Untouched };
+        return if target == "sp" { Effect::Step(Some(-list_bytes())) } else { Effect::Untouched };
     }
     if m == "pop" {
         let list = register_list(isa, ops);
         return if target == "sp" {
-            Effect::Step
+            Effect::Step(Some(list_bytes()))
         } else if list.iter().any(|r| r == target) {
             Effect::Clobber
         } else {
@@ -804,8 +869,11 @@ fn thumb_effect(m: &str, ops: &[String], target: &str) -> Effect {
             return Effect::Clobber;
         }
         let base_wb = ops.first().filter(|o| o.ends_with('!'));
+        let descending = m.ends_with("db") || m.ends_with("da") || m == "stmfd";
         return match base_wb {
-            Some(b) if is(b) => Effect::Step,
+            Some(b) if is(b) => {
+                Effect::Step(Some(if descending { -list_bytes() } else { list_bytes() }))
+            }
             _ => Effect::Untouched,
         };
     }
@@ -818,16 +886,7 @@ fn thumb_effect(m: &str, ops: &[String], target: &str) -> Effect {
         if m.starts_with("ldr") && dests.iter().any(is) {
             return Effect::Clobber;
         }
-        return match arm_writeback(isa, ops) {
-            Some((base, imm)) if base == target => {
-                if imm {
-                    Effect::Step
-                } else {
-                    Effect::Clobber
-                }
-            }
-            _ => Effect::Untouched,
-        };
+        return writeback_effect(arm_writeback(isa, ops), target);
     }
     if matches!(m, "umull" | "umlal" | "smull" | "smlal" | "umaal") {
         return if ops.iter().take(2).any(is) {
@@ -842,17 +901,14 @@ fn thumb_effect(m: &str, ops: &[String], target: &str) -> Effect {
     if !is(dest) {
         return Effect::Untouched;
     }
-    let constant_step = matches!(m, "add" | "adds" | "sub" | "subs" | "addw" | "subw")
-        && match ops {
-            [_, k] => is_imm(isa, k),
-            [_, s, k] => is(s) && is_imm(isa, k),
-            _ => false,
-        };
-    if constant_step {
-        Effect::Step
-    } else {
-        Effect::Clobber
-    }
+    let step = match (m, ops) {
+        ("add" | "adds" | "addw", [_, k]) => imm_value(isa, k),
+        ("add" | "adds" | "addw", [_, s, k]) if is(s) => imm_value(isa, k),
+        ("sub" | "subs" | "subw", [_, k]) => imm_value(isa, k).map(i64::wrapping_neg),
+        ("sub" | "subs" | "subw", [_, s, k]) if is(s) => imm_value(isa, k).map(i64::wrapping_neg),
+        _ => None,
+    };
+    step.map_or(Effect::Clobber, |k| Effect::Step(Some(k)))
 }
 
 fn aarch64_effect(m: &str, ops: &[String], target: &str) -> Effect {
@@ -871,16 +927,7 @@ fn aarch64_effect(m: &str, ops: &[String], target: &str) -> Effect {
         if is_load && ops.iter().take(dest_count).any(is) {
             return Effect::Clobber;
         }
-        return match arm_writeback(isa, ops) {
-            Some((base, imm)) if base == target => {
-                if imm {
-                    Effect::Step
-                } else {
-                    Effect::Clobber
-                }
-            }
-            _ => Effect::Untouched,
-        };
+        return writeback_effect(arm_writeback(isa, ops), target);
     }
     let Some(dest) = ops.first() else {
         return Effect::Untouched;
@@ -888,14 +935,12 @@ fn aarch64_effect(m: &str, ops: &[String], target: &str) -> Effect {
     if !is(dest) {
         return Effect::Untouched;
     }
-    let constant_step = matches!(m, "add" | "adds" | "sub" | "subs")
-        && matches!(ops, [_, s, k] if is(s) && is_imm(isa, k))
-        && ops.len() == 3;
-    if constant_step {
-        Effect::Step
-    } else {
-        Effect::Clobber
-    }
+    let step = match (m, ops) {
+        ("add" | "adds", [_, s, k]) if is(s) => imm_value(isa, k),
+        ("sub" | "subs", [_, s, k]) if is(s) => imm_value(isa, k).map(i64::wrapping_neg),
+        _ => None,
+    };
+    step.map_or(Effect::Clobber, |k| Effect::Step(Some(k)))
 }
 
 fn riscv_effect(m: &str, ops: &[String], target: &str) -> Effect {
@@ -913,12 +958,32 @@ fn riscv_effect(m: &str, ops: &[String], target: &str) -> Effect {
     if !is(dest) {
         return Effect::Untouched;
     }
-    let constant_step = matches!(m, "addi" | "addiw")
-        && matches!(ops, [_, s, k] if is(s) && is_imm(isa, k));
-    if constant_step {
-        Effect::Step
-    } else {
-        Effect::Clobber
+    let step = match (m, ops) {
+        ("addi" | "addiw", [_, s, k]) if is(s) => imm_value(isa, k),
+        _ => None,
+    };
+    step.map_or(Effect::Clobber, |k| Effect::Step(Some(k)))
+}
+
+/// x86 string instructions, which step `rsi`/`rdi` (and `rcx` under `rep`)
+/// whether or not objdump prints their operands.
+static X86_STRING_OP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(movs|lods|stos|scas|cmps|ins|outs)[bwlq]?$").unwrap());
+
+/// Registers written implicitly, beyond any explicit destination.
+fn x86_implicit_writes(m: &str) -> &'static [&'static str] {
+    let base = m.trim_end_matches(['b', 'w', 'l', 'q']);
+    match m {
+        "cqto" | "cltd" | "cwtd" => &["rdx"],
+        "cltq" | "cwtl" | "cbtw" | "lahf" | "xlat" | "xlatb" => &["rax"],
+        "cpuid" => &["rax", "rbx", "rcx", "rdx"],
+        "rdtsc" | "rdpmc" => &["rax", "rdx"],
+        "rdtscp" => &["rax", "rcx", "rdx"],
+        "syscall" => &["rax", "rcx", "r11"],
+        "leave" | "leaveq" => &["rsp", "rbp"],
+        "cmpxchg8b" | "cmpxchg16b" => &["rax", "rdx"],
+        _ if base == "cmpxchg" => &["rax"],
+        _ => &[],
     }
 }
 
@@ -933,11 +998,11 @@ fn x86_effect(m: &str, ops: &[String], target: &str) -> Effect {
         return Effect::Untouched;
     }
     if m.starts_with("push") {
-        return if target == "rsp" { Effect::Step } else { Effect::Untouched };
+        return if target == "rsp" { Effect::Step(Some(-8)) } else { Effect::Untouched };
     }
     if m.starts_with("pop") {
         if target == "rsp" {
-            return Effect::Step;
+            return Effect::Step(Some(8));
         }
         return if ops.first().is_some_and(is) { Effect::Clobber } else { Effect::Untouched };
     }
@@ -949,49 +1014,59 @@ fn x86_effect(m: &str, ops: &[String], target: &str) -> Effect {
             Effect::Untouched
         };
     }
-    if matches!(m, "cqto" | "cltd" | "cwtd") {
-        return if target == "rdx" { Effect::Clobber } else { Effect::Untouched };
-    }
-    if m.starts_with("rep") || m.starts_with("movs") && ops.is_empty() || m.starts_with("stos") {
+    if m.starts_with("rep") || X86_STRING_OP.is_match(m) {
         return if matches!(target, "rsi" | "rdi" | "rcx" | "rax") {
             Effect::Clobber
         } else {
             Effect::Untouched
         };
     }
+    if x86_implicit_writes(m).contains(&target) {
+        return Effect::Clobber;
+    }
     if base == "xchg" || base == "xadd" {
         return if ops.iter().any(is) { Effect::Clobber } else { Effect::Untouched };
     }
     let Some(dest) = ops.last() else {
-        return Effect::Untouched;
+        // Operand-less forms not modelled above may write registers.
+        let silent = matches!(
+            m,
+            "nop" | "ret" | "retq" | "endbr64" | "ud2" | "int3" | "hlt" | "pause" | "lfence"
+                | "mfence" | "sfence" | "clc" | "stc" | "cmc" | "cld" | "std" | "vzeroupper"
+        ) || !x86_implicit_writes(m).is_empty();
+        return if silent { Effect::Untouched } else { Effect::Clobber };
     };
     if !is(dest) {
         return Effect::Untouched;
     }
-    let constant_step = match (base, ops) {
-        ("add" | "sub", [k, _]) => is_imm(isa, k),
-        ("inc" | "dec", [_]) => true,
+    let step = match (base, ops) {
+        ("add", [k, _]) => imm_value(isa, k),
+        ("sub", [k, _]) => imm_value(isa, k).map(i64::wrapping_neg),
+        ("inc", [_]) => Some(1),
+        ("dec", [_]) => Some(-1),
         ("lea", [mem, _]) => x86_lea_self_step(mem, target),
-        _ => false,
+        _ => None,
     };
-    if constant_step {
-        Effect::Step
+    step.map_or(Effect::Clobber, |k| Effect::Step(Some(k)))
+}
+
+/// `lea k(%r), %r`: base only, no index, same register; returns `k`.
+fn x86_lea_self_step(mem: &str, target: &str) -> Option<i64> {
+    let open = mem.find('(')?;
+    let inner = mem[open + 1..].trim_end_matches(')');
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if parts.len() != 1 || reg(LoopIsa::X86_64, parts[0]).as_deref() != Some(target) {
+        return None;
+    }
+    let displacement = mem[..open].trim();
+    if displacement.is_empty() {
+        Some(0)
     } else {
-        Effect::Clobber
+        imm_value(LoopIsa::X86_64, &std::format!("${displacement}"))
     }
 }
 
-/// `lea k(%r), %r`: base only, no index, same register.
-fn x86_lea_self_step(mem: &str, target: &str) -> bool {
-    let Some(open) = mem.find('(') else {
-        return false;
-    };
-    let inner = mem[open + 1..].trim_end_matches(')');
-    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
-    parts.len() == 1 && reg(LoopIsa::X86_64, parts[0]).as_deref() == Some(target)
-}
-
-fn avr_effect(m: &str, ops: &[String], target: &str) -> Effect {
+fn avr_effect(m: &str, ops: &[String], previous: Option<&Insn>, target: &str) -> Effect {
     let isa = LoopIsa::Avr;
     let is = |o: &String| reg(isa, o).as_deref() == Some(target);
     let pointer = |o: &str| -> Option<(&'static str, &'static str)> {
@@ -1004,8 +1079,27 @@ fn avr_effect(m: &str, ops: &[String], target: &str) -> Effect {
             _ => None,
         }
     };
-    let writeback = |o: &str| o.ends_with('+') || o.starts_with('-');
-    let in_pair = |p: (&str, &str)| p.0 == target || p.1 == target;
+    // Post-increment / pre-decrement: the low byte moves by exactly one, the
+    // high byte only on carry.
+    let pointer_step = |o: &str| -> Effect {
+        let Some((low, high)) = pointer(o) else {
+            return Effect::Untouched;
+        };
+        let k = if o.ends_with('+') {
+            1
+        } else if o.starts_with('-') {
+            -1
+        } else {
+            return Effect::Untouched;
+        };
+        if target == low {
+            Effect::Step(Some(k))
+        } else if target == high {
+            Effect::Step(None)
+        } else {
+            Effect::Untouched
+        }
+    };
     // Compares, branches, I/O and SREG bit set/clear (`sec`, `clz`, ...; not
     // `ser`/`clr`, which write a register).
     if matches!(
@@ -1019,8 +1113,8 @@ fn avr_effect(m: &str, ops: &[String], target: &str) -> Effect {
     }
     if matches!(m, "st" | "std") {
         // `st X+, r` steps the pointer; `std Y+q, r` does not.
-        return match ops.first().map(String::as_str) {
-            Some(o) if m == "st" && writeback(o) && pointer(o).is_some_and(in_pair) => Effect::Step,
+        return match ops.first() {
+            Some(o) if m == "st" => pointer_step(o),
             _ => Effect::Untouched,
         };
     }
@@ -1031,10 +1125,8 @@ fn avr_effect(m: &str, ops: &[String], target: &str) -> Effect {
         if ops.first().is_some_and(is) {
             return Effect::Clobber;
         }
-        return match ops.get(1).map(String::as_str) {
-            Some(o) if m != "ldd" && writeback(o) && pointer(o).is_some_and(in_pair) => {
-                Effect::Step
-            }
+        return match ops.get(1) {
+            Some(o) if m != "ldd" => pointer_step(o),
             _ => Effect::Untouched,
         };
     }
@@ -1049,12 +1141,15 @@ fn avr_effect(m: &str, ops: &[String], target: &str) -> Effect {
         if low != target && high != target {
             return Effect::Untouched;
         }
-        return if m == "movw" {
-            Effect::Clobber
-        } else if ops.get(1).is_some_and(|k| is_imm(isa, k)) {
-            Effect::Step
-        } else {
-            Effect::Clobber
+        let k = match m {
+            "adiw" => ops.get(1).and_then(|k| imm_value(isa, k)),
+            "sbiw" => ops.get(1).and_then(|k| imm_value(isa, k)).map(i64::wrapping_neg),
+            _ => None,
+        };
+        return match k {
+            Some(k) if target == low => Effect::Step(Some(k)),
+            Some(_) => Effect::Step(None),
+            None => Effect::Clobber,
         };
     }
     let Some(dest) = ops.first() else {
@@ -1063,17 +1158,33 @@ fn avr_effect(m: &str, ops: &[String], target: &str) -> Effect {
     if !is(dest) {
         return Effect::Untouched;
     }
-    // `sbci`'s step depends on the low byte's borrow, itself driven by the
-    // counter's own constant step, so a `subi/sbci` pair is still a counter.
-    let constant_step = match m {
-        "subi" | "sbci" => ops.get(1).is_some_and(|k| is_imm(isa, k)),
-        "inc" | "dec" => true,
-        _ => false,
-    };
-    if constant_step {
-        Effect::Step
-    } else {
-        Effect::Clobber
+    match m {
+        "subi" => ops
+            .get(1)
+            .and_then(|k| imm_value(isa, k))
+            .map_or(Effect::Clobber, |k| Effect::Step(Some(k.wrapping_neg()))),
+        "inc" => Effect::Step(Some(1)),
+        "dec" => Effect::Step(Some(-1)),
+        // `sbci` steps by its immediate plus the borrow in, so it is a counter
+        // step only when that borrow comes from the same counter's next-lower
+        // byte (`subi`/`sbci` directly before, one register down).
+        "sbci" => {
+            let chained = previous.is_some_and(|p| {
+                matches!(p.mnemonic.as_str(), "subi" | "sbci")
+                    && operands(isa, p)
+                        .first()
+                        .and_then(|o| reg(isa, o))
+                        .and_then(|lower| avr_pair_high(&lower))
+                        .as_deref()
+                        == Some(target)
+            });
+            if chained && ops.get(1).is_some_and(|k| is_imm(isa, k)) {
+                Effect::Step(None)
+            } else {
+                Effect::Clobber
+            }
+        }
+        _ => Effect::Clobber,
     }
 }
 
@@ -1347,5 +1458,105 @@ mod counted_loop_tests {
             \x20 2:\tcmp\tr0, #0x4\n\
             \x20 4:\tbne\t0x0 <other>\n";
         assert_eq!(branches(listing, LoopIsa::Thumb), [(0x4, false)]);
+    }
+
+    #[test]
+    fn x86_register_rewritten_after_flag_setter() {
+        let listing = "<ct_fix__x>:\n\
+            \x20 10:\tmovq\t(%rsi), %rax\n\
+            \x20 13:\ttestq\t%rax, %rax\n\
+            \x20 16:\tleaq\t0x1(%rcx), %rcx\n\
+            \x20 1a:\tmovq\t%rcx, %rax\n\
+            \x20 1d:\tjne\t0x10 <ct_fix__x+0x10>\n";
+        assert_eq!(branches(listing, LoopIsa::X86_64), [(0x1d, false)]);
+    }
+
+    #[test]
+    fn x86_carry_branch_after_dec_reads_older_compare() {
+        let listing = "<ct_fix__x>:\n\
+            \x20 10:\tmovq\t(%rsi), %rax\n\
+            \x20 13:\tcmpq\t$0x4, %rax\n\
+            \x20 17:\tdecq\t%rcx\n\
+            \x20 1a:\tjb\t0x10 <ct_fix__x+0x10>\n";
+        assert_eq!(branches(listing, LoopIsa::X86_64), [(0x1a, false)]);
+    }
+
+    #[test]
+    fn x86_count_zero_jump_decides_on_rcx() {
+        let listing = "<ct_fix__x>:\n\
+            \x20 10:\tmovq\t(%rsi), %rcx\n\
+            \x20 13:\tdecq\t%rdx\n\
+            \x20 16:\tjrcxz\t0x10 <ct_fix__x+0x10>\n";
+        assert_eq!(branches(listing, LoopIsa::X86_64), [(0x16, false)]);
+    }
+
+    #[test]
+    fn x86_high_byte_and_implicit_writes_clobber() {
+        let high_byte = "<ct_fix__x>:\n\
+            \x20 10:\tmovb\t(%rsi), %ah\n\
+            \x20 12:\taddq\t$0x1, %rcx\n\
+            \x20 16:\tcmpq\t%rcx, %rax\n\
+            \x20 19:\tjne\t0x10 <ct_fix__x+0x10>\n";
+        assert_eq!(branches(high_byte, LoopIsa::X86_64), [(0x19, false)]);
+        let implicit = "<ct_fix__x>:\n\
+            \x20 10:\trdtsc\n\
+            \x20 12:\taddq\t$0x1, %rcx\n\
+            \x20 16:\tcmpq\t%rcx, %rax\n\
+            \x20 19:\tjne\t0x10 <ct_fix__x+0x10>\n";
+        assert_eq!(branches(implicit, LoopIsa::X86_64), [(0x19, false)]);
+    }
+
+    #[test]
+    fn aarch64_pre_index_register_offset_is_not_a_step() {
+        let register = "<ct_fix__x>:\n\
+            \x20 10:\tldr\tx11, [x8, x9]!\n\
+            \x20 14:\tcmp\tx8, x10\n\
+            \x20 18:\tb.ne\t0x10 <ct_fix__x+0x10>\n";
+        assert_eq!(branches(register, LoopIsa::AArch64), [(0x18, false)]);
+        let immediate = "<ct_fix__x>:\n\
+            \x20 10:\tldr\tx11, [x8, #8]!\n\
+            \x20 14:\tcmp\tx8, x10\n\
+            \x20 18:\tb.ne\t0x10 <ct_fix__x+0x10>\n";
+        assert_eq!(branches(immediate, LoopIsa::AArch64), [(0x18, true)]);
+    }
+
+    #[test]
+    fn thumb_zero_net_step_is_no_progress() {
+        let zero = "<ct_fix__x>:\n\
+            \x20 0:\tadds\tr0, #0x0\n\
+            \x20 2:\tcmp\tr0, r1\n\
+            \x20 4:\tbne\t0x0 <ct_fix__x>\n";
+        assert_eq!(branches(zero, LoopIsa::Thumb), [(0x4, false)]);
+        let net_zero = "<ct_fix__x>:\n\
+            \x20 0:\tadds\tr0, #0x1\n\
+            \x20 2:\tsubs\tr0, #0x1\n\
+            \x20 4:\tcmp\tr0, r1\n\
+            \x20 6:\tbne\t0x0 <ct_fix__x>\n";
+        assert_eq!(branches(net_zero, LoopIsa::Thumb), [(0x6, false)]);
+    }
+
+    #[test]
+    fn avr_unchained_sbci_is_not_a_step() {
+        let listing = "<ct_fix__x>:\n\
+            \x20 0:\tld\tr20, Z\n\
+            \x20 2:\tcp\tr20, r1\n\
+            \x20 4:\tsbci\tr25, 0x0\n\
+            \x20 6:\tsubi\tr24, 0x1\n\
+            \x20 8:\tcp\tr24, r22\n\
+            \x20 a:\tcpc\tr25, r23\n\
+            \x20 c:\tbrne\t.-2\n\
+            \t\t\t0000000c:  R_AVR_7_PCREL\t.text.ct_fix__x\n";
+        assert_eq!(branches(listing, LoopIsa::Avr), [(0xc, false)]);
+    }
+
+    #[test]
+    fn avr_carry_branch_after_inc_reads_older_compare() {
+        let listing = "<ct_fix__x>:\n\
+            \x20 0:\tld\tr20, Z\n\
+            \x20 2:\tcp\tr20, r1\n\
+            \x20 4:\tinc\tr24\n\
+            \x20 6:\tbrcs\t.-2\n\
+            \t\t\t00000006:  R_AVR_7_PCREL\t.text.ct_fix__x\n";
+        assert_eq!(branches(listing, LoopIsa::Avr), [(0x6, false)]);
     }
 }

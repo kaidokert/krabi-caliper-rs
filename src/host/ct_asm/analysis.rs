@@ -231,7 +231,10 @@ pub(crate) fn extract_target(line: &str) -> Option<String> {
         .map(|c| normalize_target(&c[1]))
 }
 
+/// Call target symbol from a relocation operand. AVR names calls to local
+/// functions by their section (`.text.<symbol>+0x0`).
 fn normalize_target(raw: &str) -> String {
+    let raw = raw.strip_prefix(".text.").unwrap_or(raw);
     let end = raw
         .find(|c: char| matches!(c, '+' | '-' | '@') || c.is_whitespace())
         .unwrap_or(raw.len());

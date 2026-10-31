@@ -292,15 +292,15 @@ pub fn run_whole_surface<T: TargetPolicy>(
         Ok(v) => v,
         Err(e) => return usage_error(&e, false),
     };
-    let exclusion = |symbol: &str| {
+    let exclusions = |symbol: &str| -> Vec<usize> {
         let symbol = symbol.trim_start_matches('_');
-        excluded.iter().position(|p| p.is_match(symbol))
+        (0..excluded.len()).filter(|&i| excluded[i].is_match(symbol)).collect()
     };
     let scan = |block: &FunctionBlock| {
         scan_block_counted(block, &patterns, spec.thumb_it_blocks(), loops)
     };
     let reachable = compute_reachable_from(&blocks, &patterns.call, |symbol| {
-        is_positive_fixture(symbol) && exclusion(symbol).is_none()
+        is_positive_fixture(symbol) && exclusions(symbol).is_empty()
     });
     let mut excluded_used = std::vec![false; excluded.len()];
     let mut fixtures_excluded = 0;
@@ -314,8 +314,11 @@ pub fn run_whole_surface<T: TargetPolicy>(
     let mut counted_loop_branches = 0;
     for block in &blocks {
         if is_positive_fixture(&block.symbol) {
-            if let Some(i) = exclusion(&block.symbol) {
-                excluded_used[i] = true;
+            let matched = exclusions(&block.symbol);
+            if !matched.is_empty() {
+                for i in matched {
+                    excluded_used[i] = true;
+                }
                 fixtures_excluded += 1;
                 continue;
             }
