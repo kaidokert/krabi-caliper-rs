@@ -133,8 +133,10 @@ impl GdbRemote {
             return Err(RemoteError("malformed STRACE read response".into()));
         }
         Ok(response[4..]
-            .chunks_exact(4)
-            .map(|item| u32::from_be_bytes(item.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|item| u32::from_be_bytes(*item))
             .collect())
     }
 
@@ -163,8 +165,10 @@ impl GdbRemote {
         let mut offset = 4;
         let mut take_counts = || {
             let values = response[offset..offset + halfwords as usize * 8]
-                .chunks_exact(8)
-                .map(|item| u64::from_le_bytes(item.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|item| u64::from_le_bytes(*item))
                 .collect::<Vec<_>>();
             offset += halfwords as usize * 8;
             let sum = u64::from_le_bytes(response[offset..offset + 8].try_into().unwrap());
@@ -299,8 +303,10 @@ fn hex_decode(bytes: &[u8]) -> Result<Vec<u8>, RemoteError> {
         return Err(RemoteError("odd-length hexadecimal response".into()));
     }
     bytes
-        .chunks_exact(2)
-        .map(|pair| decode_hex_byte([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| decode_hex_byte(*pair))
         .collect()
 }
 

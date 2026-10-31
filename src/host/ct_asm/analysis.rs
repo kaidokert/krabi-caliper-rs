@@ -10,6 +10,9 @@ pub struct Insn {
     pub mnemonic: String,
     pub full_line: String,
     pub call_target: Option<String>,
+    /// Raw relocation operand (`symbol+0x1a`), offset kept. Branch targets
+    /// in unlinked AVR objects are only recoverable from this.
+    pub reloc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +95,7 @@ pub fn split_blocks(text: &str) -> Vec<FunctionBlock> {
                 && last.call_target.is_none()
             {
                 last.call_target = Some(normalize_target(&c[1]));
+                last.reloc = Some(c[1].to_string());
             }
             continue;
         }
@@ -110,6 +114,7 @@ pub fn split_blocks(text: &str) -> Vec<FunctionBlock> {
                 mnemonic,
                 full_line: line.trim_end().to_string(),
                 call_target: None,
+                reloc: None,
             });
         }
     }
@@ -153,13 +158,46 @@ pub fn scan_block(
     out
 }
 
+/// [`scan_block`], additionally accepting counted-loop branches when `loops`
+/// names the ISA. Returns the violations and the number of accepted branches.
+pub fn scan_block_counted(
+    block: &FunctionBlock,
+    patterns: &Patterns,
+    thumb_it_blocks: bool,
+    loops: Option<LoopIsa>,
+) -> (Vec<Violation>, usize) {
+    let found = scan_block(block, patterns, thumb_it_blocks);
+    let Some(isa) = loops else {
+        return (found, 0);
+    };
+    let before = found.len();
+    let kept: Vec<Violation> = found
+        .into_iter()
+        .filter(|v| {
+            let index = block.insns.iter().position(|i| i.offset == v.offset);
+            !index.is_some_and(|index| is_counted_loop_branch(block, index, isa))
+        })
+        .collect();
+    let accepted = before - kept.len();
+    (kept, accepted)
+}
+
 pub fn compute_reachable_symbols(blocks: &[FunctionBlock], calls: &[Regex]) -> HashSet<String> {
+    compute_reachable_from(blocks, calls, is_positive_fixture)
+}
+
+/// Symbols reachable through calls from the blocks `is_root` selects.
+pub fn compute_reachable_from(
+    blocks: &[FunctionBlock],
+    calls: &[Regex],
+    is_root: impl Fn(&str) -> bool,
+) -> HashSet<String> {
     let by_symbol: HashMap<&str, &FunctionBlock> =
         blocks.iter().map(|b| (b.symbol.as_str(), b)).collect();
     let mut visited = HashSet::new();
     let mut queue: VecDeque<String> = blocks
         .iter()
-        .filter(|b| is_positive_fixture(&b.symbol))
+        .filter(|b| is_root(&b.symbol))
         .map(|b| b.symbol.clone())
         .collect();
     while let Some(symbol) = queue.pop_front() {
@@ -193,7 +231,10 @@ pub(crate) fn extract_target(line: &str) -> Option<String> {
         .map(|c| normalize_target(&c[1]))
 }
 
+/// Call target symbol from a relocation operand. AVR names calls to local
+/// functions by their section (`.text.<symbol>+0x0`).
 fn normalize_target(raw: &str) -> String {
+    let raw = raw.strip_prefix(".text.").unwrap_or(raw);
     let end = raw
         .find(|c: char| matches!(c, '+' | '-' | '@') || c.is_whitespace())
         .unwrap_or(raw.len());
@@ -235,6 +276,10 @@ pub struct WholeSurfaceReport {
     pub negative_controls_checked: usize,
     pub helpers_scanned: usize,
     pub helpers_allowlisted: usize,
+    /// Conditional branches accepted as counted-loop latches/exits.
+    pub counted_loop_branches: usize,
+    /// Positive fixtures left out as accepted per-target gaps.
+    pub fixtures_excluded: usize,
     pub ct_violations: Vec<ViolationOut>,
     pub helper_violations: Vec<ViolationOut>,
     pub negative_controls_failed_to_trip: Vec<String>,
@@ -251,6 +296,12 @@ impl WholeSurfaceReport {
             "  ct_fix__*       fixtures checked: {}",
             self.fixtures_checked
         );
+        if self.fixtures_excluded > 0 {
+            println!(
+                "  fixtures excluded (target gaps):  {}",
+                self.fixtures_excluded
+            );
+        }
         println!(
             "  nct_fix__neg__* controls checked: {}",
             self.negative_controls_checked
@@ -259,6 +310,12 @@ impl WholeSurfaceReport {
             "  helpers scanned (reachable):      {} ({} allowlisted)",
             self.helpers_scanned, self.helpers_allowlisted
         );
+        if self.counted_loop_branches > 0 {
+            println!(
+                "  counted-loop branches accepted:   {}",
+                self.counted_loop_branches
+            );
+        }
         print_violations("fixture", &self.ct_violations);
         print_violations("helper", &self.helper_violations);
         if self.negative_controls_failed_to_trip.is_empty() {

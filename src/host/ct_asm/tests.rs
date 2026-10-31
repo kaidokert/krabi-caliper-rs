@@ -21,6 +21,16 @@ mod tests {
     }
 
     #[test]
+    fn avr_section_relocation_drives_reachability() {
+        let blocks = split_blocks(
+            "<ct_fix__x>:\n  0: call 0x0\n  0: R_AVR_CALL .text.helper\n<helper>:\n  0: ret\n",
+        );
+        let calls = [Regex::new(r"^call$").unwrap()];
+        let reached = compute_reachable_symbols(&blocks, &calls);
+        assert!(reached.contains("helper"));
+    }
+
+    #[test]
     fn parses_nested_generic_symbols_and_architecture_neutral_implicit_offsets() {
         let blocks = split_blocks(
             "<ct_fix__generic::<core::option::Option<u8>>>:\n  nop\n  ret\n",
