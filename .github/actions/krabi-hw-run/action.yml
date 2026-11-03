@@ -84,7 +84,7 @@ runs:
         # probe-rs >= 0.30 lists a CMSIS-DAP probe with its USB interface
         # (`03eb:2175-0:Serial`); rig selectors omit it, as `--probe` allows.
         probe-rs list | sed -E 's/([0-9a-f]{4}:[0-9a-f]{4})-[0-9]+/\1/g' \
-          | grep -iF "$KRABI_PROBE" >/dev/null || {
+          | grep -F "$KRABI_PROBE" >/dev/null || {
           echo "::error::probe $KRABI_PROBE not attached to ${KRABI_BENCH:-this bench}"
           exit 1
         }
