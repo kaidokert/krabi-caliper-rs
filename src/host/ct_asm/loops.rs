@@ -15,8 +15,15 @@
 // Registers are read where the flags are set, not at the branch. At least
 // one deciding register must make net nonzero progress per iteration.
 //
-// What this does NOT establish: that the counter's initial value or the
-// invariant bound is public. `for _ in 0..secret` passes. Those are the
+// A second, narrower rule covers the bit-smear ladder in `subtle`'s primitive
+// `ct_gt` (`pow = 1; while pow < BITS { x |= x >> pow; pow += pow }`) and
+// Newton precision doubling: see `immediate_doubling_branch`. Unlike a constant
+// step, a doubling register is also the shape of a secret normalization loop
+// (`while d < n { d <<= 1 }`), so that rule requires every deciding register to
+// come from an immediate and never from data.
+//
+// What the constant-step rule does NOT establish: that the counter's initial
+// value or the invariant bound is public. `for _ in 0..secret` passes. Those are the
 // value-dependent cases the taint and timing layers exist for; this layer
 // only stops public-shape loops from drowning out real findings.
 
@@ -89,6 +96,10 @@ static HEX_IMM: LazyLock<Regex> =
 /// Is `block.insns[index]` a conditional branch closing or leaving a counted
 /// loop?
 pub fn is_counted_loop_branch(block: &FunctionBlock, index: usize, isa: LoopIsa) -> bool {
+    constant_step_branch(block, index, isa) || immediate_doubling_branch(block, index, isa)
+}
+
+fn constant_step_branch(block: &FunctionBlock, index: usize, isa: LoopIsa) -> bool {
     let insns = &block.insns;
     let branch = &insns[index];
     let Some(target) = in_function_target(block, branch, isa) else {
@@ -149,6 +160,278 @@ pub fn is_counted_loop_branch(block: &FunctionBlock, index: usize, isa: LoopIsa)
     };
     decision.regs.iter().all(|r| at.contains_key(r))
         && decision.regs.iter().any(|r| progress(&at[r]))
+}
+
+/// Is `block.insns[index]` a conditional branch inside a loop whose every
+/// deciding register is a pure function of immediates, stepped only by
+/// doubling? Its outcome then cannot depend on data, whatever the rest of the
+/// body computes.
+fn immediate_doubling_branch(block: &FunctionBlock, index: usize, isa: LoopIsa) -> bool {
+    let insns = &block.insns;
+    let branch = &insns[index];
+    let Some(target) = in_function_target(block, branch, isa) else {
+        return false;
+    };
+    let Some((head, tail)) = innermost_loop(block, branch.offset, target, isa) else {
+        return false;
+    };
+    let body: Vec<&Insn> = insns
+        .iter()
+        .filter(|i| i.offset >= head && i.offset <= tail)
+        .collect();
+    let Some(position) = body.iter().position(|i| i.offset == branch.offset) else {
+        return false;
+    };
+    let predicated = it_predicated(isa, insns);
+    let Some(decision) = decision(isa, &body[..position], branch, &predicated) else {
+        return false;
+    };
+    let scan = ImmediateScan { block, isa, head, tail, body: &body, predicated: &predicated };
+    !decision.regs.is_empty()
+        && decision.regs.iter().all(|r| scan.is_immediate_at(r, decision.at, 0))
+}
+
+/// The tightest loop holding `offset`: the branch's own back edge, or the
+/// tightest back edge spanning it.
+fn innermost_loop(
+    block: &FunctionBlock,
+    offset: u64,
+    target: u64,
+    isa: LoopIsa,
+) -> Option<(u64, u64)> {
+    if target <= offset {
+        return Some((target, offset));
+    }
+    block
+        .insns
+        .iter()
+        .filter(|i| i.offset > offset && is_branch(isa, &i.mnemonic))
+        .filter_map(|i| {
+            in_function_target(block, i, isa)
+                .filter(|h| *h <= offset)
+                .map(|h| (h, i.offset))
+        })
+        .min_by_key(|(h, j)| j - h)
+}
+
+struct ImmediateScan<'a> {
+    block: &'a FunctionBlock,
+    isa: LoopIsa,
+    head: u64,
+    tail: u64,
+    body: &'a [&'a Insn],
+    predicated: &'a HashSet<u64>,
+}
+
+impl ImmediateScan<'_> {
+    fn writes(&self, insn: &Insn, previous: Option<&Insn>, target: &str) -> bool {
+        !matches!(effect(self.isa, insn, previous, target), Effect::Untouched)
+    }
+
+    /// Instructions in the body writing `target`, in order.
+    fn body_writes(&self, target: &str) -> Vec<&Insn> {
+        let mut out = Vec::new();
+        let mut previous = None;
+        for insn in self.body {
+            if self.writes(insn, previous, target) {
+                out.push(*insn);
+            }
+            previous = Some(*insn);
+        }
+        out
+    }
+
+    /// Does `target` hold an immediate-derived value when `at` reads it?
+    fn is_immediate_at(&self, target: &str, at: u64, depth: usize) -> bool {
+        // Deeper than any lowering of the shapes this rule exists for.
+        if depth > 4 {
+            return false;
+        }
+        let writes = self.body_writes(target);
+        let Some(last) = writes.iter().rev().find(|i| i.offset < at) else {
+            // No write yet this iteration: invariant, or a doubling counter
+            // read before its step.
+            return (writes.is_empty() || self.is_doubling_counter(target))
+                && self.loaded_with_immediate(&self.seed_register(target));
+        };
+        if self.is_doubling_counter(target) {
+            return self.loaded_with_immediate(&self.seed_register(target));
+        }
+        self.executes_every_iteration(last.offset)
+            && !self.predicated.contains(&last.offset)
+            && derived_source(self.isa, last, target)
+                .is_some_and(|source| self.is_immediate_at(&source, last.offset, depth + 1))
+    }
+
+    /// `target`'s only write in the body doubles it (directly, or through a
+    /// scratch register), on every iteration.
+    fn is_doubling_counter(&self, target: &str) -> bool {
+        let writes = self.body_writes(target);
+        let [write] = writes.as_slice() else {
+            return false;
+        };
+        if self.predicated.contains(&write.offset) || !self.executes_every_iteration(write.offset) {
+            return false;
+        }
+        if doubling_source(self.isa, write, target).as_deref() == Some(target) {
+            return true;
+        }
+        let Some((_, scratch)) =
+            copy_pairs(self.isa, write).into_iter().find(|(d, _)| d == target)
+        else {
+            return false;
+        };
+        // The doubled value reaches the copy from earlier this iteration, or
+        // around the back edge when the copy leads the body.
+        let scratch_writes = self.body_writes(&scratch);
+        let Some(doubled) = scratch_writes
+            .iter()
+            .rev()
+            .find(|i| i.offset < write.offset)
+            .or_else(|| scratch_writes.last())
+        else {
+            return false;
+        };
+        !self.predicated.contains(&doubled.offset)
+            && self.executes_every_iteration(doubled.offset)
+            && doubling_source(self.isa, doubled, &scratch).as_deref() == Some(target)
+    }
+
+    /// The register whose pre-loop value seeds doubling counter `target`: the
+    /// scratch when a leading copy overwrites `target` before anything reads it.
+    fn seed_register(&self, target: &str) -> String {
+        let writes = self.body_writes(target);
+        if let [write] = writes.as_slice()
+            && let Some((_, scratch)) =
+                copy_pairs(self.isa, write).into_iter().find(|(d, _)| d == target)
+            && !self.body_writes(&scratch).iter().any(|i| i.offset < write.offset)
+        {
+            return scratch;
+        }
+        target.to_string()
+    }
+
+    /// No branch in the body can skip `offset`.
+    fn executes_every_iteration(&self, offset: u64) -> bool {
+        !self.body.iter().any(|i| {
+            i.offset < offset
+                && is_branch(self.isa, &i.mnemonic)
+                && in_function_target(self.block, i, self.isa).is_none_or(|t| t > offset)
+        })
+    }
+
+    /// On the only path into the loop, the last write to `target` before the
+    /// head is an immediate load.
+    fn loaded_with_immediate(&self, target: &str) -> bool {
+        let insns = &self.block.insns;
+        let Some(head_at) = insns.iter().position(|i| i.offset == self.head) else {
+            return false;
+        };
+        let load = insns[..head_at].iter().enumerate().rev().find_map(|(at, insn)| {
+            if is_branch(self.isa, &insn.mnemonic) {
+                return Some(None);
+            }
+            let previous = at.checked_sub(1).map(|p| &insns[p]);
+            self.writes(insn, previous, target).then_some(Some(insn))
+        });
+        let Some(Some(load)) = load else {
+            return false;
+        };
+        // A jump landing between the load and the head bypasses it.
+        let entered_elsewhere = insns.iter().any(|i| {
+            (i.offset < self.head || i.offset > self.tail)
+                && is_branch(self.isa, &i.mnemonic)
+                && in_function_target(self.block, i, self.isa)
+                    .is_none_or(|t| t > load.offset && t <= self.head)
+        });
+        !entered_elsewhere && is_immediate_load(self.isa, load, target)
+    }
+}
+
+fn is_immediate_load(isa: LoopIsa, insn: &Insn, target: &str) -> bool {
+    let m = base_mnemonic(isa, &insn.mnemonic);
+    let ops = operands(isa, insn);
+    let is = |o: &String| reg(isa, o).as_deref() == Some(target);
+    match (isa, ops.as_slice()) {
+        (LoopIsa::Thumb, [d, k]) => matches!(m, "mov" | "movs" | "movw") && is(d) && is_imm(isa, k),
+        (LoopIsa::RiscV, [d, k]) => m == "li" && is(d) && is_imm(isa, k),
+        (LoopIsa::AArch64, [d, k]) => m == "mov" && is(d) && is_imm(isa, k),
+        (LoopIsa::X86_64, [k, d]) => matches!(m, "movl" | "movq") && is(d) && is_imm(isa, k),
+        _ => false,
+    }
+}
+
+/// The register `insn` doubles into `target`, if that is all it does.
+fn doubling_source(isa: LoopIsa, insn: &Insn, target: &str) -> Option<String> {
+    let m = base_mnemonic(isa, &insn.mnemonic);
+    let ops = operands(isa, insn);
+    let regs = |a: &String, b: &String| Some((reg(isa, a)?, reg(isa, b)?));
+    let one = |k: &String| imm_value(isa, k) == Some(1);
+    let (dest, source) = match (isa, ops.as_slice()) {
+        (LoopIsa::Thumb, [d, s, k]) if matches!(m, "lsl" | "lsls") && one(k) => regs(d, s)?,
+        (LoopIsa::Thumb, [d, k]) if matches!(m, "lsl" | "lsls") && one(k) => regs(d, d)?,
+        (LoopIsa::Thumb, [d, a, b]) if matches!(m, "add" | "adds") => {
+            let (a, b) = regs(a, b)?;
+            if a != b {
+                return None;
+            }
+            (reg(isa, d)?, a)
+        }
+        (LoopIsa::Thumb, [d, a]) if matches!(m, "add" | "adds") => {
+            let (d, a) = regs(d, a)?;
+            if d != a {
+                return None;
+            }
+            (d, a)
+        }
+        (LoopIsa::AArch64, [d, s, k]) if m == "lsl" && one(k) => regs(d, s)?,
+        (LoopIsa::RiscV, [d, s, k]) if m == "slli" && one(k) => regs(d, s)?,
+        (LoopIsa::AArch64 | LoopIsa::RiscV, [d, a, b]) if m == "add" => {
+            let (a, b) = regs(a, b)?;
+            if a != b {
+                return None;
+            }
+            (reg(isa, d)?, a)
+        }
+        (LoopIsa::X86_64, [a, d]) if x86_base(m) == "add" => {
+            let (a, d) = regs(a, d)?;
+            if a != d {
+                return None;
+            }
+            (d, a)
+        }
+        (LoopIsa::X86_64, [d]) if matches!(m, "shll" | "shlq") => regs(d, d)?,
+        (LoopIsa::X86_64, [a, d]) if matches!(m, "leal" | "leaq") => {
+            let (a, b) = a.strip_prefix("(")?.strip_suffix(")")?.split_once(',')?;
+            let (a, b) = (reg(isa, a)?, reg(isa, b)?);
+            if a != b {
+                return None;
+            }
+            (reg(isa, d)?, a)
+        }
+        _ => return None,
+    };
+    (dest == target).then_some(source)
+}
+
+/// The register a shift-amount lowering computes `target` from, with only
+/// immediates otherwise. RISC-V materializes `(n & 63) - 32` to choose a
+/// double-word shift arm; no other ISA branches on it.
+fn derived_source(isa: LoopIsa, insn: &Insn, target: &str) -> Option<String> {
+    if isa != LoopIsa::RiscV {
+        return None;
+    }
+    let m = base_mnemonic(isa, &insn.mnemonic);
+    match operands(isa, insn).as_slice() {
+        [d, s, k]
+            if matches!(m, "andi" | "addi")
+                && reg(isa, d).as_deref() == Some(target)
+                && is_imm(isa, k) =>
+        {
+            reg(isa, s)
+        }
+        _ => None,
+    }
 }
 
 /// Registers holding a counter value where the decision reads them, and at
@@ -1202,6 +1485,197 @@ mod counted_loop_tests {
             .filter(|(_, i)| is_conditional_branch(isa, &i.mnemonic))
             .map(|(index, i)| (i.offset, is_counted_loop_branch(block, index, isa)))
             .collect()
+    }
+
+    // Doubling counters: `subtle`'s primitive `ct_gt` ladder and Newton precision.
+
+    #[test]
+    fn doubling_ladder_from_immediate_is_accepted() {
+        let thumb = "<ct_fix__x>:\n\
+            \x20 54:\tmovs\tr5, #0x1\n\
+            \x20 58:\tand\tr2, r5, #0x3f\n\
+            \x20 5c:\tlsls\tr5, r5, #0x1\n\
+            \x20 66:\tlsr.w\tr8, r9, r2\n\
+            \x20 80:\torr.w\tr9, r9, r8\n\
+            \x20 86:\tcmp\tr5, #0x40\n\
+            \x20 88:\tblt\t0x58 <ct_fix__x+0x58> @ imm = #-0x34\n";
+        assert_eq!(branches(thumb, LoopIsa::Thumb), [(0x88, true)]);
+        let aarch64 = "<ct_fix__x>:\n\
+            \x20 20:\tmov\tw8, #0x1                // =1\n\
+            \x20 30:\tlsr\tx10, x9, x8\n\
+            \x20 34:\tlsl\tw8, w8, #1\n\
+            \x20 38:\tcmp\tw8, #0x40\n\
+            \x20 3c:\torr\tx9, x10, x9\n\
+            \x20 40:\tb.lt\t0x30 <ct_fix__x+0x30>\n";
+        assert_eq!(branches(aarch64, LoopIsa::AArch64), [(0x40, true)]);
+        let x86 = "<ct_fix__x>:\n\
+            \x20 2d:\tmovl\t$0x1, %ecx\n\
+            \x20 32:\tmovq\t%rax, %rdx\n\
+            \x20 35:\tshrq\t%cl, %rax\n\
+            \x20 38:\torq\t%rdx, %rax\n\
+            \x20 3b:\taddl\t%ecx, %ecx\n\
+            \x20 3d:\tcmpl\t$0x40, %ecx\n\
+            \x20 40:\tjl\t0x32 <ct_fix__x+0x32>\n";
+        assert_eq!(branches(x86, LoopIsa::X86_64), [(0x40, true)]);
+    }
+
+    #[test]
+    fn riscv_double_word_shift_arm_on_counter_is_accepted() {
+        let listing = "<ct_fix__x>:\n\
+            \x20 98:\tli\ta0, 0x1\n\
+            \x20 9c:\tli\ta3, 0x40\n\
+            \x20 a0:\tandi\ta5, a0, 0x3f\n\
+            \x20 a4:\taddi\ta4, a5, -0x20\n\
+            \x20 a8:\tbltz\ta4, 0xb2 <ct_fix__x+0xb2>\n\
+            \x20 ac:\tsrl\ta5, s1, a5\n\
+            \x20 b0:\tj\t0xc4 <ct_fix__x+0xc4>\n\
+            \x20 b2:\tsrl\ts0, a1, a0\n\
+            \x20 c2:\tor\ta5, a5, s0\n\
+            \x20 ca:\tor\ta1, a1, a5\n\
+            \x20 ce:\tslli\ta0, a0, 0x1\n\
+            \x20 d2:\tblt\ta0, a3, 0xa0 <ct_fix__x+0xa0>\n";
+        assert_eq!(
+            branches(listing, LoopIsa::RiscV),
+            [(0xa8, true), (0xd2, true)]
+        );
+    }
+
+    #[test]
+    fn doubling_through_scratch_register_is_accepted() {
+        let listing = "<ct_fix__x>:\n\
+            \x20 18:\tmovs\tr2, #0x1\n\
+            \x20 1a:\tumull\tr3, r0, r1, r8\n\
+            \x20 36:\tcmp\tr2, #0x20\n\
+            \x20 38:\tmla\tr4, r0, r1, r3\n\
+            \x20 3c:\tlsl.w\tr0, r2, #0x1\n\
+            \x20 40:\tmov\tr1, r5\n\
+            \x20 42:\tmov\tr2, r0\n\
+            \x20 44:\tblo\t0x1a <ct_fix__x+0x1a> @ imm = #-0x2e\n";
+        assert_eq!(branches(listing, LoopIsa::Thumb), [(0x44, true)]);
+    }
+
+    #[test]
+    fn newton_precision_lowerings_are_accepted() {
+        let x86 = "<ct_fix__x>:\n\
+            \x20 15:\tmovl\t$0x1, %eax\n\
+            \x20 1a:\tmovq\t%r12, %rcx\n\
+            \x20 20:\timulq\t%r14, %rdx\n\
+            \x20 31:\tleaq\t(%rax,%rax), %rcx\n\
+            \x20 35:\tcmpq\t$0x20, %rax\n\
+            \x20 39:\tmovq\t%rcx, %rax\n\
+            \x20 3c:\tjb\t0x1a <ct_fix__x+0x1a>\n";
+        assert_eq!(branches(x86, LoopIsa::X86_64), [(0x3c, true)]);
+        // The copy leads the body and the scratch is data until the last write.
+        let riscv = "<ct_fix__x>:\n\
+            \x20 1e:\tli\ta7, 0x20\n\
+            \x20 22:\tli\ta4, 0x1\n\
+            \x20 24:\tmv\ta5, a4\n\
+            \x20 26:\tmulhu\ta4, a0, s0\n\
+            \x20 34:\tmul\ta4, a0, s0\n\
+            \x20 3e:\tsub\ta4, a6, a4\n\
+            \x20 60:\tslli\ta4, a5, 0x1\n\
+            \x20 64:\tbltu\ta5, a7, 0x24 <ct_fix__x+0x24>\n";
+        assert_eq!(branches(riscv, LoopIsa::RiscV), [(0x64, true)]);
+    }
+
+    #[test]
+    fn rotated_copy_needs_doubling_and_immediate_seed() {
+        // The scratch is seeded from memory.
+        let loaded = "<ct_fix__x>:\n\
+            \x20 1e:\tli\ta7, 0x20\n\
+            \x20 22:\tlw\ta4, 0x0(a0)\n\
+            \x20 24:\tmv\ta5, a4\n\
+            \x20 60:\tslli\ta4, a5, 0x1\n\
+            \x20 64:\tbltu\ta5, a7, 0x24 <ct_fix__x+0x24>\n";
+        assert_eq!(branches(loaded, LoopIsa::RiscV), [(0x64, false)]);
+        // The scratch's last write is data, so the counter is loaded each pass.
+        let data = "<ct_fix__x>:\n\
+            \x20 1e:\tli\ta7, 0x20\n\
+            \x20 22:\tli\ta4, 0x1\n\
+            \x20 24:\tmv\ta5, a4\n\
+            \x20 60:\tslli\ta4, a5, 0x1\n\
+            \x20 62:\tlw\ta4, 0x0(a0)\n\
+            \x20 64:\tbltu\ta5, a7, 0x24 <ct_fix__x+0x24>\n";
+        assert_eq!(branches(data, LoopIsa::RiscV), [(0x64, false)]);
+        let lea_mixed = "<ct_fix__x>:\n\
+            \x20 15:\tmovl\t$0x1, %eax\n\
+            \x20 1a:\tmovq\t(%rdi), %rdx\n\
+            \x20 31:\tleaq\t(%rax,%rdx), %rcx\n\
+            \x20 35:\tcmpq\t$0x20, %rax\n\
+            \x20 39:\tmovq\t%rcx, %rax\n\
+            \x20 3c:\tjb\t0x1a <ct_fix__x+0x1a>\n";
+        assert_eq!(branches(lea_mixed, LoopIsa::X86_64), [(0x3c, false)]);
+    }
+
+    #[test]
+    fn secret_normalization_loops_are_rejected() {
+        // `while d < n { d <<= 1 }` with `d` loaded: the classic division and
+        // gcd normalization leak.
+        let loaded_counter = "<ct_fix__x>:\n\
+            \x20 10:\tldr\tr5, [r0]\n\
+            \x20 14:\tlsls\tr5, r5, #0x1\n\
+            \x20 16:\tcmp\tr5, #0x40\n\
+            \x20 18:\tblt\t0x14 <ct_fix__x+0x14>\n";
+        assert_eq!(branches(loaded_counter, LoopIsa::Thumb), [(0x18, false)]);
+        let loaded_bound = "<ct_fix__x>:\n\
+            \x20 10:\tmovs\tr5, #0x1\n\
+            \x20 12:\tldr\tr3, [r0]\n\
+            \x20 14:\tlsls\tr5, r5, #0x1\n\
+            \x20 16:\tcmp\tr5, r3\n\
+            \x20 18:\tblt\t0x14 <ct_fix__x+0x14>\n";
+        assert_eq!(branches(loaded_bound, LoopIsa::Thumb), [(0x18, false)]);
+        let aarch64 = "<ct_fix__x>:\n\
+            \x20 10:\tldr\tw8, [x0]\n\
+            \x20 14:\tlsl\tw8, w8, #1\n\
+            \x20 18:\tcmp\tw8, #0x40\n\
+            \x20 1c:\tb.lt\t0x14 <ct_fix__x+0x14>\n";
+        assert_eq!(branches(aarch64, LoopIsa::AArch64), [(0x1c, false)]);
+    }
+
+    #[test]
+    fn doubling_counter_tampering_is_rejected() {
+        // A second write mixes data into the counter.
+        let mixed = "<ct_fix__x>:\n\
+            \x20 10:\tmovs\tr5, #0x1\n\
+            \x20 12:\tldr\tr3, [r0]\n\
+            \x20 14:\tlsls\tr5, r5, #0x1\n\
+            \x20 16:\torrs\tr5, r3\n\
+            \x20 18:\tcmp\tr5, #0x40\n\
+            \x20 1a:\tblt\t0x14 <ct_fix__x+0x14>\n";
+        assert_eq!(branches(mixed, LoopIsa::Thumb), [(0x1a, false)]);
+        // The step sits behind a data branch, so the count depends on data.
+        let skipped = "<ct_fix__x>:\n\
+            \x20 10:\tmovs\tr5, #0x1\n\
+            \x20 12:\tldr\tr3, [r0]\n\
+            \x20 14:\tcmp\tr3, #0x0\n\
+            \x20 16:\tbeq\t0x1a <ct_fix__x+0x1a>\n\
+            \x20 18:\tlsls\tr5, r5, #0x1\n\
+            \x20 1a:\tcmp\tr5, #0x40\n\
+            \x20 1c:\tblt\t0x14 <ct_fix__x+0x14>\n";
+        assert_eq!(
+            branches(skipped, LoopIsa::Thumb),
+            [(0x16, false), (0x1c, false)]
+        );
+        // A jump past the immediate load enters with an unknown value.
+        let bypassed = "<ct_fix__x>:\n\
+            \x20 0c:\tldr\tr5, [r0]\n\
+            \x20 0e:\tb\t0x12 <ct_fix__x+0x12>\n\
+            \x20 10:\tmovs\tr5, #0x1\n\
+            \x20 12:\tlsls\tr5, r5, #0x1\n\
+            \x20 14:\tcmp\tr5, #0x40\n\
+            \x20 16:\tblt\t0x12 <ct_fix__x+0x12>\n";
+        assert_eq!(branches(bypassed, LoopIsa::Thumb), [(0x16, false)]);
+        // A RISC-V diamond on a loaded word is a value branch.
+        let riscv = "<ct_fix__x>:\n\
+            \x20 98:\tli\ta0, 0x1\n\
+            \x20 9a:\tlw\ta5, 0x0(a2)\n\
+            \x20 a4:\taddi\ta4, a5, -0x20\n\
+            \x20 a8:\tbltz\ta4, 0xb2 <ct_fix__x+0xb2>\n\
+            \x20 ac:\tsrl\ta5, s1, a5\n\
+            \x20 b2:\tslli\ta0, a0, 0x1\n\
+            \x20 b4:\tli\ta3, 0x40\n\
+            \x20 b8:\tblt\ta0, a3, 0x9a <ct_fix__x+0x9a>\n";
+        assert_eq!(branches(riscv, LoopIsa::RiscV)[0], (0xa8, false));
     }
 
     #[test]
