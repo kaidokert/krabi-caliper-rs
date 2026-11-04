@@ -251,10 +251,12 @@ impl ImmediateScan<'_> {
         let writes = self.body_writes(target);
         let Some(last) = writes.iter().rev().find(|i| i.offset < at) else {
             // No write yet this iteration: invariant, or a doubling counter
-            // read before its step. Either way the first read sees `target`'s
-            // own pre-loop value, even if a later copy reseeds it from a scratch.
+            // read before its step. The first read sees `target`'s own pre-loop
+            // value and later reads what a leading copy took from its scratch,
+            // so both seeds have to be immediates.
             return (writes.is_empty() || self.is_doubling_counter(target))
-                && self.loaded_with_immediate(target);
+                && self.loaded_with_immediate(target)
+                && self.loaded_with_immediate(&self.seed_register(target));
         };
         if self.is_doubling_counter(target) {
             return self.loaded_with_immediate(&self.seed_register(target));
@@ -1761,6 +1763,16 @@ mod counted_loop_tests {
             \x20 08:\tlsl.w\tr4, r5, #0x1\n\
             \x20 0c:\tblo\t0x04 <ct_fix__x+0x4>\n";
         assert_eq!(branches(read_before_copy, LoopIsa::Thumb), [(0xc, false)]);
+        // The first read sees the immediate, but the copy then reseeds the
+        // target from a loaded scratch, so later decisions are on loaded data.
+        let reseeded_from_data = "<ct_fix__x>:\n\
+            \x20 00:\tmovs\tr5, #0x1\n\
+            \x20 02:\tldr\tr4, [r0]\n\
+            \x20 04:\tcmp\tr5, #0x20\n\
+            \x20 06:\tmov\tr5, r4\n\
+            \x20 08:\tlsl.w\tr4, r5, #0x1\n\
+            \x20 0c:\tblo\t0x04 <ct_fix__x+0x4>\n";
+        assert_eq!(branches(reseeded_from_data, LoopIsa::Thumb), [(0xc, false)]);
         // A seed inside an IT window may not run.
         let predicated_seed = "<ct_fix__x>:\n\
             \x20 00:\tldr\tr5, [r0]\n\
