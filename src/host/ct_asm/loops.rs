@@ -188,6 +188,7 @@ fn immediate_doubling_branch(block: &FunctionBlock, index: usize, isa: LoopIsa) 
     };
     let scan = ImmediateScan { block, isa, head, tail, body: &body, predicated: &predicated };
     !decision.regs.is_empty()
+        && !scan.lands_between(decision.at, branch.offset)
         && decision.regs.iter().all(|r| scan.is_immediate_at(r, decision.at, 0))
 }
 
@@ -250,14 +251,15 @@ impl ImmediateScan<'_> {
         let writes = self.body_writes(target);
         let Some(last) = writes.iter().rev().find(|i| i.offset < at) else {
             // No write yet this iteration: invariant, or a doubling counter
-            // read before its step.
+            // read before its step. Either way the first read sees `target`'s
+            // own pre-loop value, even if a later copy reseeds it from a scratch.
             return (writes.is_empty() || self.is_doubling_counter(target))
-                && self.loaded_with_immediate(&self.seed_register(target));
+                && self.loaded_with_immediate(target);
         };
         if self.is_doubling_counter(target) {
             return self.loaded_with_immediate(&self.seed_register(target));
         }
-        self.executes_every_iteration(last.offset)
+        self.runs_once_per_iteration(last.offset)
             && !self.predicated.contains(&last.offset)
             && derived_source(self.isa, last, target)
                 .is_some_and(|source| self.is_immediate_at(&source, last.offset, depth + 1))
@@ -270,7 +272,7 @@ impl ImmediateScan<'_> {
         let [write] = writes.as_slice() else {
             return false;
         };
-        if self.predicated.contains(&write.offset) || !self.executes_every_iteration(write.offset) {
+        if self.predicated.contains(&write.offset) || !self.runs_once_per_iteration(write.offset) {
             return false;
         }
         if doubling_source(self.isa, write, target).as_deref() == Some(target) {
@@ -293,7 +295,7 @@ impl ImmediateScan<'_> {
             return false;
         };
         !self.predicated.contains(&doubled.offset)
-            && self.executes_every_iteration(doubled.offset)
+            && self.runs_once_per_iteration(doubled.offset)
             && doubling_source(self.isa, doubled, &scratch).as_deref() == Some(target)
     }
 
@@ -311,12 +313,29 @@ impl ImmediateScan<'_> {
         target.to_string()
     }
 
-    /// No branch in the body can skip `offset`.
-    fn executes_every_iteration(&self, offset: u64) -> bool {
+    /// No branch in the body can skip `offset`, or rerun it without taking the
+    /// latch. A rerun lets data choose how far a doubling counter has advanced
+    /// when the latch reads it.
+    fn runs_once_per_iteration(&self, offset: u64) -> bool {
         !self.body.iter().any(|i| {
-            i.offset < offset
-                && is_branch(self.isa, &i.mnemonic)
-                && in_function_target(self.block, i, self.isa).is_none_or(|t| t > offset)
+            if !is_branch(self.isa, &i.mnemonic) {
+                return false;
+            }
+            let target = in_function_target(self.block, i, self.isa);
+            if i.offset < offset {
+                target.is_none_or(|t| t > offset)
+            } else {
+                i.offset != self.tail && target.is_some_and(|t| t >= self.head && t <= offset)
+            }
+        })
+    }
+
+    /// Can a branch in the body land after the flag-setting compare at `from`
+    /// and reach `to` without running it? `to` would then read stale flags.
+    fn lands_between(&self, from: u64, to: u64) -> bool {
+        self.body.iter().any(|i| {
+            is_branch(self.isa, &i.mnemonic)
+                && in_function_target(self.block, i, self.isa).is_none_or(|t| t > from && t <= to)
         })
     }
 
@@ -337,12 +356,13 @@ impl ImmediateScan<'_> {
         let Some(Some(load)) = load else {
             return false;
         };
-        // A jump landing between the load and the head bypasses it.
+        // A jump from outside the loop landing after the load, anywhere up to
+        // the latch, enters without it.
         let entered_elsewhere = insns.iter().any(|i| {
             (i.offset < self.head || i.offset > self.tail)
                 && is_branch(self.isa, &i.mnemonic)
                 && in_function_target(self.block, i, self.isa)
-                    .is_none_or(|t| t > load.offset && t <= self.head)
+                    .is_none_or(|t| t > load.offset && t <= self.tail)
         });
         !entered_elsewhere && is_immediate_load(self.isa, load, target)
     }
@@ -386,6 +406,14 @@ fn doubling_source(isa: LoopIsa, insn: &Insn, target: &str) -> Option<String> {
         }
         (LoopIsa::AArch64, [d, s, k]) if m == "lsl" && one(k) => regs(d, s)?,
         (LoopIsa::RiscV, [d, s, k]) if m == "slli" && one(k) => regs(d, s)?,
+        (LoopIsa::RiscV, [d, k]) if m == "slli" && one(k) => regs(d, d)?,
+        (LoopIsa::RiscV, [d, a]) if m == "add" => {
+            let (d, a) = regs(d, a)?;
+            if d != a {
+                return None;
+            }
+            (d, a)
+        }
         (LoopIsa::AArch64 | LoopIsa::RiscV, [d, a, b]) if m == "add" => {
             let (a, b) = regs(a, b)?;
             if a != b {
@@ -1517,6 +1545,16 @@ mod counted_loop_tests {
             \x20 3d:\tcmpl\t$0x40, %ecx\n\
             \x20 40:\tjl\t0x32 <ct_fix__x+0x32>\n";
         assert_eq!(branches(x86, LoopIsa::X86_64), [(0x40, true)]);
+        for step in ["c.slli\ta0, 0x1", "c.add\ta0, a0"] {
+            let compressed = std::format!(
+                "<ct_fix__x>:\n\
+                \x20 00:\tli\ta0, 0x1\n\
+                \x20 02:\tli\ta3, 0x40\n\
+                \x20 04:\t{step}\n\
+                \x20 06:\tblt\ta0, a3, 0x4 <ct_fix__x+0x4>\n"
+            );
+            assert_eq!(branches(&compressed, LoopIsa::RiscV), [(0x6, true)]);
+        }
     }
 
     #[test]
@@ -1665,6 +1703,74 @@ mod counted_loop_tests {
             \x20 14:\tcmp\tr5, #0x40\n\
             \x20 16:\tblt\t0x12 <ct_fix__x+0x12>\n";
         assert_eq!(branches(bypassed, LoopIsa::Thumb), [(0x16, false)]);
+        // A jump into the body enters with an unknown value.
+        let mid_entry = "<ct_fix__x>:\n\
+            \x20 00:\tldr\tr5, [r0]\n\
+            \x20 02:\tb\t0x0a <ct_fix__x+0xa>\n\
+            \x20 04:\tmovs\tr5, #0x1\n\
+            \x20 06:\tlsls\tr5, r5, #0x1\n\
+            \x20 0a:\tcmp\tr5, #0x40\n\
+            \x20 0c:\tblt\t0x06 <ct_fix__x+0x6>\n";
+        assert_eq!(branches(mid_entry, LoopIsa::Thumb), [(0xc, false)]);
+        // A body branch leaves backward and rejoins past the step.
+        let rejoined = "<ct_fix__x>:\n\
+            \x20 00:\tb\t0x06 <ct_fix__x+0x6>\n\
+            \x20 02:\tldr\tr5, [r0]\n\
+            \x20 04:\tb\t0x10 <ct_fix__x+0x10>\n\
+            \x20 06:\tmovs\tr5, #0x1\n\
+            \x20 08:\tldr\tr3, [r1]\n\
+            \x20 0a:\tcmp\tr3, #0x0\n\
+            \x20 0c:\tbeq\t0x02 <ct_fix__x+0x2>\n\
+            \x20 0e:\tlsl.w\tr5, r5, #0x1\n\
+            \x20 10:\tcmp\tr5, #0x40\n\
+            \x20 12:\tblt\t0x08 <ct_fix__x+0x8>\n";
+        assert_eq!(
+            branches(rejoined, LoopIsa::Thumb),
+            [(0xc, false), (0x12, false)]
+        );
+        // A data branch reruns the step, so data sets the count at the latch.
+        let rerun = "<ct_fix__x>:\n\
+            \x20 00:\tmovs\tr5, #0x1\n\
+            \x20 02:\tlsl.w\tr5, r5, #0x1\n\
+            \x20 06:\tldr\tr3, [r0]\n\
+            \x20 08:\tcmp\tr3, #0x0\n\
+            \x20 0a:\tbeq\t0x02 <ct_fix__x+0x2>\n\
+            \x20 0c:\tcmp\tr5, #0x40\n\
+            \x20 0e:\tblt\t0x02 <ct_fix__x+0x2>\n";
+        assert_eq!(
+            branches(rerun, LoopIsa::Thumb),
+            [(0xa, false), (0xe, false)]
+        );
+        // A jump over the compare leaves the latch reading the loaded word's flags.
+        let stale_flags = "<ct_fix__x>:\n\
+            \x20 00:\tmovs\tr5, #0x1\n\
+            \x20 02:\tldr\tr3, [r0]\n\
+            \x20 04:\tcmp\tr3, #0x0\n\
+            \x20 06:\tlsl.w\tr5, r5, #0x1\n\
+            \x20 0a:\tb\t0x0e <ct_fix__x+0xe>\n\
+            \x20 0c:\tcmp\tr5, #0x40\n\
+            \x20 0e:\tblt\t0x04 <ct_fix__x+0x4>\n";
+        assert_eq!(branches(stale_flags, LoopIsa::Thumb), [(0xe, false)]);
+        // The compare reads the target before the copy reseeds it from the
+        // immediate-loaded scratch, so the first decision is on loaded data.
+        let read_before_copy = "<ct_fix__x>:\n\
+            \x20 00:\tldr\tr5, [r0]\n\
+            \x20 02:\tmovs\tr4, #0x1\n\
+            \x20 04:\tcmp\tr5, #0x20\n\
+            \x20 06:\tmov\tr5, r4\n\
+            \x20 08:\tlsl.w\tr4, r5, #0x1\n\
+            \x20 0c:\tblo\t0x04 <ct_fix__x+0x4>\n";
+        assert_eq!(branches(read_before_copy, LoopIsa::Thumb), [(0xc, false)]);
+        // A seed inside an IT window may not run.
+        let predicated_seed = "<ct_fix__x>:\n\
+            \x20 00:\tldr\tr5, [r0]\n\
+            \x20 02:\tcmp\tr1, #0x0\n\
+            \x20 04:\tit\tne\n\
+            \x20 06:\tmovne\tr5, #0x1\n\
+            \x20 08:\tlsl.w\tr5, r5, #0x1\n\
+            \x20 0c:\tcmp\tr5, #0x40\n\
+            \x20 0e:\tblt\t0x08 <ct_fix__x+0x8>\n";
+        assert_eq!(branches(predicated_seed, LoopIsa::Thumb), [(0xe, false)]);
         // A RISC-V diamond on a loaded word is a value branch.
         let riscv = "<ct_fix__x>:\n\
             \x20 98:\tli\ta0, 0x1\n\
