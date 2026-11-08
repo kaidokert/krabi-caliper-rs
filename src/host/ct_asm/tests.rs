@@ -61,6 +61,7 @@ mod tests {
             ladder_symbols_expected: 0,
             ladder_branches_seen: 0,
             ladder_branches_allowed: 0,
+            counted_loop_branches: 0,
             positive_fixtures_checked: 0,
             negative_controls_checked: 1,
             negative_controls_tripped: 1,

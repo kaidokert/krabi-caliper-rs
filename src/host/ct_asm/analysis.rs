@@ -339,6 +339,9 @@ pub struct LadderReport {
     pub ladder_symbols_expected: usize,
     pub ladder_branches_seen: usize,
     pub ladder_branches_allowed: usize,
+    /// Ladder branches accepted as counted-loop latches/exits; not included
+    /// in `ladder_branches_seen`.
+    pub counted_loop_branches: usize,
     pub positive_fixtures_checked: usize,
     pub negative_controls_checked: usize,
     pub negative_controls_tripped: usize,
@@ -437,6 +440,12 @@ impl LadderReport {
             "  branches seen:       {} (allowed per symbol: {})",
             self.ladder_branches_seen, self.ladder_branches_allowed
         );
+        if self.counted_loop_branches > 0 {
+            println!(
+                "  counted-loop branches accepted: {}",
+                self.counted_loop_branches
+            );
+        }
         println!(
             "  negative controls:   {} of {} tripped",
             self.negative_controls_tripped, self.negative_controls_checked
