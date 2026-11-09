@@ -456,12 +456,17 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
         }
         if ladder.is_match(&block.symbol) {
             matched += 1;
-            let (mut found, accepted) = scan(block);
+            let all = scan_block(block, &patterns, spec.thumb_it_blocks());
+            let (found, accepted) = split_counted(block, all, loops);
             seen += found.len();
-            counted_loop_branches += accepted;
-            if found.len() > spec.ladder_allowed_branches() {
-                violations.extend(found.split_off(spec.ladder_allowed_branches()));
-            }
+            counted_loop_branches += accepted.len();
+            violations.extend(ladder_violations(
+                block,
+                found,
+                &accepted,
+                spec.ladder_allowed_branches(),
+                loops,
+            ));
             continue;
         }
         if is_negative_control(&block.symbol) {
@@ -493,6 +498,40 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Branches in one ladder symbol that the allowance does not cover.
+///
+/// Without a counted-loop model the allowance is a plain count. With one, it
+/// is reserved for the control of the outermost loop, the ladder's loop over
+/// the exponent bits: its back edge, its zero-iteration guard, and its exits.
+/// An exit only qualifies while nothing in that loop was accepted as counted;
+/// once the loop's control is accepted, any further exit is an extra branch.
+/// Every other branch must have been accepted as counted.
+fn ladder_violations(
+    block: &FunctionBlock,
+    mut found: Vec<Violation>,
+    accepted: &[u64],
+    allowance: usize,
+    loops: Option<LoopIsa>,
+) -> Vec<Violation> {
+    let Some((isa, span)) = loops.and_then(|isa| Some((isa, outermost_loop(block, isa)?))) else {
+        return if found.len() > allowance { found.split_off(allowance) } else { Vec::new() };
+    };
+    let role = |offset| loop_role(block, offset, span, isa);
+    let loop_counted =
+        accepted.iter().any(|offset| matches!(role(*offset), LoopRole::BackEdge | LoopRole::Exit));
+    let (mut control, mut violations): (Vec<_>, Vec<_>) =
+        found.into_iter().partition(|v| match role(v.offset) {
+            LoopRole::BackEdge | LoopRole::Guard => true,
+            LoopRole::Exit => !loop_counted,
+            LoopRole::Body | LoopRole::Outside => false,
+        });
+    if control.len() > allowance {
+        violations.extend(control.split_off(allowance));
+    }
+    violations.sort_by_key(|v| v.offset);
+    violations
 }
 
 /// Run an exact, multi-symbol conditional-branch calibration.

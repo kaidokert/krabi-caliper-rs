@@ -167,19 +167,25 @@ pub fn scan_block_counted(
     loops: Option<LoopIsa>,
 ) -> (Vec<Violation>, usize) {
     let found = scan_block(block, patterns, thumb_it_blocks);
+    let (kept, accepted) = split_counted(block, found, loops);
+    (kept, accepted.len())
+}
+
+/// Split `found` into the branches still reported and the offsets of those
+/// accepted as counted-loop branches.
+fn split_counted(
+    block: &FunctionBlock,
+    found: Vec<Violation>,
+    loops: Option<LoopIsa>,
+) -> (Vec<Violation>, Vec<u64>) {
     let Some(isa) = loops else {
-        return (found, 0);
+        return (found, Vec::new());
     };
-    let before = found.len();
-    let kept: Vec<Violation> = found
-        .into_iter()
-        .filter(|v| {
-            let index = block.insns.iter().position(|i| i.offset == v.offset);
-            !index.is_some_and(|index| is_counted_loop_branch(block, index, isa))
-        })
-        .collect();
-    let accepted = before - kept.len();
-    (kept, accepted)
+    let (accepted, kept): (Vec<Violation>, Vec<Violation>) = found.into_iter().partition(|v| {
+        let index = block.insns.iter().position(|i| i.offset == v.offset);
+        index.is_some_and(|index| is_counted_loop_branch(block, index, isa))
+    });
+    (kept, accepted.into_iter().map(|v| v.offset).collect())
 }
 
 pub fn compute_reachable_symbols(blocks: &[FunctionBlock], calls: &[Regex]) -> HashSet<String> {

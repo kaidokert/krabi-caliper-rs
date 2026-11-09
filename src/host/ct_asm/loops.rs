@@ -99,6 +99,62 @@ pub fn is_counted_loop_branch(block: &FunctionBlock, index: usize, isa: LoopIsa)
     constant_step_branch(block, index, isa) || immediate_doubling_branch(block, index, isa)
 }
 
+/// The widest loop in `block`, as the `(head, tail)` offsets of the backward
+/// branch that spans the most code. In a ladder this is the loop over the
+/// exponent bits.
+pub fn outermost_loop(block: &FunctionBlock, isa: LoopIsa) -> Option<(u64, u64)> {
+    block
+        .insns
+        .iter()
+        .filter(|i| is_branch(isa, &i.mnemonic))
+        .filter_map(|i| {
+            in_function_target(block, i, isa)
+                .filter(|head| *head <= i.offset)
+                .map(|head| (head, i.offset))
+        })
+        .max_by_key(|(head, tail)| tail - head)
+}
+
+/// Where a branch sits relative to a loop `(head, tail)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopRole {
+    /// The loop's back edge, at `tail`.
+    BackEdge,
+    /// Before the loop, jumping to the instruction right after `tail`: the
+    /// check that skips a loop with zero iterations.
+    Guard,
+    /// Inside the loop, jumping out of it.
+    Exit,
+    /// Inside the loop, staying inside it.
+    Body,
+    /// Anywhere else.
+    Outside,
+}
+
+/// The role of the branch at `offset` in the loop `(head, tail)`.
+pub fn loop_role(block: &FunctionBlock, offset: u64, (head, tail): (u64, u64), isa: LoopIsa) -> LoopRole {
+    let Some(insn) = block.insns.iter().find(|i| i.offset == offset) else {
+        return LoopRole::Outside;
+    };
+    let target = in_function_target(block, insn, isa);
+    if offset == tail {
+        LoopRole::BackEdge
+    } else if offset < head {
+        let after_tail = block.insns.iter().map(|i| i.offset).find(|o| *o > tail);
+        if target.is_some() && target == after_tail {
+            LoopRole::Guard
+        } else {
+            LoopRole::Outside
+        }
+    } else if offset > tail {
+        LoopRole::Outside
+    } else if target.is_none_or(|t| t < head || t > tail) {
+        LoopRole::Exit
+    } else {
+        LoopRole::Body
+    }
+}
+
 fn constant_step_branch(block: &FunctionBlock, index: usize, isa: LoopIsa) -> bool {
     let insns = &block.insns;
     let branch = &insns[index];

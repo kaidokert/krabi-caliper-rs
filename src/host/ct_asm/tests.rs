@@ -1,6 +1,73 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ladder violations for a RISC-V listing under counted-loop acceptance.
+    fn riscv_ladder(listing: &str, allowance: usize) -> Vec<u64> {
+        let blocks = split_blocks(listing);
+        let block = &blocks[0];
+        let patterns =
+            Patterns::new(crate::host::isa::RISCV_FORBIDDEN, &[], &[], &[], &[]).unwrap();
+        let loops = Some(LoopIsa::RiscV);
+        let (found, accepted) = split_counted(block, scan_block(block, &patterns, false), loops);
+        ladder_violations(block, found, &accepted, allowance, loops)
+            .iter()
+            .map(|v| v.offset)
+            .collect()
+    }
+
+    /// A counted ladder loop: `a0` counts down by one to zero.
+    fn counted_ladder(body: &str) -> std::string::String {
+        std::format!(
+            "<ct_fix__x>:\n\
+            \x20 00:\tli\ta0, 0x40\n\
+            \x20 04:\tlw\ta2, 0x0(a1)\n\
+            {body}\
+            \x20 20:\taddi\ta0, a0, -0x1\n\
+            \x20 24:\tbnez\ta0, 0x4 <ct_fix__x+0x4>\n\
+            \x20 28:\tret\n"
+        )
+    }
+
+    #[test]
+    fn counted_ladder_loop_alone_passes() {
+        // Passing with no allowance shows the model accepts the back edge.
+        assert_eq!(riscv_ladder(&counted_ladder(""), 0), [0u64; 0]);
+    }
+
+    #[test]
+    fn counted_ladder_does_not_free_the_allowance_for_a_body_branch() {
+        let listing = counted_ladder(
+            "\x20 08:\tbeqz\ta2, 0x10 <ct_fix__x+0x10>\n\
+            \x20 0c:\txor\ta3, a3, a2\n",
+        );
+        assert_eq!(riscv_ladder(&listing, 1), [0x8]);
+    }
+
+    #[test]
+    fn counted_ladder_does_not_free_the_allowance_for_an_early_exit() {
+        let listing = counted_ladder("\x20 08:\tbnez\ta2, 0x28 <ct_fix__x+0x28>\n");
+        assert_eq!(riscv_ladder(&listing, 1), [0x8]);
+    }
+
+    #[test]
+    fn allowance_covers_an_uncounted_back_edge_and_zero_trip_guard() {
+        // The back edge tests a loaded bound, so the model does not accept it.
+        let listing = "<ct_fix__x>:\n\
+            \x20 00:\tlw\ta0, 0x0(a1)\n\
+            \x20 04:\tbeqz\ta0, 0x14 <ct_fix__x+0x14>\n\
+            \x20 08:\tlw\ta2, 0x4(a1)\n\
+            \x20 0c:\tsrl\ta0, a0, a2\n\
+            \x20 10:\tbnez\ta0, 0x8 <ct_fix__x+0x8>\n\
+            \x20 14:\tret\n";
+        assert_eq!(riscv_ladder(listing, 2), [0u64; 0]);
+        assert_eq!(riscv_ladder(listing, 1), [0x10]);
+        let with_body = listing.replace(
+            "\x20 0c:\tsrl\ta0, a0, a2\n",
+            "\x20 0c:\tbeqz\ta2, 0x10 <ct_fix__x+0x10>\n\x20 0e:\tsrl\ta0, a0, a2\n",
+        );
+        assert_eq!(riscv_ladder(&with_body, 2), [0xc]);
+    }
     #[test]
     fn thumb_it_does_not_mask_a_conditional_branch() {
         let blocks = split_blocks("<ct_fix__x>:\n  0: it eq\n  2: beq 0x8\n");
