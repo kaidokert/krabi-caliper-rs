@@ -50,6 +50,76 @@ mod tests {
         assert_eq!(riscv_ladder(&listing, 1), [0x8]);
     }
 
+    /// A counted ladder loop on `a0`, preceded by `guard`, which jumps past it.
+    fn guarded_counted_ladder(guard: &str) -> std::string::String {
+        std::format!(
+            "<ct_fix__x>:\n\
+            \x20 00:\tli\ta0, 0x40\n\
+            \x20 04:\tlw\ta2, 0x0(a1)\n\
+            \x20 08:\t{guard}, 0x1c <ct_fix__x+0x1c>\n\
+            \x20 0c:\tlw\ta3, 0x4(a1)\n\
+            \x20 10:\txor\ta4, a4, a3\n\
+            \x20 14:\taddi\ta0, a0, -0x1\n\
+            \x20 18:\tbnez\ta0, 0xc <ct_fix__x+0xc>\n\
+            \x20 1c:\tret\n"
+        )
+    }
+
+    #[test]
+    fn guard_on_the_counted_loop_counter_passes() {
+        assert_eq!(riscv_ladder(&guarded_counted_ladder("beqz\ta0"), 1), [0u64; 0]);
+    }
+
+    #[test]
+    fn guard_on_a_loaded_value_before_a_counted_loop_is_rejected() {
+        assert_eq!(riscv_ladder(&guarded_counted_ladder("beqz\ta2"), 1), [0x8]);
+    }
+
+    #[test]
+    fn guard_on_a_register_reloaded_as_the_counter_is_rejected() {
+        // The guard tests `a0` while it holds a loaded value; `a0` only
+        // becomes the counter afterwards.
+        let listing = "<ct_fix__x>:\n\
+            \x20 00:\tlw\ta0, 0x0(a1)\n\
+            \x20 04:\tbeqz\ta0, 0x1c <ct_fix__x+0x1c>\n\
+            \x20 08:\tli\ta0, 0x40\n\
+            \x20 0c:\tlw\ta3, 0x4(a1)\n\
+            \x20 10:\txor\ta4, a4, a3\n\
+            \x20 14:\taddi\ta0, a0, -0x1\n\
+            \x20 18:\tbnez\ta0, 0xc <ct_fix__x+0xc>\n\
+            \x20 1c:\tret\n";
+        assert_eq!(riscv_ladder(listing, 1), [0x4]);
+    }
+
+    #[test]
+    fn flag_guard_on_a_register_reloaded_before_the_branch_is_rejected() {
+        // `cmp` reads the loaded `r0`; `movw` then reloads it as the counter
+        // without touching the flags, so the branch decides on the old value.
+        let listing = "<ct_fix__x>:\n\
+            \x20 00:\tldr\tr0, [r1]\n\
+            \x20 02:\tcmp\tr0, #0x0\n\
+            \x20 04:\tmovw\tr0, #0x40\n\
+            \x20 08:\tbeq\t0x12 <ct_fix__x+0x12> @ imm = #0x6\n\
+            \x20 0a:\tldr\tr3, [r1, #0x4]\n\
+            \x20 0c:\teors\tr4, r3\n\
+            \x20 0e:\tsubs\tr0, #0x1\n\
+            \x20 10:\tbne\t0xa <ct_fix__x+0xa> @ imm = #-0xa\n\
+            \x20 12:\tbx\tlr\n";
+        let blocks = split_blocks(listing);
+        let block = &blocks[0];
+        let patterns =
+            Patterns::new(crate::host::isa::THUMB_FORBIDDEN, &[], &[], &[], &[]).unwrap();
+        let loops = Some(LoopIsa::Thumb);
+        let (found, accepted) = split_counted(block, scan_block(block, &patterns, true), loops);
+        // The back edge is accepted as counted, so only the guard remains.
+        assert_eq!(accepted, [0x10]);
+        let violations: Vec<u64> = ladder_violations(block, found, &accepted, 1, loops)
+            .iter()
+            .map(|v| v.offset)
+            .collect();
+        assert_eq!(violations, [0x8]);
+    }
+
     #[test]
     fn allowance_covers_an_uncounted_back_edge_and_zero_trip_guard() {
         // The back edge tests a loaded bound, so the model does not accept it.

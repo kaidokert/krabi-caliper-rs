@@ -131,6 +131,44 @@ pub enum LoopRole {
     Outside,
 }
 
+/// The registers that decide the branch at `offset`, and the offset of the
+/// instruction that reads them: the branch itself for compare-and-branch
+/// forms, otherwise the instruction that set the flags it reads. `None` when
+/// they cannot be determined.
+pub fn branch_operands(
+    block: &FunctionBlock,
+    offset: u64,
+    isa: LoopIsa,
+) -> Option<(Vec<String>, u64)> {
+    let index = block.insns.iter().position(|i| i.offset == offset)?;
+    let before: Vec<&Insn> = block.insns[..index].iter().collect();
+    let predicated = it_predicated(isa, &block.insns);
+    let Decision { regs, at } = decision(isa, &before, &block.insns[index], &predicated)?;
+    (!regs.is_empty()).then_some((regs, at))
+}
+
+/// Whether no instruction strictly between offsets `after` and `before`
+/// writes any of `regs`.
+pub fn regs_untouched_between(
+    block: &FunctionBlock,
+    after: u64,
+    before: u64,
+    regs: &[String],
+    isa: LoopIsa,
+) -> bool {
+    let mut previous = None;
+    for insn in &block.insns {
+        if insn.offset > after
+            && insn.offset < before
+            && regs.iter().any(|r| !matches!(effect(isa, insn, previous, r), Effect::Untouched))
+        {
+            return false;
+        }
+        previous = Some(insn);
+    }
+    true
+}
+
 /// The role of the branch at `offset` in the loop `(head, tail)`.
 pub fn loop_role(block: &FunctionBlock, offset: u64, (head, tail): (u64, u64), isa: LoopIsa) -> LoopRole {
     let Some(insn) = block.insns.iter().find(|i| i.offset == offset) else {

@@ -506,8 +506,12 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
 /// is reserved for the control of the outermost loop, the ladder's loop over
 /// the exponent bits: its back edge, its zero-iteration guard, and its exits.
 /// An exit only qualifies while nothing in that loop was accepted as counted;
-/// once the loop's control is accepted, any further exit is an extra branch.
-/// Every other branch must have been accepted as counted.
+/// once the loop's control is accepted, any further exit is an extra branch,
+/// and a guard qualifies only if it tests registers the accepted control also
+/// tests, and nothing writes them between the guard's read of them and the
+/// loop. Every other branch must have been accepted as counted. The counted
+/// control's starting values are taken as public, as the counted-loop model
+/// already does, so any guard on them is.
 fn ladder_violations(
     block: &FunctionBlock,
     mut found: Vec<Violation>,
@@ -519,11 +523,27 @@ fn ladder_violations(
         return if found.len() > allowance { found.split_off(allowance) } else { Vec::new() };
     };
     let role = |offset| loop_role(block, offset, span, isa);
-    let loop_counted =
-        accepted.iter().any(|offset| matches!(role(*offset), LoopRole::BackEdge | LoopRole::Exit));
+    let counted_control: Vec<u64> = accepted
+        .iter()
+        .copied()
+        .filter(|offset| matches!(role(*offset), LoopRole::BackEdge | LoopRole::Exit))
+        .collect();
+    let loop_counted = !counted_control.is_empty();
+    let control_regs: Vec<String> = counted_control
+        .iter()
+        .filter_map(|offset| branch_operands(block, *offset, isa))
+        .flat_map(|(regs, _)| regs)
+        .collect();
+    let guards_counter = |offset| {
+        branch_operands(block, offset, isa).is_some_and(|(regs, read_at)| {
+            regs.iter().all(|r| control_regs.contains(r))
+                && regs_untouched_between(block, read_at, span.0, &regs, isa)
+        })
+    };
     let (mut control, mut violations): (Vec<_>, Vec<_>) =
         found.into_iter().partition(|v| match role(v.offset) {
-            LoopRole::BackEdge | LoopRole::Guard => true,
+            LoopRole::BackEdge => true,
+            LoopRole::Guard => !loop_counted || guards_counter(v.offset),
             LoopRole::Exit => !loop_counted,
             LoopRole::Body | LoopRole::Outside => false,
         });
