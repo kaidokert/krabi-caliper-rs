@@ -508,8 +508,10 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
 /// An exit only qualifies while nothing in that loop was accepted as counted;
 /// once the loop's control is accepted, any further exit is an extra branch,
 /// and a guard qualifies only if it tests registers the accepted control also
-/// tests, and nothing writes them between the guard and the loop. Every other
-/// branch must have been accepted as counted.
+/// tests, and nothing writes them between the guard's read of them and the
+/// loop. Every other branch must have been accepted as counted. The counted
+/// control's starting values are taken as public, as the counted-loop model
+/// already does, so any guard on them is.
 fn ladder_violations(
     block: &FunctionBlock,
     mut found: Vec<Violation>,
@@ -530,12 +532,12 @@ fn ladder_violations(
     let control_regs: Vec<String> = counted_control
         .iter()
         .filter_map(|offset| branch_operands(block, *offset, isa))
-        .flatten()
+        .flat_map(|(regs, _)| regs)
         .collect();
     let guards_counter = |offset| {
-        branch_operands(block, offset, isa).is_some_and(|regs| {
+        branch_operands(block, offset, isa).is_some_and(|(regs, read_at)| {
             regs.iter().all(|r| control_regs.contains(r))
-                && regs_untouched_between(block, offset, span.0, &regs, isa)
+                && regs_untouched_between(block, read_at, span.0, &regs, isa)
         })
     };
     let (mut control, mut violations): (Vec<_>, Vec<_>) =

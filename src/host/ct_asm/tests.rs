@@ -92,6 +92,35 @@ mod tests {
     }
 
     #[test]
+    fn flag_guard_on_a_register_reloaded_before_the_branch_is_rejected() {
+        // `cmp` reads the loaded `r0`; `movw` then reloads it as the counter
+        // without touching the flags, so the branch decides on the old value.
+        let listing = "<ct_fix__x>:\n\
+            \x20 00:\tldr\tr0, [r1]\n\
+            \x20 02:\tcmp\tr0, #0x0\n\
+            \x20 04:\tmovw\tr0, #0x40\n\
+            \x20 08:\tbeq\t0x12 <ct_fix__x+0x12> @ imm = #0x6\n\
+            \x20 0a:\tldr\tr3, [r1, #0x4]\n\
+            \x20 0c:\teors\tr4, r3\n\
+            \x20 0e:\tsubs\tr0, #0x1\n\
+            \x20 10:\tbne\t0xa <ct_fix__x+0xa> @ imm = #-0xa\n\
+            \x20 12:\tbx\tlr\n";
+        let blocks = split_blocks(listing);
+        let block = &blocks[0];
+        let patterns =
+            Patterns::new(crate::host::isa::THUMB_FORBIDDEN, &[], &[], &[], &[]).unwrap();
+        let loops = Some(LoopIsa::Thumb);
+        let (found, accepted) = split_counted(block, scan_block(block, &patterns, true), loops);
+        // The back edge is accepted as counted, so only the guard remains.
+        assert_eq!(accepted, [0x10]);
+        let violations: Vec<u64> = ladder_violations(block, found, &accepted, 1, loops)
+            .iter()
+            .map(|v| v.offset)
+            .collect();
+        assert_eq!(violations, [0x8]);
+    }
+
+    #[test]
     fn allowance_covers_an_uncounted_back_edge_and_zero_trip_guard() {
         // The back edge tests a loaded bound, so the model does not accept it.
         let listing = "<ct_fix__x>:\n\
