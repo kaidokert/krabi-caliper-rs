@@ -506,8 +506,9 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
 /// is reserved for the control of the outermost loop, the ladder's loop over
 /// the exponent bits: its back edge, its zero-iteration guard, and its exits.
 /// An exit only qualifies while nothing in that loop was accepted as counted;
-/// once the loop's control is accepted, any further exit is an extra branch.
-/// Every other branch must have been accepted as counted.
+/// once the loop's control is accepted, any further exit is an extra branch,
+/// and a guard qualifies only if it tests registers the accepted control also
+/// tests. Every other branch must have been accepted as counted.
 fn ladder_violations(
     block: &FunctionBlock,
     mut found: Vec<Violation>,
@@ -519,11 +520,25 @@ fn ladder_violations(
         return if found.len() > allowance { found.split_off(allowance) } else { Vec::new() };
     };
     let role = |offset| loop_role(block, offset, span, isa);
-    let loop_counted =
-        accepted.iter().any(|offset| matches!(role(*offset), LoopRole::BackEdge | LoopRole::Exit));
+    let counted_control: Vec<u64> = accepted
+        .iter()
+        .copied()
+        .filter(|offset| matches!(role(*offset), LoopRole::BackEdge | LoopRole::Exit))
+        .collect();
+    let loop_counted = !counted_control.is_empty();
+    let control_regs: Vec<String> = counted_control
+        .iter()
+        .filter_map(|offset| branch_operands(block, *offset, isa))
+        .flatten()
+        .collect();
+    let guards_counter = |offset| {
+        branch_operands(block, offset, isa)
+            .is_some_and(|regs| regs.iter().all(|r| control_regs.contains(r)))
+    };
     let (mut control, mut violations): (Vec<_>, Vec<_>) =
         found.into_iter().partition(|v| match role(v.offset) {
-            LoopRole::BackEdge | LoopRole::Guard => true,
+            LoopRole::BackEdge => true,
+            LoopRole::Guard => !loop_counted || guards_counter(v.offset),
             LoopRole::Exit => !loop_counted,
             LoopRole::Body | LoopRole::Outside => false,
         });

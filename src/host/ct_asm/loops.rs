@@ -131,6 +131,17 @@ pub enum LoopRole {
     Outside,
 }
 
+/// The registers that decide the branch at `offset`: its own operands for
+/// compare-and-branch forms, otherwise those of the instruction that set the
+/// flags it reads. `None` when they cannot be determined.
+pub fn branch_operands(block: &FunctionBlock, offset: u64, isa: LoopIsa) -> Option<Vec<String>> {
+    let index = block.insns.iter().position(|i| i.offset == offset)?;
+    let before: Vec<&Insn> = block.insns[..index].iter().collect();
+    let predicated = it_predicated(isa, &block.insns);
+    let regs = decision(isa, &before, &block.insns[index], &predicated)?.regs;
+    (!regs.is_empty()).then_some(regs)
+}
+
 /// The role of the branch at `offset` in the loop `(head, tail)`.
 pub fn loop_role(block: &FunctionBlock, offset: u64, (head, tail): (u64, u64), isa: LoopIsa) -> LoopRole {
     let Some(insn) = block.insns.iter().find(|i| i.offset == offset) else {
