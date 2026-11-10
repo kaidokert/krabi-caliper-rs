@@ -76,6 +76,22 @@ mod tests {
     }
 
     #[test]
+    fn guard_on_a_register_reloaded_as_the_counter_is_rejected() {
+        // The guard tests `a0` while it holds a loaded value; `a0` only
+        // becomes the counter afterwards.
+        let listing = "<ct_fix__x>:\n\
+            \x20 00:\tlw\ta0, 0x0(a1)\n\
+            \x20 04:\tbeqz\ta0, 0x1c <ct_fix__x+0x1c>\n\
+            \x20 08:\tli\ta0, 0x40\n\
+            \x20 0c:\tlw\ta3, 0x4(a1)\n\
+            \x20 10:\txor\ta4, a4, a3\n\
+            \x20 14:\taddi\ta0, a0, -0x1\n\
+            \x20 18:\tbnez\ta0, 0xc <ct_fix__x+0xc>\n\
+            \x20 1c:\tret\n";
+        assert_eq!(riscv_ladder(listing, 1), [0x4]);
+    }
+
+    #[test]
     fn allowance_covers_an_uncounted_back_edge_and_zero_trip_guard() {
         // The back edge tests a loaded bound, so the model does not accept it.
         let listing = "<ct_fix__x>:\n\
