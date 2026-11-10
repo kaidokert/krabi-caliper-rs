@@ -24,7 +24,8 @@ pub trait TargetPolicy {
         0
     }
     /// Accept conditional branches that close or exit a counted loop (see
-    /// [`is_counted_loop_branch`]) in the whole-surface scan. Off by default.
+    /// [`is_counted_loop_branch`]) in the whole-surface and ladder scans. Off
+    /// by default.
     fn counted_loops(&self) -> bool {
         false
     }
@@ -35,7 +36,8 @@ pub trait TargetPolicy {
     }
 }
 
-/// Whole-surface scan options layered on any policy.
+/// Scan options layered on any policy. [`run_ladder`] honours
+/// `counted_loops` and rejects `excluded_fixtures`.
 #[derive(Debug, Clone, Copy)]
 pub struct Surface<T> {
     pub policy: T,
@@ -422,8 +424,28 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
         Ok(v) => v,
         Err(e) => return usage_error(&format!("bad --ladder regex: {e}"), true),
     };
+    if !spec.excluded_fixtures().is_empty() {
+        return usage_error("excluded fixtures apply to the whole-surface scan only", true);
+    }
+    let loops = if spec.counted_loops() {
+        match LoopIsa::for_triple(triple.as_str()) {
+            Some(isa) => Some(isa),
+            None => {
+                return usage_error(
+                    &format!("counted-loop acceptance has no model for {triple}"),
+                    true,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let scan = |block: &FunctionBlock| {
+        scan_block_counted(block, &patterns, spec.thumb_it_blocks(), loops)
+    };
     let mut matched = 0;
     let mut seen = 0;
+    let mut counted_loop_branches = 0;
     let mut violations = Vec::new();
     let mut neg_seen = BTreeSet::new();
     let mut neg_tripped = BTreeSet::new();
@@ -434,17 +456,24 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
         }
         if ladder.is_match(&block.symbol) {
             matched += 1;
-            let mut found = scan_block(block, &patterns, spec.thumb_it_blocks());
+            let all = scan_block(block, &patterns, spec.thumb_it_blocks());
+            let (found, accepted) = split_counted(block, all, loops);
             seen += found.len();
-            if found.len() > spec.ladder_allowed_branches() {
-                violations.extend(found.split_off(spec.ladder_allowed_branches()));
-            }
+            counted_loop_branches += accepted.len();
+            violations.extend(ladder_violations(
+                block,
+                found,
+                &accepted,
+                spec.ladder_allowed_branches(),
+                loops,
+            ));
             continue;
         }
         if is_negative_control(&block.symbol) {
             let name = block.symbol.trim_start_matches('_').to_string();
             neg_seen.insert(name.clone());
-            if !scan_block(block, &patterns, spec.thumb_it_blocks()).is_empty() {
+            // Same acceptance as the ladder: a control must still trip.
+            if !scan(block).0.is_empty() {
                 neg_tripped.insert(name);
             }
         }
@@ -455,6 +484,7 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
         ladder_symbols_expected: args.expect_ladder.unwrap_or(positives),
         ladder_branches_seen: seen,
         ladder_branches_allowed: spec.ladder_allowed_branches(),
+        counted_loop_branches,
         positive_fixtures_checked: positives,
         negative_controls_checked: neg_seen.len(),
         negative_controls_tripped: neg_tripped.len(),
@@ -468,6 +498,40 @@ pub fn run_ladder<T: TargetPolicy>(targets: &[T], config: LadderConfig<'_>) -> E
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Branches in one ladder symbol that the allowance does not cover.
+///
+/// Without a counted-loop model the allowance is a plain count. With one, it
+/// is reserved for the control of the outermost loop, the ladder's loop over
+/// the exponent bits: its back edge, its zero-iteration guard, and its exits.
+/// An exit only qualifies while nothing in that loop was accepted as counted;
+/// once the loop's control is accepted, any further exit is an extra branch.
+/// Every other branch must have been accepted as counted.
+fn ladder_violations(
+    block: &FunctionBlock,
+    mut found: Vec<Violation>,
+    accepted: &[u64],
+    allowance: usize,
+    loops: Option<LoopIsa>,
+) -> Vec<Violation> {
+    let Some((isa, span)) = loops.and_then(|isa| Some((isa, outermost_loop(block, isa)?))) else {
+        return if found.len() > allowance { found.split_off(allowance) } else { Vec::new() };
+    };
+    let role = |offset| loop_role(block, offset, span, isa);
+    let loop_counted =
+        accepted.iter().any(|offset| matches!(role(*offset), LoopRole::BackEdge | LoopRole::Exit));
+    let (mut control, mut violations): (Vec<_>, Vec<_>) =
+        found.into_iter().partition(|v| match role(v.offset) {
+            LoopRole::BackEdge | LoopRole::Guard => true,
+            LoopRole::Exit => !loop_counted,
+            LoopRole::Body | LoopRole::Outside => false,
+        });
+    if control.len() > allowance {
+        violations.extend(control.split_off(allowance));
+    }
+    violations.sort_by_key(|v| v.offset);
+    violations
 }
 
 /// Run an exact, multi-symbol conditional-branch calibration.
