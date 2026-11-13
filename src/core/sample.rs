@@ -70,6 +70,54 @@ impl<const N: usize> SampleSet<N> {
             wrapped,
         })
     }
+
+    /// Returns the measurement with the `index`-th smallest tick count, counting from zero.
+    ///
+    /// The samples must be non-empty and share a unit and frequency, as for
+    /// [`summary`](Self::summary). Ties between equal tick counts may return any of the equal
+    /// measurements; they differ at most in `wrapped`. The selection sorts a copy of the samples
+    /// on the stack, so it needs no allocator and leaves the set unchanged.
+    pub fn order_statistic(&self, index: usize) -> Result<Measurement, SummaryError> {
+        self.summary()?;
+        let mut sorted = self.samples;
+        let initialized = sorted
+            .get_mut(..self.len)
+            .ok_or(SummaryError::IndexOutOfRange)?;
+        initialized.sort_unstable_by_key(|sample| sample.map(|sample| sample.ticks));
+        initialized
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or(SummaryError::IndexOutOfRange)
+    }
+
+    /// Returns the upper median: the measurement at sorted index `len / 2`.
+    ///
+    /// For an odd count this is the median. For an even count it is the larger of the two
+    /// middle measurements, so the result is always an observed value rather than an average.
+    pub fn median(&self) -> Result<Measurement, SummaryError> {
+        self.order_statistic(self.len / 2)
+    }
+
+    /// Returns the nearest-rank percentile `numerator / denominator` (for example `95 / 100`).
+    ///
+    /// The result is the measurement at rank `ceil(numerator * len / denominator)`, counting
+    /// from one, with rank 0 taken as rank 1. So `0 / 1` is the minimum and `1 / 1` the maximum.
+    /// Nothing is interpolated: the result is always an observed value. A zero denominator or a
+    /// fraction above one returns [`SummaryError::InvalidQuantile`].
+    pub fn percentile(
+        &self,
+        numerator: u32,
+        denominator: u32,
+    ) -> Result<Measurement, SummaryError> {
+        if denominator == 0 || numerator > denominator {
+            return Err(SummaryError::InvalidQuantile);
+        }
+        let scaled = u64::from(numerator) * self.len as u64;
+        let rank = scaled.div_ceil(u64::from(denominator)).max(1);
+        let index = usize::try_from(rank - 1).map_err(|_| SummaryError::IndexOutOfRange)?;
+        self.order_statistic(index)
+    }
 }
 
 impl<const N: usize> Default for SampleSet<N> {
@@ -142,6 +190,10 @@ pub enum SummaryError {
     Empty,
     UnitMismatch,
     FrequencyMismatch,
+    /// An order statistic was requested beyond the last sample.
+    IndexOutOfRange,
+    /// A percentile fraction had a zero denominator or exceeded one.
+    InvalidQuantile,
 }
 
 impl Summary {
@@ -205,6 +257,71 @@ mod tests {
             .unwrap();
         assert_eq!(incompatible.summary(), Err(SummaryError::FrequencyMismatch));
         assert_eq!(SampleSet::<1>::new().summary(), Err(SummaryError::Empty));
+    }
+
+    fn cycles<const N: usize>(ticks: &[u64]) -> SampleSet<N> {
+        let mut samples = SampleSet::<N>::new();
+        for &value in ticks {
+            samples
+                .push(Measurement::new(value, Unit::CoreCycles))
+                .unwrap();
+        }
+        samples
+    }
+
+    #[test]
+    fn order_statistics_select_observed_values_without_reordering_the_set() {
+        let samples = cycles::<9>(&[40, 12, 33, 12, 90, 7, 51, 33, 18]);
+        let before = samples;
+        let sorted = [7, 12, 12, 18, 33, 33, 40, 51, 90];
+        for (index, &want) in sorted.iter().enumerate() {
+            assert_eq!(samples.order_statistic(index).unwrap().ticks, want);
+        }
+        assert_eq!(
+            samples.order_statistic(9),
+            Err(SummaryError::IndexOutOfRange)
+        );
+        assert_eq!(samples.median().unwrap().ticks, 33);
+        assert_eq!(samples, before);
+
+        // Even count: the upper of the two middle values, never their average.
+        assert_eq!(cycles::<4>(&[4, 1, 3, 2]).median().unwrap().ticks, 3);
+        assert_eq!(cycles::<1>(&[5]).median().unwrap().ticks, 5);
+    }
+
+    #[test]
+    fn percentiles_use_nearest_rank() {
+        let samples = cycles::<10>(&[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+        for (numerator, denominator, want) in [
+            (0, 1, 10),
+            (1, 100, 10),
+            (1, 10, 10),
+            (11, 100, 20),
+            (1, 2, 50),
+            (90, 100, 90),
+            (95, 100, 100),
+            (1, 1, 100),
+        ] {
+            assert_eq!(
+                samples.percentile(numerator, denominator).unwrap().ticks,
+                want,
+                "{numerator}/{denominator}"
+            );
+        }
+        assert_eq!(samples.percentile(1, 0), Err(SummaryError::InvalidQuantile));
+        assert_eq!(samples.percentile(2, 1), Err(SummaryError::InvalidQuantile));
+        let wide = u32::MAX;
+        assert_eq!(samples.percentile(wide, wide).unwrap().ticks, 100);
+    }
+
+    #[test]
+    fn order_statistics_keep_summary_checks() {
+        assert_eq!(SampleSet::<3>::new().median(), Err(SummaryError::Empty));
+        let mut mixed = SampleSet::<2>::new();
+        mixed.push(Measurement::new(1, Unit::CoreCycles)).unwrap();
+        mixed.push(Measurement::new(2, Unit::TimerTicks)).unwrap();
+        assert_eq!(mixed.median(), Err(SummaryError::UnitMismatch));
+        assert_eq!(mixed.percentile(1, 2), Err(SummaryError::UnitMismatch));
     }
 
     #[cfg(feature = "host")]
