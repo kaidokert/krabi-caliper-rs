@@ -639,6 +639,41 @@ cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark =
     assert!(report.success());
     std::fs::remove_file(root_manifest).unwrap();
 
+    // The prepared path retries too: this runner fails until its marker file exists.
+    let marker = workspace.join("flaky.marker");
+    let flaky = parse(&format!(
+        r#"
+[profiles.prepared]
+runner = "command"
+target = "host"
+executable = "sh"
+args = [
+  "-c",
+  "if [ -e '{marker}' ]; then printf '%s\n' 'EM_OUTCOME schema:1 benchmark:prepared-fixture status:PASS'; else touch '{marker}'; exit 7; fi",
+]
+
+[campaigns.prepared]
+profile = "prepared"
+constant-time = {{ gate = false, welch-threshold = 4.5 }}
+retry = {{ attempts = 2 }}
+cases = [{{ name = "prepared", example = "prepared-fixture", expected-benchmark = "prepared-fixture" }}]
+"#,
+        marker = marker.display()
+    ));
+    let report = executor
+        .run_prepared(
+            &flaky,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap();
+    assert!(report.success());
+    assert_eq!(report.cases[0].attempts, 2);
+    assert_eq!(report.cases[0].retried[0].status, CaseStatus::RunFailed);
+    std::fs::remove_file(marker).unwrap();
+
     let mut mismatched = prepared.clone();
     mismatched.build.target = Some("wrong-target".to_string());
     std::fs::write(
@@ -1084,37 +1119,63 @@ fn scripted_report(id: &str, status: CaseStatus, error: Option<&str>) -> CaseRep
 }
 
 fn run_script(policy: &RetryPolicy, statuses: &[CaseStatus]) -> (CaseReport, usize) {
-    let dir = std::env::temp_dir().join(format!("krabi-caliper-retry-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("fixture")).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "krabi-caliper-retry-{}-{}",
+        std::process::id(),
+        statuses.len()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let case_dir = dir.join("fixture");
     let mut calls = 0;
     let report = run_with_retry(policy, &dir, true, || {
         let status = statuses[calls];
         calls += 1;
+        // Like run_case: start from an empty case directory and leave a log in it.
+        let _ = std::fs::remove_dir_all(&case_dir);
+        std::fs::create_dir_all(&case_dir).unwrap();
+        std::fs::write(case_dir.join("raw-stdout.log"), format!("attempt {calls}")).unwrap();
         Ok(scripted_report(
             "fixture",
             status,
-            (status != CaseStatus::Pass).then_some("attempt failed"),
+            (status != CaseStatus::Pass).then_some("attempt failed\nsecond line"),
         ))
     })
     .unwrap();
-    let metadata = std::fs::read_to_string(dir.join("fixture/metadata.json")).ok();
-    let _ = std::fs::remove_dir_all(&dir);
     if report.attempts > 1 {
-        let metadata = metadata.expect("a retried case rewrites its metadata");
+        let metadata = std::fs::read_to_string(case_dir.join("metadata.json"))
+            .expect("a retried case rewrites its metadata");
         let written: CaseReport = serde_json::from_str(&metadata).unwrap();
         assert_eq!(written.attempts, report.attempts);
         assert_eq!(written.retried, report.retried);
+        // Every discarded attempt's logs survive under attempts/<n>/, and the final
+        // attempt's stay at the top.
+        for attempt in 1..report.attempts {
+            let log = case_dir.join(format!("attempts/{attempt}/raw-stdout.log"));
+            assert_eq!(
+                std::fs::read_to_string(log).unwrap(),
+                format!("attempt {attempt}")
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(case_dir.join("raw-stdout.log")).unwrap(),
+            format!("attempt {}", report.attempts)
+        );
     }
+    // Nothing is left staged beside the case directory.
+    let leftovers = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().file_name() != "fixture")
+        .count();
+    assert_eq!(leftovers, 0);
+    let _ = std::fs::remove_dir_all(&dir);
     (report, calls)
 }
 
 #[test]
 fn retry_reruns_only_listed_statuses_up_to_the_attempt_limit() {
     use CaseStatus::*;
-    let policy = RetryPolicy {
-        attempts: 3,
-        ..RetryPolicy::default()
-    };
+    let policy = RetryPolicy::new(3, vec![RunFailed, TimedOut]);
 
     let (report, calls) = run_script(&policy, &[RunFailed, TimedOut, Pass]);
     assert_eq!((report.status, report.attempts, calls), (Pass, 3, 3));
@@ -1123,19 +1184,34 @@ fn retry_reruns_only_listed_statuses_up_to_the_attempt_limit() {
         [
             RetriedAttempt {
                 status: RunFailed,
-                error: Some("attempt failed".to_string())
+                error: Some("attempt failed\nsecond line".to_string()),
+                artifacts: Some("attempts/1".to_string()),
             },
             RetriedAttempt {
                 status: TimedOut,
-                error: Some("attempt failed".to_string())
+                error: Some("attempt failed\nsecond line".to_string()),
+                artifacts: Some("attempts/2".to_string()),
             },
         ]
     );
 
+    // Reports show the retry: the per-case and campaign Markdown, and the CSV.
+    let failure = report.render_failure_markdown();
+    assert!(failure.contains("**Attempts:** 3"), "{failure}");
+    assert!(failure.contains("- Attempt 1: `run-failed`, attempt failed (`attempts/1/`)"));
+    assert!(!failure.contains("- Attempt 1: `run-failed`, attempt failed\nsecond line"));
+    let campaign = CampaignReport {
+        campaign: "flaky".to_string(),
+        profile: "host".to_string(),
+        cases: vec![report.clone()],
+    };
+    assert!(campaign.render_markdown().contains("| Pass (3 attempts) |"));
+    assert!(campaign.render_csv().contains("retry,attempts,3"));
+
     // The limit counts every run; the last failure is the reported one.
     let (report, calls) = run_script(&policy, &[RunFailed, RunFailed, RunFailed]);
     assert_eq!((report.status, report.attempts, calls), (RunFailed, 3, 3));
-    assert_eq!(report.error.as_deref(), Some("attempt failed"));
+    assert_eq!(report.error.as_deref(), Some("attempt failed\nsecond line"));
     assert_eq!(report.retried.len(), 2);
 
     // A workload failure is a result, not a transient: it is never retried by default.
@@ -1171,10 +1247,10 @@ cases = [{ name = "fixture", example = "fixture" }]
     config.validate().unwrap();
     assert_eq!(
         config.campaigns["flaky"].retry,
-        RetryPolicy {
-            attempts: 3,
-            on: vec![CaseStatus::RunFailed, CaseStatus::MissingTerminalRecord],
-        }
+        RetryPolicy::new(
+            3,
+            vec![CaseStatus::RunFailed, CaseStatus::MissingTerminalRecord]
+        )
     );
     assert_eq!(config.campaigns["plain"].retry, RetryPolicy::default());
 
@@ -1184,6 +1260,7 @@ cases = [{ name = "fixture", example = "fixture" }]
             "{ attempts = 2, on = [\"pass\"] }",
             "cannot retry a passing case",
         ),
+        ("{ attempts = 2, on = [] }", "retries no status"),
     ] {
         let config = parse(&format!(
             r#"
@@ -1213,6 +1290,43 @@ cases = [{ name = "fixture", example = "fixture" }]
         )
         .is_err()
     );
+}
+
+#[test]
+fn reports_written_before_retry_still_read() {
+    let mut report = scripted_report("fixture", CaseStatus::Pass, None);
+    let mut value = serde_json::to_value(&report).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("attempts");
+    object.remove("retried");
+    let read: CaseReport = serde_json::from_value(value).unwrap();
+    assert_eq!((read.attempts, read.retried.len()), (1, 0));
+
+    // A single attempt does not add `retried` to the JSON.
+    report.attempts = 1;
+    let encoded = serde_json::to_string(&report).unwrap();
+    assert!(encoded.contains("\"attempts\":1"));
+    assert!(!encoded.contains("retried"));
+}
+
+#[test]
+fn statuses_are_named_as_configured() {
+    use CaseStatus::*;
+    for status in [
+        Pass,
+        WorkloadFail,
+        MeasurementError,
+        BuildFailed,
+        RunFailed,
+        TimedOut,
+        ProtocolError,
+        MissingTerminalRecord,
+    ] {
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::Value::String(status.name().to_string())
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -1245,5 +1359,10 @@ cases = [{ name = "fixture", example = "fixture" }]
         std::fs::read_to_string(workspace.join("target/krabi-caliper/flaky/fixture/metadata.json"))
             .unwrap();
     assert!(metadata.contains("\"attempts\": 2"));
+    assert!(
+        workspace
+            .join("target/krabi-caliper/flaky/fixture/attempts/1/metadata.json")
+            .is_file()
+    );
     std::fs::remove_dir_all(workspace).unwrap();
 }

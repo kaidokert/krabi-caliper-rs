@@ -1,4 +1,5 @@
 #[derive(Clone, Debug, Deserialize)]
+#[non_exhaustive]
 pub struct ToolkitConfig {
     pub profiles: BTreeMap<String, RunnerProfile>,
     #[serde(default)]
@@ -50,6 +51,11 @@ impl ToolkitConfig {
             if campaign.retry.attempts == 0 {
                 return Err(CampaignError::InvalidConfig(format!(
                     "campaign {name:?} retry attempts must be at least 1"
+                )));
+            }
+            if campaign.retry.attempts > 1 && campaign.retry.on.is_empty() {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "campaign {name:?} retries no status; list one in retry.on"
                 )));
             }
             if campaign.retry.on.contains(&CaseStatus::Pass) {
@@ -452,6 +458,7 @@ pub struct VenueConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct RunnerProfile {
     #[serde(default)]
     pub extends: Option<String>,

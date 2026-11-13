@@ -1537,8 +1537,10 @@ fn write_case_metadata(path: &Path, report: &CaseReport) -> Result<(), CampaignE
 
 /// Runs one case, then runs it again while `policy` says its status is transient.
 ///
-/// Each attempt replaces the case's artifact directory. The kept report, and its rewritten
-/// metadata, record how many attempts ran and what each discarded attempt reported.
+/// Each attempt starts from an empty case directory. A discarded attempt's directory (its
+/// logs, metadata and failure report) is kept and ends up in the final case directory as
+/// `attempts/<n>/`. The kept report, and its rewritten metadata, record how many attempts ran
+/// and what each discarded attempt reported.
 fn run_with_retry(
     policy: &RetryPolicy,
     campaign_dir: &Path,
@@ -1546,22 +1548,33 @@ fn run_with_retry(
     mut attempt: impl FnMut() -> Result<CaseReport, CampaignError>,
 ) -> Result<CaseReport, CampaignError> {
     let mut retried = Vec::new();
+    let mut staged = Vec::new();
     let mut number = 1;
     loop {
         let mut report = attempt()?;
+        let case_dir = artifact_child(campaign_dir, &report.id, "expanded case id")?;
         if policy.retries(number, report.status) {
             if !silent {
                 std::eprintln!(
-                    "retrying case {:?} after {:?} (attempt {}/{})",
+                    "retrying case {:?} after {} (attempt {}/{})",
                     report.id,
-                    report.status,
+                    report.status.name(),
                     number + 1,
                     policy.attempts
                 );
             }
+            let mut artifacts = None;
+            if case_dir.is_dir() {
+                // Staged outside the case directory, which the next attempt empties.
+                let stage = campaign_dir.join(format!(".{}.attempt-{number}", report.id));
+                replace_dir(&case_dir, &stage)?;
+                staged.push((stage, number));
+                artifacts = Some(format!("attempts/{number}"));
+            }
             retried.push(RetriedAttempt {
                 status: report.status,
                 error: report.error.take(),
+                artifacts,
             });
             number += 1;
             continue;
@@ -1569,12 +1582,33 @@ fn run_with_retry(
         if retried.is_empty() {
             return Ok(report);
         }
+        let attempts_dir = case_dir.join("attempts");
+        for (stage, attempt) in staged {
+            fs::create_dir_all(&attempts_dir).map_err(|source| CampaignError::Io {
+                path: attempts_dir.clone(),
+                source,
+            })?;
+            replace_dir(&stage, &attempts_dir.join(attempt.to_string()))?;
+        }
         report.attempts = number;
         report.retried = retried;
-        let case_dir = artifact_child(campaign_dir, &report.id, "expanded case id")?;
         write_case_artifacts(&case_dir, &report)?;
         return Ok(report);
     }
+}
+
+/// Moves `from` to `to`, replacing anything already at `to`.
+fn replace_dir(from: &Path, to: &Path) -> Result<(), CampaignError> {
+    if to.exists() {
+        fs::remove_dir_all(to).map_err(|source| CampaignError::Io {
+            path: to.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::rename(from, to).map_err(|source| CampaignError::Io {
+        path: from.to_path_buf(),
+        source,
+    })
 }
 
 fn write_case_artifacts(path: &Path, report: &CaseReport) -> Result<(), CampaignError> {

@@ -30,6 +30,7 @@ include!("campaign/config.rs");
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct CampaignConfig {
     pub profile: String,
     #[serde(default)]
@@ -62,6 +63,7 @@ pub struct CampaignConfig {
 /// status it retried past.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[non_exhaustive]
 pub struct RetryPolicy {
     #[serde(default = "one_attempt")]
     pub attempts: u32,
@@ -79,6 +81,11 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// A policy of `attempts` runs in total, retrying the statuses in `on`.
+    pub fn new(attempts: u32, on: Vec<CaseStatus>) -> Self {
+        Self { attempts, on }
+    }
+
     /// Whether a report from attempt `attempt` (counting from one) should be run again.
     pub fn retries(&self, attempt: u32, status: CaseStatus) -> bool {
         attempt < self.attempts && self.on.contains(&status)
@@ -95,6 +102,7 @@ fn transient_statuses() -> Vec<CaseStatus> {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct CaseConfig {
     pub name: String,
     #[serde(default)]

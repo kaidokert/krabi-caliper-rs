@@ -99,7 +99,9 @@ retry = { attempts = 3 }   # `on` defaults to ["run-failed", "timed-out"]
 `attempts` counts every run, including the first. Only the statuses in `on` are
 retried; a workload or measurement failure is a result and is not retried
 unless listed. The kept report records `attempts` and, in `retried`, the status
-and error of each discarded attempt.
+and error of each discarded attempt. Each discarded attempt's logs, metadata
+and failure report are kept in the case directory under `attempts/<n>/`, and
+the campaign Markdown and CSV reports show the attempt count.
 
 For a scarce hardware runner, build the firmware on a hosted runner and pass
 the prepared bundle to the hardware job:
