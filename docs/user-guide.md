@@ -108,6 +108,46 @@ footprint extraction, comparisons, JSON/CSV/Markdown reports, CT-grind
 integration, panic-path auditing, Welch analysis, and combined DWT/ETM
 evidence.
 
+## Counting instructions from QEMU execution traces
+
+`host::exec_trace` (with `host`) counts the instructions an image executes
+between two markers, from QEMU's per-instruction exec log:
+
+```rust,ignore
+use krabi_caliper::host::exec_trace::{
+    ExecTracePcs, QemuExecTrace, TraceMarker, marker_intervals,
+};
+
+let trace = std::path::Path::new("target/trace.log");
+QemuExecTrace::new(
+    "qemu-system-arm",
+    ["-cpu", "cortex-m4", "-machine", "mps2-an386", "-nographic",
+     "-semihosting-config", "enable=on,target=native", "-kernel", "app.elf"],
+)
+.attempts(3)
+.capture(trace)?;
+// Marker functions from the symbol table: address and size.
+let begin = TraceMarker::function(0x1000, 4);
+let end = TraceMarker::function(0x1004, 4);
+let intervals = marker_intervals(ExecTracePcs::open(trace)?, &begin, &end, None)?;
+let counts: Vec<usize> = intervals.iter().map(Vec::len).collect();
+```
+
+`capture` appends `-accel tcg,one-insn-per-tb=on -d exec,nochain -D <trace>`,
+which makes every executed instruction one log line (QEMU 8.1 or later), and
+retries failed runs. The image must exit on its own; there is no timeout.
+
+An interval opens on a PC in `begin`, skips the rest of the begin function's
+own body, and holds every later PC up to (not including) the first PC in `end`.
+`TraceMarker::Address` marks a single address instead of a function. Pass a
+limit to stop after that many intervals. A trace that ends inside an interval is
+an error. Each interval keeps its PCs, so callers can attribute them to
+functions (for example with a disassembly) before counting.
+
+These are instruction counts from an emulator, not cycles: QEMU models no
+pipeline, caches or wait states. Record the QEMU version with the counts, since
+the log format and translation belong to QEMU.
+
 ## Feature groups
 
 - Target core: `paired`, `stack`, `deterministic-rng`
