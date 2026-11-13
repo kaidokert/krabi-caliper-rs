@@ -95,7 +95,16 @@ impl ToolkitConfig {
             )),
             None => None,
         };
-        profile.resolve(name, venue, initial_evidence)
+        profile
+            .resolve(name, venue, initial_evidence)
+            .map_err(|error| match error {
+                // Name the profile, so a binding missing for one profile is not mistaken for
+                // a problem with the campaign being run.
+                CampaignError::InvalidConfig(message) if !message.contains(&format!("{name:?}")) => {
+                    CampaignError::InvalidConfig(format!("profile {name:?}: {message}"))
+                }
+                error => error,
+            })
     }
 
     fn inherited_profile(
@@ -966,7 +975,10 @@ fn preset_values(preset: RunnerPreset) -> PresetValues {
             board: None,
             mcu: Some("${PROBE_RS_CHIP}"),
             transport: Some("rtt"),
-            probe: Some("${PROBE_RS_PROBE}"),
+            // The selector is recorded in resolved bindings. As `probe` metadata it would enter
+            // the configuration identity, and swapping a probe would block comparisons that the
+            // probe field itself only warns about.
+            probe: None,
             clock_frequency_hz: None,
         },
     }

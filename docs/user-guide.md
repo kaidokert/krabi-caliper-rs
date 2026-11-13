@@ -95,9 +95,18 @@ target = "thumbv7em-none-eabihf"
 venue = "bench"
 ```
 
-The run ends at the `EM_OUTCOME` event, and probe-rs is interrupted rather
-than killed so it releases the probe. The bindings are needed only where the
-case runs, not by `build --output`.
+The run ends at the first `EM_OUTCOME` event. On Unix probe-rs then gets an
+interrupt so it detaches cleanly; on Windows, and on a timeout, it is killed
+after a three-second grace period, which still releases the probe. The chip is
+recorded as the MCU; the probe selector is recorded among the resolved
+bindings but not in the configuration identity, so replacing a probe does not
+block comparisons. `mcu` and `probe` in a profile are recorded metadata only,
+and `args` replaces the whole command line.
+
+`build --output` needs neither binding, so firmware can be built where no
+probe is attached. `validate` and `run` resolve every profile in the file, so
+set the bindings wherever those commands run, or keep hardware profiles in a
+separate configuration file.
 
 Then validate or run it:
 

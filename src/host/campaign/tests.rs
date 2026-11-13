@@ -940,13 +940,27 @@ cases = [{ name = "fixture", example = "fixture" }]
     assert_eq!(profile.completion_action, CompletionAction::Interrupt);
     assert_eq!(profile.transport.as_deref(), Some("rtt"));
     assert_eq!(profile.mcu.as_deref(), Some("STM32L431KCUx"));
-    assert_eq!(profile.probe.as_deref(), Some("0483:374f:0001"));
+    // The selector is evidence, not identity: swapping a probe does not block comparisons.
+    assert_eq!(profile.probe, None);
     assert_eq!(
         profile.resolved_bindings["PROBE_RS_PROBE"],
         "0483:374f:0001"
     );
+    assert!(!profile.configuration_identity.contains("0483:374f:0001"));
+    assert!(profile.configuration_identity.contains("STM32L431KCUx"));
+
     // The build job needs neither binding, so it can run where no probe is attached.
-    assert!(config.validate_for_build().is_ok());
+    let unbound = parse(
+        r#"
+[profiles.board]
+preset = "probe-rs-rtt"
+target = "thumbv7em-none-eabihf"
+[campaigns.test]
+profile = "board"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    assert!(unbound.validate_for_build().is_ok());
 }
 
 #[test]
@@ -984,6 +998,8 @@ cases = [{ name = "fixture", example = "fixture" }]
     if std::env::var_os("PROBE_RS_PROBE").is_none() {
         let error = without_probe.validate().unwrap_err().to_string();
         assert!(error.contains("PROBE_RS_PROBE"), "{error}");
+        // The error names the profile that needs the binding.
+        assert!(error.contains("\"board\""), "{error}");
     }
 }
 
