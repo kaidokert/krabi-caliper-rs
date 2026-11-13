@@ -199,6 +199,36 @@ examines in each form a rule matches, for checks a substring cannot express,
 such as an anchored pattern or every match. It also fails on an image with no
 symbols.
 
+## Disassembly and static stack bounds
+
+`host::disasm` (with `host`) reads a linked Arm Thumb image through LLVM's
+`nm -S -n -C` and `objdump -d --demangle --no-show-raw-insn`:
+
+```rust
+use krabi_caliper::host::disasm::{Disassembly, DisasmTools, UnresolvedCalls};
+
+let image = Disassembly::from_elf("target/thumbv7em-none-eabi/release/app",
+                                  &DisasmTools::cargo_binutils())?;
+let root = image.find_unique("app::measured::")?.address;
+let reachable = image.reachable_from(root, UnresolvedCalls::Reject)?;
+let stack = image.composed_stack_upper(root)?;
+assert!(stack.bounded, "indirect calls below the root are not counted");
+```
+
+Each function carries its `nm` size, instructions, static call edges (calls,
+tail calls and conditional branches into another function) and a conservative
+frame: four bytes per pushed register plus every `sub sp, #imm`.
+`composed_stack_upper` sums frames along the deepest static chain, rejects
+recursion, and reports `bounded = false` when an indirect call was skipped.
+Names are the LLVM tools' demangled names, hashes included, so record those
+tools' versions with the measurement.
+
+For objdump listings, `function_body` extracts one function,
+`line_attributed_instructions` counts instructions that `objdump -d -l`
+attributes to a source line range, `first_stack_allocation` reads explicit
+frame allocations, and `ChainBudget` checks a chain of known frames against
+per-frame and total ceilings.
+
 ## Counting instructions from QEMU execution traces
 
 `host::exec_trace` (feature `host`) counts the instructions an image executes

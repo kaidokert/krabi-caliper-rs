@@ -10,6 +10,7 @@ mod compare;
 pub mod ct_asm;
 #[cfg(feature = "ctgrind")]
 pub mod ctgrind;
+pub mod disasm;
 mod elf;
 pub mod elf_audit;
 pub mod exec_trace;
