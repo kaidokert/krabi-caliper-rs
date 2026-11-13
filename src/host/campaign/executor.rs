@@ -1549,6 +1549,7 @@ fn run_with_retry(
 ) -> Result<CaseReport, CampaignError> {
     let mut retried = Vec::new();
     let mut staged = Vec::new();
+    let mut stage_root = None;
     let mut number = 1;
     loop {
         let mut report = attempt()?;
@@ -1565,9 +1566,14 @@ fn run_with_retry(
             }
             let mut artifacts = None;
             if case_dir.is_dir() {
-                // Staged outside the case directory, which the next attempt empties.
-                let stage = campaign_dir.join(format!(".{}.attempt-{number}", report.id));
-                replace_dir(&case_dir, &stage)?;
+                // Staged outside the case directory, which the next attempt empties, in a
+                // directory this run creates, so no other case's artifacts can be in the way.
+                let root = match &stage_root {
+                    Some(root) => root,
+                    None => stage_root.insert(create_unique_dir(campaign_dir, &report.id)?),
+                };
+                let stage = root.join(number.to_string());
+                move_dir(&case_dir, &stage)?;
                 staged.push((stage, number));
                 artifacts = Some(format!("attempts/{number}"));
             }
@@ -1588,7 +1594,11 @@ fn run_with_retry(
                 path: attempts_dir.clone(),
                 source,
             })?;
-            replace_dir(&stage, &attempts_dir.join(attempt.to_string()))?;
+            move_dir(&stage, &attempts_dir.join(attempt.to_string()))?;
+        }
+        if let Some(root) = &stage_root {
+            // Empty now; a failure to remove it loses nothing.
+            let _ = fs::remove_dir(root);
         }
         report.attempts = number;
         report.retried = retried;
@@ -1597,13 +1607,38 @@ fn run_with_retry(
     }
 }
 
-/// Moves `from` to `to`, replacing anything already at `to`.
-fn replace_dir(from: &Path, to: &Path) -> Result<(), CampaignError> {
+/// Creates a new directory beside the case directories for staging discarded attempts of
+/// `case_id`. Creation is atomic and never reuses an existing path, so a case whose name looks
+/// like a staging directory is left untouched.
+fn create_unique_dir(campaign_dir: &Path, case_id: &str) -> Result<PathBuf, CampaignError> {
+    let pid = std::process::id();
+    for suffix in 0u32.. {
+        let path = campaign_dir.join(format!(".{case_id}.retry-{pid}-{suffix}"));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(CampaignError::Io { path, source }),
+        }
+    }
+    Err(CampaignError::Io {
+        path: campaign_dir.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "no free retry staging directory name",
+        ),
+    })
+}
+
+/// Moves `from` to `to`, which must not exist: nothing is ever deleted to make room.
+fn move_dir(from: &Path, to: &Path) -> Result<(), CampaignError> {
     if to.exists() {
-        fs::remove_dir_all(to).map_err(|source| CampaignError::Io {
+        return Err(CampaignError::Io {
             path: to.to_path_buf(),
-            source,
-        })?;
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "refusing to overwrite an existing path",
+            ),
+        });
     }
     fs::rename(from, to).map_err(|source| CampaignError::Io {
         path: from.to_path_buf(),

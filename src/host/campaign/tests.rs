@@ -1173,6 +1173,54 @@ fn run_script(policy: &RetryPolicy, statuses: &[CaseStatus]) -> (CaseReport, usi
 }
 
 #[test]
+fn retry_staging_never_touches_other_case_directories() {
+    use CaseStatus::*;
+    let dir =
+        std::env::temp_dir().join(format!("krabi-caliper-retry-names-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Valid case names that look like staging directories, holding earlier cases' artifacts.
+    let lookalikes = [
+        ".fixture.attempt-1".to_string(),
+        format!(".fixture.retry-{}-0", std::process::id()),
+    ];
+    for name in &lookalikes {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(dir.join(name).join("metadata.json"), name).unwrap();
+    }
+    let case_dir = dir.join("fixture");
+    let statuses = [RunFailed, RunFailed, Pass];
+    let mut calls = 0;
+    let report = run_with_retry(&RetryPolicy::new(3, vec![RunFailed]), &dir, true, || {
+        let status = statuses[calls];
+        calls += 1;
+        let _ = std::fs::remove_dir_all(&case_dir);
+        std::fs::create_dir_all(&case_dir).unwrap();
+        std::fs::write(case_dir.join("raw-stdout.log"), format!("attempt {calls}")).unwrap();
+        Ok(scripted_report("fixture", status, None))
+    })
+    .unwrap();
+    assert_eq!(report.attempts, 3);
+    for name in &lookalikes {
+        assert_eq!(
+            std::fs::read_to_string(dir.join(name).join("metadata.json")).unwrap(),
+            *name,
+            "{name} was disturbed"
+        );
+    }
+    for attempt in 1..3 {
+        assert_eq!(
+            std::fs::read_to_string(case_dir.join(format!("attempts/{attempt}/raw-stdout.log")))
+                .unwrap(),
+            format!("attempt {attempt}")
+        );
+    }
+    // Only the case directory and the two lookalikes remain: the staging directory is gone.
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn retry_reruns_only_listed_statuses_up_to_the_attempt_limit() {
     use CaseStatus::*;
     let policy = RetryPolicy::new(3, vec![RunFailed, TimedOut]);
