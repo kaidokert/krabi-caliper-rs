@@ -16,6 +16,8 @@ mod model;
 #[cfg(feature = "campaign")]
 pub mod panic_audit;
 mod parser;
+#[cfg(feature = "campaign")]
+pub mod provenance;
 mod render;
 mod stats;
 

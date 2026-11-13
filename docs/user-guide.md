@@ -169,6 +169,37 @@ skips, such as a linker-script `.uninit` region or `.got`, so a size gate can
 require the list to be empty. Runtime reservations such as `riscv-rt`'s
 `.stack` and `.heap` are listed too; a gate allows those by name.
 
+## Recording provenance
+
+A figure is comparable with another only when both came from the same sources,
+dependencies, tools and images. `host::provenance` (with `campaign`) records
+those inputs as content hashes and version lines:
+
+```rust
+use krabi_caliper::host::provenance::{Provenance, SourceTree};
+
+let sources = SourceTree::new(".")
+    .file("Cargo.toml")
+    .file("memory.x")
+    .directory("src")
+    .extension("rs");
+let record = Provenance::new()
+    .source_tree(&sources)?
+    .lockfile("Cargo.lock".as_ref())?
+    .tool("rustc", "rustc", ["--version"])?
+    .tool("emulator", "qemu-system-arm", ["--version"])?
+    .image("app", "target/thumbv7m-none-eabi/release/app".as_ref())?;
+```
+
+The source-tree digest covers exactly the selected files (directories are
+searched for the listed extensions, skipping `target`), including their
+relative paths, so adding, renaming or editing a selected file changes it and
+nothing else does. It is independent of the checkout location and the host's
+path separator. Missing files and failing tools are errors. Store the record
+beside the results, and use `Provenance::differences` to list what changed
+between two records; deciding whether a change invalidates a comparison is up
+to the caller.
+
 ## Feature groups
 
 - Target core: `paired`, `stack`, `deterministic-rng`
