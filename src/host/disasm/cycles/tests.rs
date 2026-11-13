@@ -91,7 +91,10 @@ fn rejects_what_the_core_or_model_cannot_cost() {
     // Register moves into pc are branches; other loads into pc are not modelled.
     assert_eq!(cost(M0, "mov", "pc, r1", None), (3, 3));
     assert_eq!(cost(M4, "add", "pc, r2", None), (2, 4));
+    assert_eq!(cost(M3, "moveq", "pc, r0", None), (1, 4));
     assert!(rejected(M4, "ldr.w", "pc, [r0, r1, lsl #2]"));
+    // Reading pc is not a branch.
+    assert_eq!(cost(M4, "cmp", "pc, r1", None), (1, 1));
     // Ordinary forms stay modelled.
     assert_eq!(cost(M0, "mov", "r0, r1", None), (1, 1));
     assert_eq!(cost(M4, "ldr", "r0, [pc, #0x4]", None), (2, 3));

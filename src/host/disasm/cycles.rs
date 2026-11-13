@@ -20,8 +20,9 @@
 //!   as ordinary loads and stores.
 //!
 //! `mov pc, rN` and `add pc, rN` are costed as branches (3 cycles on Cortex-M0, 2..4 on
-//! Cortex-M3/M4). Floating point, DSP and other unlisted instructions are errors, as are other
-//! instructions that write `pc` (`ldr pc, [..]`) and Armv7-M instructions in a Cortex-M0 trace.
+//! Cortex-M3/M4, 1..4 for a conditional form in an IT block). Floating point, DSP and other
+//! unlisted instructions are errors, as are loads into `pc` other than `pop`/`ldm`
+//! (`ldr pc, [..]`) and Armv7-M instructions in a Cortex-M0 trace.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -164,9 +165,10 @@ fn armv7m_only(raw: &str, mnemonic: &str) -> bool {
         )
 }
 
-/// Whether the instruction's first operand, its destination, is `pc`.
-fn writes_pc(operands: &str) -> bool {
-    operands.split(',').next().unwrap_or_default().trim() == "pc"
+/// Whether a move, add or load (by normalized mnemonic) writes `pc`.
+fn writes_pc(mnemonic: &str, operands: &str) -> bool {
+    (mnemonic == "mov" || mnemonic == "add" || mnemonic.starts_with("ldr"))
+        && operands.split(',').next().unwrap_or_default().trim() == "pc"
 }
 
 /// The cycles `instruction` takes on `core`. `taken` must say whether a conditional branch
@@ -192,19 +194,25 @@ pub fn instruction_cycles(
     {
         return Err(unmodelled());
     }
-    if writes_pc(&instruction.operands) {
+    if writes_pc(&mnemonic, &instruction.operands) {
         // `mov pc, rN` and `add pc, rN` (Thumb jump-table dispatch) branch to a register
-        // value: 3 cycles on Cortex-M0, 1 plus the pipeline refill on Cortex-M3/M4. Loads
-        // into `pc` other than `pop`/`ldm` are not modelled.
-        return if mnemonic == "mov" || mnemonic == "add" {
-            Ok(if core == M0 {
-                fixed(3, "register-branch")
-            } else {
-                range(2, 4, "register-branch")
-            })
+        // value: 3 cycles on Cortex-M0, 1 plus the pipeline refill on Cortex-M3/M4. A
+        // conditional form inside an IT block may fail its condition and take 1. Loads into
+        // `pc` other than `pop`/`ldm` are not modelled.
+        if mnemonic.starts_with("ldr") {
+            return Err(unmodelled());
+        }
+        let base = instruction
+            .mnemonic
+            .trim_end_matches(".w")
+            .trim_end_matches(".n");
+        return Ok(if core == M0 {
+            fixed(3, "register-branch")
+        } else if base != mnemonic {
+            range(1, 4, "register-branch")
         } else {
-            Err(unmodelled())
-        };
+            range(2, 4, "register-branch")
+        });
     }
     if conditional {
         let taken = taken.ok_or_else(|| CycleModelError::UnknownDirection {
