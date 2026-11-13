@@ -273,6 +273,34 @@ fn composed_stack_follows_the_deepest_chain() {
         d.composed_stack_upper(0x140),
         Err(DisasmError::Recursive(0x140))
     ));
+    // Counting each recursive frame once gives an estimate that is not a bound.
+    assert_eq!(
+        d.composed_stack_upper_with(0x140, RecursionPolicy::CountOnce)
+            .unwrap(),
+        ComposedStack {
+            bytes: 4,
+            bounded: false
+        }
+    );
+    let mutual = Disassembly::parse(
+        "00000140 00000004 T recursive\n00000150 00000004 T other\n",
+        "00000140 <recursive>:\n 140: \tpush\t{r7, lr}\n 142: \tbl\t0x150 <other>\n\
+         00000150 <other>:\n 150: \tpush\t{r4, r5, r7, lr}\n 152: \tbl\t0x140 <recursive>\n",
+    )
+    .unwrap();
+    assert_eq!(
+        mutual
+            .composed_stack_upper_with(0x140, RecursionPolicy::CountOnce)
+            .unwrap(),
+        ComposedStack {
+            bytes: 8 + 16,
+            bounded: false
+        }
+    );
+    assert!(matches!(
+        mutual.composed_stack_upper_with(0x140, RecursionPolicy::Reject),
+        Err(DisasmError::Recursive(0x140))
+    ));
     assert!(matches!(
         Disassembly::parse(NM, "nothing here\n"),
         Err(DisasmError::Empty)

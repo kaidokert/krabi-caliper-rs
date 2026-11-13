@@ -223,7 +223,9 @@ Each function carries its `nm` size, instructions, static call edges (calls,
 tail calls and conditional branches into another function) and a frame
 estimate: four bytes per pushed register plus every `sub sp, #0x..`.
 `composed_stack_upper` sums frames along the deepest static chain and rejects
-recursion. It is a heuristic, not a proof: indirect calls, indirect branches,
+recursion; `composed_stack_upper_with(root, RecursionPolicy::CountOnce)` instead
+counts each recursive frame once and clears `bounded`, for recursion that is
+bounded in practice (library sorts, for example). It is a heuristic, not a proof: indirect calls, indirect branches,
 branches to addresses that start no function, and stack adjustments it does not
 count (`subw`, `vpush`, register adjustments, decimal immediates) are listed per
 function and clear `bounded`. Exception entry and interrupt handlers are never

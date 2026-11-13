@@ -191,6 +191,20 @@ pub enum UnresolvedCallPolicy {
     Allow,
 }
 
+/// How [`Disassembly::composed_stack_upper_with`] treats recursion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecursionPolicy {
+    /// Recursion is a [`DisasmError::Recursive`] error.
+    Reject,
+    /// Each function's frame counts once per chain: a call back into a function already on
+    /// the chain, or a `bl`/`blx` to the caller's own start, adds nothing. The result's
+    /// `bounded` is false whenever this happened, since the real depth is unknown. Useful
+    /// when recursion is bounded in practice (library sorts, for example) and an estimate
+    /// is still wanted.
+    CountOnce,
+}
+
 fn run(program: &OsStr, arguments: &[&OsStr]) -> Result<String, DisasmError> {
     let failure = |detail: String| DisasmError::Tool {
         program: program.to_string_lossy().into_owned(),
@@ -452,14 +466,24 @@ impl Disassembly {
     /// function's own start, are errors. Each function is composed once, so shared callees
     /// cost nothing extra.
     pub fn composed_stack_upper(&self, root: u64) -> Result<ComposedStack, DisasmError> {
+        self.composed_stack_upper_with(root, RecursionPolicy::Reject)
+    }
+
+    /// [`Disassembly::composed_stack_upper`] with an explicit [`RecursionPolicy`].
+    pub fn composed_stack_upper_with(
+        &self,
+        root: u64,
+        recursion: RecursionPolicy,
+    ) -> Result<ComposedStack, DisasmError> {
         let mut visiting = BTreeSet::new();
         let mut done = BTreeMap::new();
-        self.compose(root, &mut visiting, &mut done)
+        self.compose(root, recursion, &mut visiting, &mut done)
     }
 
     fn compose(
         &self,
         address: u64,
+        recursion: RecursionPolicy,
         visiting: &mut BTreeSet<u64>,
         done: &mut BTreeMap<u64, ComposedStack>,
     ) -> Result<ComposedStack, DisasmError> {
@@ -473,13 +497,20 @@ impl Disassembly {
             .functions
             .get(&address)
             .ok_or(DisasmError::MissingFunction(address))?;
-        if function.calls_self {
+        let count_once = recursion == RecursionPolicy::CountOnce;
+        if function.calls_self && !count_once {
             return Err(DisasmError::Recursive(address));
         }
         let mut deepest = 0;
-        let mut bounded = function.unresolved_calls.is_empty() && function.uncounted.is_empty();
+        let mut bounded = function.unresolved_calls.is_empty()
+            && function.uncounted.is_empty()
+            && !function.calls_self;
         for child in &function.calls {
-            let below = self.compose(*child, visiting, done)?;
+            if count_once && visiting.contains(child) {
+                bounded = false;
+                continue;
+            }
+            let below = self.compose(*child, recursion, visiting, done)?;
             deepest = deepest.max(below.bytes);
             bounded &= below.bounded;
         }
