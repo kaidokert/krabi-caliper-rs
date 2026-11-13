@@ -19,8 +19,9 @@
 //! - Exclusive and unprivileged loads and stores (`ldrex`, `strex`, `ldrt`, ...) are costed
 //!   as ordinary loads and stores.
 //!
-//! Floating point, DSP and other unlisted instructions are errors, as are instructions that
-//! write `pc` without being branches, and Armv7-M instructions in a Cortex-M0 trace.
+//! `mov pc, rN` and `add pc, rN` are costed as branches (3 cycles on Cortex-M0, 2..4 on
+//! Cortex-M3/M4). Floating point, DSP and other unlisted instructions are errors, as are other
+//! instructions that write `pc` (`ldr pc, [..]`) and Armv7-M instructions in a Cortex-M0 trace.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -163,10 +164,9 @@ fn armv7m_only(raw: &str, mnemonic: &str) -> bool {
         )
 }
 
-/// Whether a non-branch instruction writes `pc` (`mov pc, rN`, `add pc, rN`, `ldr pc, [..]`).
-fn writes_pc_without_branching(mnemonic: &str, operands: &str) -> bool {
-    let destination = operands.split(',').next().unwrap_or_default().trim();
-    destination == "pc" && (mnemonic == "mov" || mnemonic == "add" || mnemonic.starts_with("ldr"))
+/// Whether the instruction's first operand, its destination, is `pc`.
+fn writes_pc(operands: &str) -> bool {
+    operands.split(',').next().unwrap_or_default().trim() == "pc"
 }
 
 /// The cycles `instruction` takes on `core`. `taken` must say whether a conditional branch
@@ -189,9 +189,22 @@ pub fn instruction_cycles(
     };
     if (core == M0 && armv7m_only(&instruction.mnemonic, &mnemonic))
         || (core == M3 && mnemonic == "umaal")
-        || writes_pc_without_branching(&mnemonic, &instruction.operands)
     {
         return Err(unmodelled());
+    }
+    if writes_pc(&instruction.operands) {
+        // `mov pc, rN` and `add pc, rN` (Thumb jump-table dispatch) branch to a register
+        // value: 3 cycles on Cortex-M0, 1 plus the pipeline refill on Cortex-M3/M4. Loads
+        // into `pc` other than `pop`/`ldm` are not modelled.
+        return if mnemonic == "mov" || mnemonic == "add" {
+            Ok(if core == M0 {
+                fixed(3, "register-branch")
+            } else {
+                range(2, 4, "register-branch")
+            })
+        } else {
+            Err(unmodelled())
+        };
     }
     if conditional {
         let taken = taken.ok_or_else(|| CycleModelError::UnknownDirection {
