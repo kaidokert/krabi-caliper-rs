@@ -169,6 +169,21 @@ skips, such as a linker-script `.uninit` region or `.got`, so a size gate can
 require the list to be empty. Runtime reservations such as `riscv-rt`'s
 `.stack` and `.heap` are listed too; a gate allows those by name.
 
+To prove that a feature compiled out, or that a facility such as an
+allocator, formatting or soft float never reached an image, audit the built
+ELF:
+
+```sh
+cargo krabi-caliper audit-elf target/thumbv7m-none-eabi/release/app   --forbid-symbol core::panicking --forbid-symbol __rust_alloc   --forbid-string "panicked at" --require-symbol app::feature::enable
+```
+
+Symbol rules match substrings of demangled names, hash included, as `nm -C`
+prints them. String rules search the contents of allocated sections by
+default, which is what reaches the target; `--string-scope whole-file` also
+searches debug information and symbol tables. Every broken rule is reported,
+and the command fails if any image breaks one. `--rules` reads the same rules
+from TOML, and `host::elf_audit` offers them as a library.
+
 ## Counting instructions from QEMU execution traces
 
 `host::exec_trace` (feature `host`) counts the instructions an image executes
