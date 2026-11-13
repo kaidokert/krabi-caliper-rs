@@ -15,6 +15,17 @@ pub const fn extend_timer16(wraps: u32, counter: u16, overflow_pending: bool) ->
     (wraps.wrapping_add(pending_wrap as u32) as u64) << 16 | counter as u64
 }
 
+/// Ticks between two [`extend_timer16`] readings, and whether the 48-bit extended count wrapped
+/// between them.
+///
+/// The extended count is 48 bits (a 32-bit overflow count above the 16-bit timer), so the
+/// difference is taken modulo 2^48: correct for any interval shorter than one full period, even
+/// across the overflow count's own rollover.
+pub const fn elapsed_timer48(start: u64, end: u64) -> (u64, bool) {
+    const PERIOD_MASK: u64 = (1 << 48) - 1;
+    (end.wrapping_sub(start) & PERIOD_MASK, end < start)
+}
+
 /// Internal clock source for 16-bit Timer/Counter1 (and the identical Timer3/4/5): the CPU clock
 /// divided by a prescaler.
 ///
@@ -77,7 +88,7 @@ mod atmega2560 {
     use avr_device::atmega2560::{CPU, TC1};
     use avr_device::interrupt::Mutex;
 
-    use super::{Timer1Prescale, extend_timer16, timer_measurement};
+    use super::{Timer1Prescale, elapsed_timer48, extend_timer16, timer_measurement};
     #[cfg(feature = "stack")]
     use crate::FootprintError;
     #[cfg(feature = "stack")]
@@ -181,7 +192,7 @@ mod atmega2560 {
         }
 
         pub fn elapsed_ticks_since_start(&self) -> u64 {
-            read_timer1(self.timer).wrapping_sub(self.start_total)
+            elapsed_timer48(self.start_total, read_timer1(self.timer)).0
         }
     }
 
@@ -195,8 +206,8 @@ mod atmega2560 {
 
         #[inline(always)]
         fn elapsed(&mut self, start: Self::Instant) -> Measurement {
-            let end = read_timer1(self.timer);
-            timer_measurement(end.wrapping_sub(start), self.frequency_hz, end < start)
+            let (ticks, wrapped) = elapsed_timer48(start, read_timer1(self.timer));
+            timer_measurement(ticks, self.frequency_hz, wrapped)
         }
     }
 
@@ -370,6 +381,19 @@ mod tests {
         assert_eq!(extend_timer16(4, 7, true), (5 << 16) + 7);
         assert_eq!(extend_timer16(5, 7, false), (5 << 16) + 7);
         assert_eq!(extend_timer16(4, 0xf000, true), (4 << 16) + 0xf000);
+    }
+
+    #[test]
+    fn elapsed_ticks_survive_the_overflow_count_rollover() {
+        // Two ticks before and three after the overflow count wraps from u32::MAX to 0.
+        let start = extend_timer16(u32::MAX, 0xfffe, false);
+        let end = extend_timer16(0, 0x0003, false);
+        assert_eq!(elapsed_timer48(start, end), (5, true));
+        // An ordinary interval is unchanged.
+        let start = extend_timer16(7, 0x1000, false);
+        let end = extend_timer16(9, 0x0800, false);
+        assert_eq!(elapsed_timer48(start, end), ((2 << 16) - 0x800, false));
+        assert_eq!(elapsed_timer48(start, start), (0, false));
     }
 
     #[test]
