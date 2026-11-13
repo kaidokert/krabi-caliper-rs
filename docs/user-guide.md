@@ -174,15 +174,22 @@ allocator, formatting or soft float never reached an image, audit the built
 ELF:
 
 ```sh
-cargo krabi-caliper audit-elf target/thumbv7m-none-eabi/release/app   --forbid-symbol core::panicking --forbid-symbol __rust_alloc   --forbid-string "panicked at" --require-symbol app::feature::enable
+cargo krabi-caliper audit-elf target/thumbv7m-none-eabi/release/app \
+  --forbid-symbol core::panicking --forbid-symbol __rust_alloc \
+  --forbid-string "panicked at" --require-symbol app::feature::enable
 ```
 
-Symbol rules match substrings of demangled names, hash included, as `nm -C`
-prints them. String rules search the contents of allocated sections by
-default, which is what reaches the target; `--string-scope whole-file` also
-searches debug information and symbol tables. Every broken rule is reported,
-and the command fails if any image breaks one. `--rules` reads the same rules
-from TOML, and `host::elf_audit` offers them as a library.
+Symbol rules match substrings of a symbol's name as stored or demangled, with
+or without hashes and crate disambiguators, so `core::panicking` matches both
+legacy and v0 mangling. Only a defined symbol satisfies a required rule; any
+mention, an undefined reference included, breaks a forbidden one. String rules
+search the contents of allocated sections by default, which is what reaches
+the target; `--string-scope whole-file` also searches debug information and
+symbol tables. Every broken rule is reported, and the command fails if any
+image breaks one. The audit fails closed: a non-ELF file, an unreadable
+section, or rules with nothing to search (symbol rules on a stripped image) are
+errors. `--rules` reads the same rules from TOML, and `host::elf_audit` offers
+them as a library.
 
 ## Counting instructions from QEMU execution traces
 

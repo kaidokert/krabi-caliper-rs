@@ -3,18 +3,29 @@
 //! A firmware build can prove that a feature compiled out, or that a forbidden facility (an
 //! allocator, formatting, a soft-float helper, a panic message) never reached the image, only by
 //! looking at the image. These rules say which symbol names and byte strings must or must not
-//! appear. A rule is a substring: a symbol rule matches any symbol whose demangled name (with its
-//! hash, as `nm -C` prints it) contains the text, and a string rule matches the bytes anywhere in
-//! the scanned data.
+//! appear.
+//!
+//! A rule is a substring. A symbol rule matches a symbol if any of three forms of its name contains
+//! the text: the demangled name with hashes and crate disambiguators (as `nm -C` prints Rust
+//! names), the demangled name without them (`core::panicking::panic` for legacy and v0 mangling
+//! alike), or the name as stored. Rust names are demangled; C++ names are matched as stored.
+//! Only a defined symbol satisfies a required rule, while any mention, including an undefined
+//! reference, breaks a forbidden one. A string rule matches bytes within one scanned region; a
+//! string split across two sections is not found.
+//!
+//! The audit fails closed: a non-ELF file, a section it cannot read, and rules that would have
+//! nothing to search (symbol rules on a stripped image) are errors rather than passes.
 
 use std::fmt;
+use std::format;
 use std::fs;
 use std::path::Path;
 use std::string::{String, ToString};
-use std::vec;
 use std::vec::Vec;
 
-use object::{Object, ObjectSection, ObjectSymbol, SectionFlags, SectionKind};
+use object::{
+    BinaryFormat, Object, ObjectSection, ObjectSymbol, SectionFlags, SectionKind, SymbolKind,
+};
 use serde::{Deserialize, Serialize};
 
 use super::ElfError;
@@ -28,7 +39,8 @@ pub enum StringScope {
     /// information, symbol tables and comments are not searched.
     #[default]
     AllocatedSections,
-    /// Every byte of the file, including debug information and symbol names.
+    /// Every byte of the file, including debug information and symbol names. Compressed
+    /// sections (`SHF_COMPRESSED` debug information) are searched as stored, not decompressed.
     WholeFile,
 }
 
@@ -59,26 +71,31 @@ impl ElfAuditRules {
         Self::default()
     }
 
+    /// Requires a defined symbol whose name contains `needle`.
     pub fn require_symbol(mut self, needle: impl Into<String>) -> Self {
         self.require_symbols.push(needle.into());
         self
     }
 
+    /// Forbids any symbol, defined or referenced, whose name contains `needle`.
     pub fn forbid_symbol(mut self, needle: impl Into<String>) -> Self {
         self.forbid_symbols.push(needle.into());
         self
     }
 
+    /// Requires `needle` in the scanned bytes.
     pub fn require_string(mut self, needle: impl Into<String>) -> Self {
         self.require_strings.push(needle.into());
         self
     }
 
+    /// Forbids `needle` in the scanned bytes.
     pub fn forbid_string(mut self, needle: impl Into<String>) -> Self {
         self.forbid_strings.push(needle.into());
         self
     }
 
+    /// Sets the bytes string rules search.
     pub fn string_scope(mut self, scope: StringScope) -> Self {
         self.string_scope = scope;
         self
@@ -114,13 +131,22 @@ impl ElfAuditRules {
 
 /// One broken rule.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "kind")]
+#[serde(
+    rename_all = "kebab-case",
+    rename_all_fields = "kebab-case",
+    tag = "type"
+)]
 #[non_exhaustive]
 pub enum ElfAuditViolation {
     /// No symbol name contains the required text.
     MissingSymbol { rule: String },
-    /// A symbol name contains forbidden text; `symbol` is the first such name.
-    ForbiddenSymbol { rule: String, symbol: String },
+    /// A symbol name contains forbidden text; `symbol` is the first such name, and `defined` is
+    /// false when the image only references it.
+    ForbiddenSymbol {
+        rule: String,
+        symbol: String,
+        defined: bool,
+    },
     /// The scanned bytes do not contain the required string.
     MissingString { rule: String },
     /// The scanned bytes contain a forbidden string. `section` names the first section it was
@@ -136,8 +162,17 @@ impl fmt::Display for ElfAuditViolation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingSymbol { rule } => write!(formatter, "missing required symbol {rule:?}"),
-            Self::ForbiddenSymbol { rule, symbol } => {
-                write!(formatter, "forbidden symbol {rule:?} in {symbol}")
+            Self::ForbiddenSymbol {
+                rule,
+                symbol,
+                defined,
+            } => {
+                write!(formatter, "forbidden symbol {rule:?} in {symbol}")?;
+                if *defined {
+                    Ok(())
+                } else {
+                    formatter.write_str(" (undefined reference)")
+                }
             }
             Self::MissingString { rule } => write!(formatter, "missing required string {rule:?}"),
             Self::ForbiddenString {
@@ -160,12 +195,13 @@ impl fmt::Display for ElfAuditViolation {
 
 /// The outcome of auditing one image against one rule set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct ElfAuditReport {
     /// Every broken rule, in rule order: required symbols, forbidden symbols, required strings,
     /// forbidden strings.
     pub violations: Vec<ElfAuditViolation>,
-    /// Symbol names examined, after demangling.
+    /// Distinct symbols examined (file and section symbols excluded).
     pub symbols_examined: usize,
     /// Bytes searched by the string rules.
     pub bytes_examined: u64,
@@ -184,6 +220,15 @@ pub enum ElfAuditError {
     Elf(ElfError),
     /// A rule is empty, so it would match every image.
     EmptyRule,
+    /// The file parsed, but not as ELF.
+    NotElf,
+    /// A section that string rules must search has no readable contents (a truncated or
+    /// corrupt image).
+    UnreadableSection(String),
+    /// Rules of one kind exist but the image has nothing for them to search ("symbols" for a
+    /// stripped image, "bytes" for one without loaded sections), so they could only pass
+    /// vacuously.
+    NothingToSearch(&'static str),
 }
 
 impl fmt::Display for ElfAuditError {
@@ -191,11 +236,34 @@ impl fmt::Display for ElfAuditError {
         match self {
             Self::Elf(error) => error.fmt(formatter),
             Self::EmptyRule => formatter.write_str("an ELF audit rule is empty"),
+            Self::NotElf => formatter.write_str("not an ELF image"),
+            Self::UnreadableSection(name) => {
+                write!(formatter, "section {name:?} has no readable contents")
+            }
+            Self::NothingToSearch(what) => {
+                write!(
+                    formatter,
+                    "the image has no {what} for the audit rules to search"
+                )
+            }
         }
     }
 }
 
-impl std::error::Error for ElfAuditError {}
+impl std::error::Error for ElfAuditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Elf(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<ElfError> for ElfAuditError {
+    fn from(error: ElfError) -> Self {
+        Self::Elf(error)
+    }
+}
 
 /// Audits the ELF image at `path` against `rules`.
 pub fn audit_elf(path: &Path, rules: &ElfAuditRules) -> Result<ElfAuditReport, ElfAuditError> {
@@ -211,41 +279,71 @@ pub fn audit_elf_bytes(
     rules.validate()?;
     let object =
         object::File::parse(bytes).map_err(|error| ElfAuditError::Elf(ElfError::Object(error)))?;
+    if object.format() != BinaryFormat::Elf {
+        return Err(ElfAuditError::NotElf);
+    }
 
-    let symbols = object
-        .symbols()
-        .chain(object.dynamic_symbols())
-        .filter_map(|symbol| {
-            let name = symbol.name().ok()?;
-            (!name.is_empty()).then(|| rustc_demangle::demangle(name).to_string())
-        })
-        .collect::<Vec<_>>();
+    let mut symbols = Vec::new();
+    for symbol in object.symbols().chain(object.dynamic_symbols()) {
+        if matches!(symbol.kind(), SymbolKind::File | SymbolKind::Section) {
+            continue;
+        }
+        let raw = symbol
+            .name_bytes()
+            .map_err(|error| ElfAuditError::Elf(ElfError::Object(error)))?;
+        if raw.is_empty() {
+            continue;
+        }
+        symbols.push(AuditedSymbol::new(raw, !symbol.is_undefined()));
+    }
+    symbols.sort();
+    symbols.dedup();
+    let has_symbol_rules = !rules.require_symbols.is_empty() || !rules.forbid_symbols.is_empty();
+    if has_symbol_rules && symbols.is_empty() {
+        return Err(ElfAuditError::NothingToSearch("symbols"));
+    }
 
     // (file offset, section name, data) for every region the string rules search.
-    let regions = match rules.string_scope {
-        StringScope::WholeFile => vec![(0, None, bytes)],
-        StringScope::AllocatedSections => object
-            .sections()
-            .filter(|section| is_loaded(section.flags(), section.kind()))
-            .filter_map(|section| {
-                let (offset, _) = section.file_range()?;
-                let data = section.data().ok()?;
-                Some((offset, section.name().ok().map(str::to_string), data))
-            })
-            .collect(),
-    };
+    let mut regions = Vec::new();
+    match rules.string_scope {
+        StringScope::WholeFile => regions.push((0, None, bytes)),
+        StringScope::AllocatedSections => {
+            for section in object.sections() {
+                if !is_loaded(section.flags(), section.kind()) {
+                    continue;
+                }
+                let name = section.name().ok().map(str::to_string);
+                let unreadable =
+                    || ElfAuditError::UnreadableSection(name.clone().unwrap_or_default());
+                let (offset, _) = section.file_range().ok_or_else(unreadable)?;
+                let data = section.data().map_err(|_| unreadable())?;
+                regions.push((offset, name, data));
+            }
+        }
+    }
+    let has_string_rules = !rules.require_strings.is_empty() || !rules.forbid_strings.is_empty();
+    if has_string_rules && regions.iter().all(|(_, _, data)| data.is_empty()) {
+        return Err(ElfAuditError::NothingToSearch("bytes"));
+    }
 
     let mut violations = Vec::new();
     for rule in &rules.require_symbols {
-        if !symbols.iter().any(|symbol| symbol.contains(rule.as_str())) {
+        // Only a definition satisfies a requirement; a reference to an undefined symbol does not
+        // put its code in the image.
+        if !symbols
+            .iter()
+            .any(|symbol| symbol.defined && symbol.matches(rule))
+        {
             violations.push(ElfAuditViolation::MissingSymbol { rule: rule.clone() });
         }
     }
     for rule in &rules.forbid_symbols {
-        if let Some(symbol) = symbols.iter().find(|symbol| symbol.contains(rule.as_str())) {
+        // Any mention is forbidden, including an undefined reference.
+        if let Some(symbol) = symbols.iter().find(|symbol| symbol.matches(rule)) {
             violations.push(ElfAuditViolation::ForbiddenSymbol {
                 rule: rule.clone(),
-                symbol: symbol.clone(),
+                symbol: symbol.demangled.clone(),
+                defined: symbol.defined,
             });
         }
     }
@@ -281,6 +379,35 @@ pub fn audit_elf_bytes(
     })
 }
 
+/// One symbol name in every form a rule may be written against.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AuditedSymbol {
+    /// Demangled with hashes and crate disambiguators, as `nm -C` prints Rust names.
+    demangled: String,
+    /// Demangled without them: `core::panicking::panic` for legacy and v0 names alike.
+    plain: String,
+    /// The name as stored, so a rule may also be written in mangled form.
+    raw: String,
+    defined: bool,
+}
+
+impl AuditedSymbol {
+    fn new(raw: &[u8], defined: bool) -> Self {
+        let raw = String::from_utf8_lossy(raw).into_owned();
+        let demangled = rustc_demangle::demangle(&raw);
+        Self {
+            plain: format!("{demangled:#}"),
+            demangled: demangled.to_string(),
+            raw,
+            defined,
+        }
+    }
+
+    fn matches(&self, rule: &str) -> bool {
+        self.demangled.contains(rule) || self.plain.contains(rule) || self.raw.contains(rule)
+    }
+}
+
 /// Whether a section occupies target memory with contents from the file.
 fn is_loaded(flags: SectionFlags, kind: SectionKind) -> bool {
     const SHF_ALLOC: u64 = 0x2;
@@ -311,10 +438,21 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
+
+    #[derive(Clone, Copy)]
+    enum Sym {
+        /// A function defined in `.text`.
+        Defined,
+        /// A reference with no definition (`SHN_UNDEF`).
+        Undefined,
+        /// An `STT_FILE` source-file symbol.
+        File,
+    }
 
     /// A little-endian ELF32 relocatable image with `.text` and `.rodata` (allocated), `.comment`
     /// (not allocated), `.bss` (allocated, no file contents), and a symbol table.
-    fn image(text: &[u8], rodata: &[u8], comment: &[u8], symbols: &[&str]) -> Vec<u8> {
+    fn image(text: &[u8], rodata: &[u8], comment: &[u8], symbols: &[(&str, Sym)]) -> Vec<u8> {
         fn push_u16(out: &mut Vec<u8>, value: u16) {
             out.extend_from_slice(&value.to_le_bytes());
         }
@@ -324,19 +462,24 @@ mod tests {
 
         let mut strtab = vec![0u8];
         let mut name_offsets = Vec::new();
-        for symbol in symbols {
+        for (symbol, _) in symbols {
             name_offsets.push(strtab.len() as u32);
             strtab.extend_from_slice(symbol.as_bytes());
             strtab.push(0);
         }
         let mut symtab = vec![0u8; 16];
-        for offset in &name_offsets {
+        for (offset, (_, kind)) in name_offsets.iter().zip(symbols) {
+            let (info, shndx) = match kind {
+                Sym::Defined => (0x12, 1),   // STB_GLOBAL, STT_FUNC, in .text
+                Sym::Undefined => (0x10, 0), // STB_GLOBAL, STT_NOTYPE, SHN_UNDEF
+                Sym::File => (0x04, 0xfff1), // STB_LOCAL, STT_FILE, SHN_ABS
+            };
             push_u32(&mut symtab, *offset); // st_name
             push_u32(&mut symtab, 0); // st_value
             push_u32(&mut symtab, 0); // st_size
-            symtab.push(0x12); // STB_GLOBAL, STT_FUNC
+            symtab.push(info);
             symtab.push(0);
-            push_u16(&mut symtab, 1); // .text
+            push_u16(&mut symtab, shndx);
         }
         let names = [
             "",
@@ -372,9 +515,10 @@ mod tests {
         for (_, _, data, _, _) in &sections {
             offsets.push(52 + body.len() as u32);
             body.extend_from_slice(data);
-        }
-        while body.len() % 4 != 0 {
-            body.push(0);
+            // Keep every section, the symbol table in particular, 4-byte aligned.
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
         }
         let shoff = 52 + body.len() as u32;
 
@@ -403,7 +547,12 @@ mod tests {
             push_u32(&mut out, if index == 0 { 0 } else { offsets[index] });
             push_u32(&mut out, if *kind == 8 { 64 } else { data.len() as u32 });
             push_u32(&mut out, *link);
-            push_u32(&mut out, if *kind == 2 { 1 } else { 0 });
+            // sh_info of .symtab: one past the last local symbol (the null and file symbols).
+            let locals = 1 + symbols
+                .iter()
+                .filter(|(_, kind)| matches!(kind, Sym::File))
+                .count() as u32;
+            push_u32(&mut out, if *kind == 2 { locals } else { 0 });
             push_u32(&mut out, 1);
             push_u32(&mut out, *entsize);
         }
@@ -416,11 +565,105 @@ mod tests {
             b"org.example/feature/enabled\0",
             b"panicked at only-in-debug\0",
             &[
-                "_ZN4core9panicking5panic17h0123456789abcdefE",
-                "_ZN7example7feature6enable17h1111111111111111E",
-                "memcpy",
+                ("example_source.rs", Sym::File),
+                ("_ZN4core9panicking5panic17h0123456789abcdefE", Sym::Defined),
+                (
+                    "_ZN7example7feature6enable17h1111111111111111E",
+                    Sym::Defined,
+                ),
+                ("memcpy", Sym::Defined),
+                ("__aeabi_dadd", Sym::Undefined),
             ],
         )
+    }
+
+    #[test]
+    fn v0_names_match_without_crate_disambiguators() {
+        let v0 = image(
+            b"code",
+            b"x",
+            b"",
+            &[("_RNvNtCs1234_4core9panicking5panic", Sym::Defined)],
+        );
+        let report =
+            audit_elf_bytes(&v0, &ElfAuditRules::new().forbid_symbol("core::panicking")).unwrap();
+        let [ElfAuditViolation::ForbiddenSymbol { symbol, .. }] = &report.violations[..] else {
+            panic!("{:?}", report.violations);
+        };
+        // The reported name keeps its disambiguator; the rule matched the plain form.
+        assert!(symbol.starts_with("core["), "{symbol}");
+        // A rule may also be written against the mangled name.
+        assert!(
+            !audit_elf_bytes(&v0, &ElfAuditRules::new().forbid_symbol("_RNvNtCs"))
+                .unwrap()
+                .passed()
+        );
+    }
+
+    #[test]
+    fn only_definitions_satisfy_requirements_but_references_are_forbidden() {
+        let report = audit_elf_bytes(
+            &sample(),
+            &ElfAuditRules::new()
+                .require_symbol("__aeabi_dadd")
+                .forbid_symbol("__aeabi_d")
+                .require_symbol("example_source"),
+        )
+        .unwrap();
+        assert_eq!(
+            report.violations,
+            [
+                ElfAuditViolation::MissingSymbol {
+                    rule: "__aeabi_dadd".to_string()
+                },
+                // File symbols are not code: a source file name satisfies nothing.
+                ElfAuditViolation::MissingSymbol {
+                    rule: "example_source".to_string()
+                },
+                ElfAuditViolation::ForbiddenSymbol {
+                    rule: "__aeabi_d".to_string(),
+                    symbol: "__aeabi_dadd".to_string(),
+                    defined: false,
+                },
+            ]
+        );
+        assert_eq!(
+            report.violations[2].to_string(),
+            "forbidden symbol \"__aeabi_d\" in __aeabi_dadd (undefined reference)"
+        );
+    }
+
+    #[test]
+    fn rules_with_nothing_to_search_fail_closed() {
+        let stripped = image(b"code", b"data", b"", &[]);
+        assert!(matches!(
+            audit_elf_bytes(&stripped, &ElfAuditRules::new().forbid_symbol("std::")),
+            Err(ElfAuditError::NothingToSearch("symbols"))
+        ));
+        let empty = image(b"", b"", b"comment", &[("main", Sym::Defined)]);
+        assert!(matches!(
+            audit_elf_bytes(&empty, &ElfAuditRules::new().forbid_string("panicked")),
+            Err(ElfAuditError::NothingToSearch("bytes"))
+        ));
+        // Without rules of that kind, an empty source is fine.
+        assert!(
+            audit_elf_bytes(&stripped, &ElfAuditRules::new().forbid_string("panicked"))
+                .unwrap()
+                .passed()
+        );
+    }
+
+    #[test]
+    fn reports_serialize_in_kebab_case() {
+        let report =
+            audit_elf_bytes(&sample(), &ElfAuditRules::new().forbid_string("code")).unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["symbols-examined"], 4);
+        assert_eq!(json["string-scope"], "allocated-sections");
+        assert_eq!(json["violations"][0]["type"], "forbidden-string");
+        assert_eq!(json["violations"][0]["file-offset"], 0x36);
+        let back: ElfAuditReport = serde_json::from_value(json).unwrap();
+        assert_eq!(back, report);
     }
 
     #[test]
@@ -429,10 +672,11 @@ mod tests {
             .require_symbol("example::feature::enable")
             .require_symbol("memcpy")
             .forbid_symbol("std::")
-            .forbid_symbol("__aeabi_d");
+            .forbid_symbol("__aeabi_f");
         let report = audit_elf_bytes(&sample(), &rules).unwrap();
         assert!(report.passed(), "{:?}", report.violations);
-        assert_eq!(report.symbols_examined, 3);
+        // The file symbol is not counted.
+        assert_eq!(report.symbols_examined, 4);
 
         // The demangled form, including the hash, is what a rule sees.
         let rules = ElfAuditRules::new()
@@ -449,6 +693,7 @@ mod tests {
                 ElfAuditViolation::ForbiddenSymbol {
                     rule: "core::panicking".to_string(),
                     symbol: "core::panicking::panic::h0123456789abcdef".to_string(),
+                    defined: true,
                 },
             ]
         );

@@ -387,7 +387,12 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             json,
         } => {
             let mut audit_rules = match rules {
-                Some(path) => toml::from_str::<ElfAuditRules>(&fs::read_to_string(path)?)?,
+                Some(path) => {
+                    let text = fs::read_to_string(&path)
+                        .map_err(|error| format!("{}: {error}", path.display()))?;
+                    toml::from_str::<ElfAuditRules>(&text)
+                        .map_err(|error| format!("{}: {error}", path.display()))?
+                }
                 None => ElfAuditRules::new(),
             };
             audit_rules.require_symbols.extend(require_symbol);
@@ -400,10 +405,14 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
                     AuditStringScope::WholeFile => StringScope::WholeFile,
                 };
             }
+            if audit_rules == ElfAuditRules::new().string_scope(audit_rules.string_scope) {
+                return Err("audit-elf needs at least one rule".into());
+            }
             let mut passed = true;
             let mut reports = Vec::new();
             for path in elf {
-                let report = audit_elf(&path, &audit_rules)?;
+                let report = audit_elf(&path, &audit_rules)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
                 if report.passed() {
                     println!("{}: pass", path.display());
                 } else {
