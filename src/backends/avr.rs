@@ -15,18 +15,26 @@ pub const fn extend_timer16(wraps: u32, counter: u16, overflow_pending: bool) ->
     (wraps.wrapping_add(pending_wrap as u32) as u64) << 16 | counter as u64
 }
 
-/// Timer/Counter clock source for a 16-bit AVR timer: the CPU clock divided by a prescaler.
+/// Internal clock source for 16-bit Timer/Counter1 (and the identical Timer3/4/5): the CPU clock
+/// divided by a prescaler.
 ///
-/// A smaller divisor gives finer ticks but wraps sooner. At `/1` one tick is one CPU cycle and a
-/// 16 MHz part wraps every 4.096 ms, so long intervals depend on the overflow ISR.
+/// A smaller divisor gives finer ticks but wraps sooner. Software wrap extension needs the
+/// overflow ISR to run within 0x8000 ticks of each wrap: about 2.1 s at `/1024` on a 16 MHz part,
+/// but only 32,768 CPU cycles at `/1`. Interrupts disabled for longer than that, or a long ISR
+/// elsewhere (AVR ISRs don't nest), make a measurement silently short by 65,536 ticks per late
+/// wrap. Choose the largest divisor that still resolves the operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Timer1Prescale {
-    /// The CPU clock itself; one tick per CPU cycle.
+    /// The CPU clock itself: one tick per CPU cycle.
     Div1,
+    /// The CPU clock divided by 8.
     Div8,
+    /// The CPU clock divided by 64.
     Div64,
+    /// The CPU clock divided by 256.
     Div256,
+    /// The CPU clock divided by 1024.
     Div1024,
 }
 
@@ -42,11 +50,15 @@ impl Timer1Prescale {
         }
     }
 
-    /// The timer tick frequency for a CPU clock, or `None` if the clock is unknown.
+    /// The exact timer tick frequency for a CPU clock.
+    ///
+    /// `None` if the clock is unknown, or if the divisor does not divide it exactly (20 MHz / 1024
+    /// is 19,531.25 Hz), since measurement metadata would otherwise carry a rounded frequency.
     pub const fn tick_frequency_hz(self, cpu_hz: Option<u64>) -> Option<u64> {
+        let divisor = self.divisor() as u64;
         match cpu_hz {
-            Some(hz) => Some(hz / self.divisor() as u64),
-            None => None,
+            Some(hz) if hz != 0 && hz % divisor == 0 => Some(hz / divisor),
+            _ => None,
         }
     }
 }
@@ -106,8 +118,9 @@ mod atmega2560 {
     /// The application owns the CPU clock and supplies the resulting timer
     /// tick frequency. It must install an overflow ISR that calls
     /// [`timer1_overflow`] and enable global interrupts before relying on
-    /// software wrap extension. This adapter never changes global interrupt
-    /// state.
+    /// software wrap extension, and that ISR must run within 0x8000 ticks of
+    /// each wrap (see [`Timer1Prescale`]). This adapter never changes global
+    /// interrupt state.
     pub struct Timer1Counter<'timer> {
         timer: &'timer mut TC1,
         frequency_hz: Option<u64>,
@@ -121,11 +134,24 @@ mod atmega2560 {
             Self::start(timer, Timer1Prescale::Div1024, frequency_hz)
         }
 
-        /// Stops and configures Timer1, clears stale overflow state, enables
-        /// its overflow interrupt, then starts it with `prescale`.
+        /// Stops and configures Timer1 at `prescale`, deriving the tick
+        /// frequency from the CPU clock with [`Timer1Prescale::tick_frequency_hz`].
+        pub fn start_with_cpu_clock(
+            timer: &'timer mut TC1,
+            prescale: Timer1Prescale,
+            cpu_hz: Option<u64>,
+        ) -> Self {
+            Self::start(timer, prescale, prescale.tick_frequency_hz(cpu_hz))
+        }
+
+        /// Stops and configures Timer1, zeroes it, clears stale overflow
+        /// state, enables its overflow interrupt, then starts it with
+        /// `prescale`.
         ///
-        /// `frequency_hz` is the resulting tick frequency, which
-        /// [`Timer1Prescale::tick_frequency_hz`] derives from the CPU clock.
+        /// `frequency_hz` labels every measurement, so it must be the tick
+        /// frequency at `prescale`: `prescale.tick_frequency_hz(cpu_hz)`, or
+        /// `None` if unknown. Prefer [`start_with_cpu_clock`](Self::start_with_cpu_clock),
+        /// which derives it.
         pub fn start(
             timer: &'timer mut TC1,
             prescale: Timer1Prescale,
@@ -133,6 +159,9 @@ mod atmega2560 {
         ) -> Self {
             timer.tccr1b.write(|writer| writer.cs1().no_clock());
             timer.tccr1a.reset();
+            // A stale count near 0xffff would wrap almost at once, which at `/1` leaves the
+            // overflow ISR almost no margin.
+            timer.tcnt1.write(|writer| writer.bits(0));
             avr_device::interrupt::free(|cs| TIMER1_WRAPS.borrow(cs).set(0));
             timer.tifr1.write(|writer| writer.tov1().set_bit());
             timer.timsk1.write(|writer| writer.toie1().set_bit());
@@ -356,7 +385,18 @@ mod tests {
             assert_eq!(prescale.divisor(), divisor);
             assert_eq!(prescale.tick_frequency_hz(Some(16_000_000)), Some(hz));
             assert_eq!(prescale.tick_frequency_hz(None), None);
+            assert_eq!(prescale.tick_frequency_hz(Some(0)), None);
         }
+        // A clock the divisor doesn't divide exactly has no exact tick frequency.
+        assert_eq!(
+            Timer1Prescale::Div1024.tick_frequency_hz(Some(20_000_000)),
+            None
+        );
+        assert_eq!(
+            Timer1Prescale::Div8.tick_frequency_hz(Some(20_000_000)),
+            Some(2_500_000)
+        );
+        assert_eq!(Timer1Prescale::Div256.tick_frequency_hz(Some(100)), None);
     }
 
     #[test]
