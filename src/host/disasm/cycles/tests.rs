@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 fn instruction(mnemonic: &str, operands: &str) -> Instruction {
     Instruction {
@@ -72,6 +72,35 @@ fn arithmetic_and_system_classes() {
     ));
 }
 
+#[test]
+fn rejects_what_the_core_or_model_cannot_cost() {
+    let rejected = |core, mnemonic: &str, operands: &str| {
+        matches!(
+            instruction_cycles(core, &instruction(mnemonic, operands), None),
+            Err(CycleModelError::Unmodelled { function: None, .. })
+        )
+    };
+    // Armv7-M instructions in a Cortex-M0 trace.
+    for mnemonic in [
+        "udiv", "tbb", "ldrd", "ite", "cbz", "movw", "clz", "mla", "umull",
+    ] {
+        assert!(rejected(M0, mnemonic, "r0, r1, r2"), "{mnemonic}");
+    }
+    assert!(rejected(M0, "ldr.w", "r0, [r1]"));
+    assert!(rejected(M3, "umaal", "r0, r1, r2, r3"));
+    // Instructions that write pc without being branches.
+    assert!(rejected(M0, "mov", "pc, r1"));
+    assert!(rejected(M4, "add", "pc, r2"));
+    assert!(rejected(M4, "ldr.w", "pc, [r0, r1, lsl #2]"));
+    // Ordinary forms stay modelled.
+    assert_eq!(cost(M0, "mov", "r0, r1", None), (1, 1));
+    assert_eq!(cost(M4, "ldr", "r0, [pc, #0x4]", None), (2, 3));
+    assert_eq!(cost(M4, "ldmdb", "r0, {r1, r2}", None), (3, 3));
+    assert_eq!(cost(M0, "pop", "{r4, r5}", None), (3, 3));
+    // `ble` is a conditional branch, not `bl`.
+    assert_eq!(cost(M0, "ble", "0x20", Some(true)), (3, 3));
+}
+
 const NM: &str = "00000100 00000010 T f\n";
 const OBJDUMP: &str = "
 00000100 <f>:
@@ -118,4 +147,13 @@ fn estimates_follow_the_trace() {
         estimate_cycles(M4, &d, &[]).unwrap(),
         CycleEstimate::default()
     );
+    // A successor that is neither the target nor the next instruction (an exception entry,
+    // say) is an error rather than a taken branch.
+    assert!(matches!(
+        estimate_cycles(M4, &d, &[0x106, 0x400]),
+        Err(CycleModelError::UnexpectedSuccessor {
+            address: 0x106,
+            next: 0x400
+        })
+    ));
 }

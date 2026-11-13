@@ -256,12 +256,24 @@ let estimate = estimate_cycles(CortexMCore::M4, &image, &pcs)?;
 println!("{}..{} cycles", estimate.minimum, estimate.maximum);
 ```
 
-The timings assume zero-wait-state memory, no bus contention and no interrupts.
-A range covers what a listing cannot decide: pipeline refill after a branch, the
-Cortex-M0 multiplier option, and early-terminating divides. A conditional
-branch is taken when the next traced PC is not the following instruction.
-Instructions outside the model, such as floating point, DSP and exclusives, are
-errors rather than guesses. The result also gives per-address cycles and timing
+The PCs must list every executed instruction: trace with `-d exec,nochain` and
+`one-insn-per-tb=on` (see `host::exec_trace`), since plain `-d exec` logs only
+block starts. The timings assume zero-wait-state memory, no bus contention and
+no interrupts. A range covers what a listing cannot decide: pipeline refill
+after a branch, the Cortex-M0 multiplier option, and early-terminating divides.
+`M0` means Cortex-M0, not M0+, whose timings differ. A conditional branch's
+direction comes from the next PC; a successor that is neither its target nor
+the next instruction (an exception, say) is an error. Floating point, DSP,
+non-branch writes to `pc` and Armv7-M instructions on `M0` are errors rather
+than guesses.
+
+The figures follow the Technical Reference Manuals with documented deviations,
+so they are a model estimate rather than a guaranteed bracket. On M3/M4,
+pipelined adjacent loads can cost less than the per-load minimum, and the M3
+table-branch and long multiply-accumulate ranges are the model's own.
+Condition-failed instructions inside IT blocks are charged as executed.
+Exclusive loads and stores are costed as ordinary ones. The module
+documentation lists the deviations in full. The result also gives per-address cycles and timing
 classes, branch-direction counts and a mnemonic histogram. Parts with flash
 wait states, caches or accelerators run differently, so measure on them.
 

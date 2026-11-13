@@ -1,15 +1,26 @@
 //! An analytical cycle model for Cortex-M0, Cortex-M3 and Cortex-M4 instruction sequences.
 //!
-//! Each executed instruction gets a cycle range from the core's published instruction timings
-//! under these assumptions: zero-wait-state memory, no bus contention, no interrupts or
-//! exceptions, and no stalls beyond those the timings list. A range covers what the listing
-//! alone cannot decide (pipeline refill after a branch, multiplier configuration on
-//! Cortex-M0, early-terminating divides). The sum over a dynamic trace brackets the sequence
-//! on such a core; real parts with flash wait states, caches or accelerators run slower or
-//! differently, so measure there.
+//! Each executed instruction gets a cycle range under these assumptions: zero-wait-state
+//! memory, no bus contention, no interrupts or exceptions, and every traced instruction
+//! executed. A range covers what the listing alone cannot decide (pipeline refill after a
+//! branch, multiplier configuration on Cortex-M0, early-terminating divides). Real parts with
+//! flash wait states, caches or accelerators run slower or differently, so measure there.
 //!
-//! Instructions outside the model (floating point, DSP, exclusives, and anything else not
-//! listed) are errors, not guesses.
+//! The figures follow the Technical Reference Manuals' instruction timings with these known
+//! deviations, so the sum is a model estimate, not a guaranteed bracket:
+//!
+//! - Cortex-M3/M4 loads cost 2..3 each; adjacent loads and stores that pipeline can cost 1, so
+//!   load-heavy code can run below the minimum.
+//! - Cortex-M3 `tbb`/`tbh` cost 6..8 (the TRM gives 2 plus refill), and the Cortex-M3
+//!   long multiply-accumulate ranges are the model's own (`umlal` 4..6, others 5..7).
+//! - `isb` on Cortex-M3/M4 is 1..4 without the TRM's refetch term.
+//! - An instruction whose condition fails inside an IT block still appears in a QEMU
+//!   one-instruction-per-block trace and is charged as if it executed.
+//! - Exclusive and unprivileged loads and stores (`ldrex`, `strex`, `ldrt`, ...) are costed
+//!   as ordinary loads and stores.
+//!
+//! Floating point, DSP and other unlisted instructions are errors, as are instructions that
+//! write `pc` without being branches, and Armv7-M instructions in a Cortex-M0 trace.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,7 +28,7 @@ use std::string::{String, ToString};
 
 use super::thumb::{
     conditional_branch, is_long_multiply, is_multiply, is_simple_alu, normalize_mnemonic,
-    register_count,
+    register_count, target_address,
 };
 use super::{Disassembly, Instruction};
 
@@ -25,9 +36,12 @@ use super::{Disassembly, Instruction};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum CortexMCore {
-    /// Armv6-M; multiplies span the 1-cycle and 32-cycle multiplier options.
+    /// Cortex-M0 (not Cortex-M0+, whose branch and load timings differ); multiplies span the
+    /// 1-cycle and 32-cycle multiplier options.
     M0,
+    /// Cortex-M3.
     M3,
+    /// Cortex-M4; floating-point and DSP instructions are not modelled.
     M4,
 }
 
@@ -75,6 +89,10 @@ pub enum CycleModelError {
     UnknownDirection { address: u64, mnemonic: String },
     /// A traced PC has no decoded instruction.
     UnknownPc(u64),
+    /// The PC after a conditional branch is neither its target nor the next instruction (an
+    /// exception, a gap in the trace, or a wrongly inferred instruction size).
+    #[non_exhaustive]
+    UnexpectedSuccessor { address: u64, next: u64 },
 }
 
 impl fmt::Display for CycleModelError {
@@ -101,14 +119,59 @@ impl fmt::Display for CycleModelError {
             Self::UnknownPc(pc) => {
                 write!(formatter, "traced PC {pc:#x} has no decoded instruction")
             }
+            Self::UnexpectedSuccessor { address, next } => write!(
+                formatter,
+                "conditional branch at {address:#x} is followed by {next:#x}, neither its target \
+                 nor the next instruction"
+            ),
         }
     }
 }
 
 impl std::error::Error for CycleModelError {}
 
+/// Armv7-M instructions (by normalized mnemonic) a Cortex-M0 cannot execute.
+fn armv7m_only(raw: &str, mnemonic: &str) -> bool {
+    raw.ends_with(".w")
+        || mnemonic.starts_with("it")
+        || matches!(
+            mnemonic,
+            "udiv"
+                | "sdiv"
+                | "tbb"
+                | "tbh"
+                | "ldrd"
+                | "strd"
+                | "cbz"
+                | "cbnz"
+                | "movw"
+                | "movt"
+                | "clz"
+                | "mla"
+                | "mls"
+                | "umull"
+                | "smull"
+                | "umlal"
+                | "smlal"
+                | "umaal"
+                | "ubfx"
+                | "sbfx"
+                | "bfi"
+                | "bfc"
+                | "rbit"
+                | "orn"
+        )
+}
+
+/// Whether a non-branch instruction writes `pc` (`mov pc, rN`, `add pc, rN`, `ldr pc, [..]`).
+fn writes_pc_without_branching(mnemonic: &str, operands: &str) -> bool {
+    let destination = operands.split(',').next().unwrap_or_default().trim();
+    destination == "pc" && (mnemonic == "mov" || mnemonic == "add" || mnemonic.starts_with("ldr"))
+}
+
 /// The cycles `instruction` takes on `core`. `taken` must say whether a conditional branch
-/// (including `cbz`/`cbnz`) was taken; it is ignored for anything else.
+/// (including `cbz`/`cbnz`) was taken; it is ignored for anything else. An `Unmodelled` error
+/// from here has no `function`; [`estimate_cycles`] fills it in.
 pub fn instruction_cycles(
     core: CortexMCore,
     instruction: &Instruction,
@@ -119,6 +182,17 @@ pub fn instruction_cycles(
     let range = CycleCost::range;
     let conditional = conditional_branch(&instruction.mnemonic).is_some();
     let mnemonic = normalize_mnemonic(&instruction.mnemonic);
+    let unmodelled = || CycleModelError::Unmodelled {
+        address: instruction.address,
+        mnemonic: instruction.mnemonic.clone(),
+        function: None,
+    };
+    if (core == M0 && armv7m_only(&instruction.mnemonic, &mnemonic))
+        || (core == M3 && mnemonic == "umaal")
+        || writes_pc_without_branching(&mnemonic, &instruction.operands)
+    {
+        return Err(unmodelled());
+    }
     if conditional {
         let taken = taken.ok_or_else(|| CycleModelError::UnknownDirection {
             address: instruction.address,
@@ -267,11 +341,7 @@ pub fn instruction_cycles(
     if is_simple_alu(&mnemonic) {
         return Ok(fixed(1, "alu"));
     }
-    Err(CycleModelError::Unmodelled {
-        address: instruction.address,
-        mnemonic: instruction.mnemonic.clone(),
-        function: None,
-    })
+    Err(unmodelled())
 }
 
 /// The modelled cycles of one address over a trace.
@@ -300,9 +370,13 @@ pub struct CycleEstimate {
 
 /// Costs the executed PCs `pcs` (in execution order, Thumb bit cleared) on `core`.
 ///
-/// A conditional branch counts as taken when the next PC in `pcs` is not the following
-/// instruction; the last PC of the sequence has no successor and counts as not taken. Sums
-/// saturate.
+/// `pcs` must list every executed instruction (QEMU `-d exec,nochain` with
+/// `one-insn-per-tb=on`; plain `-d exec` logs only block starts). A conditional branch is not
+/// taken when the next PC is the following instruction, taken when it is the branch target,
+/// and an [`CycleModelError::UnexpectedSuccessor`] otherwise (an exception, a trace gap, or a
+/// wrongly inferred size), so exceptions are never silently costed. The last PC of the
+/// sequence has no successor and counts as not taken, which biases the estimate low by at
+/// most one refill. Sums saturate.
 pub fn estimate_cycles(
     core: CortexMCore,
     disassembly: &Disassembly,
@@ -315,13 +389,23 @@ pub fn estimate_cycles(
             .get(&pc)
             .ok_or(CycleModelError::UnknownPc(pc))?;
         let next_pc = pcs.get(index.saturating_add(1)).copied();
-        let taken = conditional_branch(&instruction.mnemonic).map(|_| {
-            next_pc.is_some_and(|next| {
-                next != instruction
-                    .address
-                    .saturating_add(u64::from(instruction.size))
-            })
-        });
+        let taken = match (conditional_branch(&instruction.mnemonic), next_pc) {
+            (None, _) => None,
+            (Some(_), None) => Some(false),
+            (Some(_), Some(next)) => {
+                if next
+                    == instruction
+                        .address
+                        .saturating_add(u64::from(instruction.size))
+                {
+                    Some(false)
+                } else if target_address(&instruction.operands) == Some(next) {
+                    Some(true)
+                } else {
+                    return Err(CycleModelError::UnexpectedSuccessor { address: pc, next });
+                }
+            }
+        };
         match taken {
             Some(true) => estimate.taken_conditional = estimate.taken_conditional.saturating_add(1),
             Some(false) => {
