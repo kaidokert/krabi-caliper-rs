@@ -44,7 +44,8 @@ Target facilities include:
 - allocation-free measurements, samples, summaries, and repeated benchmarks;
 - stack painting through an application-supplied memory contract;
 - Cortex-M SysTick and DWT, RISC-V cycle/instruction CSRs, and ATmega2560
-  Timer1 adapters;
+  Timer1 adapters (Timer1 at a chosen prescaler, `Timer1Prescale`, from `/1`
+  for one tick per CPU cycle to `/1024` for long intervals);
 - the versioned `EM_*` event protocol over formatting sinks, `ufmt`, RTT,
   semihosting, or application-owned UART output;
 - balanced paired acquisition and deterministic fixtures.
