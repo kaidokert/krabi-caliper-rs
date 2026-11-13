@@ -301,6 +301,45 @@ fn composed_stack_follows_the_deepest_chain() {
         mutual.composed_stack_upper_with(0x140, RecursionPolicy::Reject),
         Err(DisasmError::Recursive(0x140))
     ));
+    // A cycle reached two ways: r calls a and b, a calls b and d, b calls a. Whichever way
+    // the walk enters the cycle {a, b}, both frames count, plus d below them.
+    let entered_twice = Disassembly::parse(
+        "00000100 00000004 T r\n00000110 00000004 T a\n00000120 00000004 T b\n00000130 00000002 T d\n",
+        "00000100 <r>:\n 100: \tbl\t0x110 <a>\n 102: \tbl\t0x120 <b>\n\
+         00000110 <a>:\n 110: \tpush\t{r7, lr}\n 112: \tbl\t0x120 <b>\n 114: \tbl\t0x130 <d>\n\
+         00000120 <b>:\n 120: \tpush\t{r4, r5, r7, lr}\n 122: \tbl\t0x110 <a>\n\
+         00000130 <d>:\n 130: \tsub\tsp, #0x40\n",
+    )
+    .unwrap();
+    for root in [0x100, 0x110, 0x120] {
+        assert_eq!(
+            entered_twice
+                .composed_stack_upper_with(root, RecursionPolicy::CountOnce)
+                .unwrap(),
+            ComposedStack {
+                bytes: 8 + 16 + 0x40,
+                bounded: false
+            },
+            "{root:#x}"
+        );
+    }
+    assert_eq!(
+        entered_twice
+            .composed_stack_upper_with(0x130, RecursionPolicy::CountOnce)
+            .unwrap(),
+        ComposedStack {
+            bytes: 0x40,
+            bounded: true
+        }
+    );
+    // Without recursion, both policies agree.
+    for root in [0x100, 0x120] {
+        assert_eq!(
+            d.composed_stack_upper_with(root, RecursionPolicy::CountOnce)
+                .unwrap(),
+            d.composed_stack_upper(root).unwrap()
+        );
+    }
     assert!(matches!(
         Disassembly::parse(NM, "nothing here\n"),
         Err(DisasmError::Empty)

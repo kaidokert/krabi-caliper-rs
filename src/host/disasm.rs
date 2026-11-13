@@ -197,11 +197,11 @@ pub enum UnresolvedCallPolicy {
 pub enum RecursionPolicy {
     /// Recursion is a [`DisasmError::Recursive`] error.
     Reject,
-    /// Each function's frame counts once per chain: a call back into a function already on
-    /// the chain, or a `bl`/`blx` to the caller's own start, adds nothing. The result's
-    /// `bounded` is false whenever this happened, since the real depth is unknown. Useful
-    /// when recursion is bounded in practice (library sorts, for example) and an estimate
-    /// is still wanted.
+    /// Every function in a recursive cycle counts once: the functions of each strongly
+    /// connected component of the call graph are summed as one frame, and a `bl`/`blx` to a
+    /// function's own start adds nothing. The result's `bounded` is false whenever a chain
+    /// passes through recursion, since the real depth is unknown. Useful when recursion is
+    /// bounded in practice (library sorts, for example) and an estimate is still wanted.
     CountOnce,
 }
 
@@ -475,15 +475,71 @@ impl Disassembly {
         root: u64,
         recursion: RecursionPolicy,
     ) -> Result<ComposedStack, DisasmError> {
-        let mut visiting = BTreeSet::new();
-        let mut done = BTreeMap::new();
-        self.compose(root, recursion, &mut visiting, &mut done)
+        match recursion {
+            RecursionPolicy::Reject => {
+                let mut visiting = BTreeSet::new();
+                let mut done = BTreeMap::new();
+                self.compose(root, &mut visiting, &mut done)
+            }
+            RecursionPolicy::CountOnce => self.compose_components(root),
+        }
+    }
+
+    /// Composes over strongly connected components: each component's frame is the sum of its
+    /// members' frames (every function in a cycle once), plus its deepest callee component.
+    fn compose_components(&self, root: u64) -> Result<ComposedStack, DisasmError> {
+        let mut components = Components {
+            disassembly: self,
+            index: BTreeMap::new(),
+            low: BTreeMap::new(),
+            stack: Vec::new(),
+            on_stack: BTreeSet::new(),
+            component_of: BTreeMap::new(),
+            members: Vec::new(),
+        };
+        components.visit(root)?;
+        // Tarjan's algorithm emits callee components before their callers.
+        let mut composed: Vec<ComposedStack> = Vec::with_capacity(components.members.len());
+        for (id, members) in components.members.iter().enumerate() {
+            let mut frames = 0u64;
+            let mut deepest = 0;
+            let mut bounded = members.len() == 1;
+            for address in members {
+                let function = self
+                    .functions
+                    .get(address)
+                    .ok_or(DisasmError::MissingFunction(*address))?;
+                frames = frames.saturating_add(function.local_stack_upper);
+                bounded &= function.unresolved_calls.is_empty()
+                    && function.uncounted.is_empty()
+                    && !function.calls_self;
+                for child in &function.calls {
+                    let Some(&child_id) = components.component_of.get(child) else {
+                        return Err(DisasmError::MissingFunction(*child));
+                    };
+                    if child_id != id {
+                        let below = composed[child_id];
+                        deepest = deepest.max(below.bytes);
+                        bounded &= below.bounded;
+                    }
+                }
+            }
+            composed.push(ComposedStack {
+                bytes: frames.saturating_add(deepest),
+                bounded,
+            });
+        }
+        components
+            .component_of
+            .get(&root)
+            .and_then(|id| composed.get(*id))
+            .copied()
+            .ok_or(DisasmError::MissingFunction(root))
     }
 
     fn compose(
         &self,
         address: u64,
-        recursion: RecursionPolicy,
         visiting: &mut BTreeSet<u64>,
         done: &mut BTreeMap<u64, ComposedStack>,
     ) -> Result<ComposedStack, DisasmError> {
@@ -497,20 +553,13 @@ impl Disassembly {
             .functions
             .get(&address)
             .ok_or(DisasmError::MissingFunction(address))?;
-        let count_once = recursion == RecursionPolicy::CountOnce;
-        if function.calls_self && !count_once {
+        if function.calls_self {
             return Err(DisasmError::Recursive(address));
         }
         let mut deepest = 0;
-        let mut bounded = function.unresolved_calls.is_empty()
-            && function.uncounted.is_empty()
-            && !function.calls_self;
+        let mut bounded = function.unresolved_calls.is_empty() && function.uncounted.is_empty();
         for child in &function.calls {
-            if count_once && visiting.contains(child) {
-                bounded = false;
-                continue;
-            }
-            let below = self.compose(*child, recursion, visiting, done)?;
+            let below = self.compose(*child, visiting, done)?;
             deepest = deepest.max(below.bytes);
             bounded &= below.bounded;
         }
@@ -521,6 +570,59 @@ impl Disassembly {
         };
         done.insert(address, composed);
         Ok(composed)
+    }
+}
+
+/// Tarjan's strongly connected components over the static call graph reachable from a root.
+struct Components<'a> {
+    disassembly: &'a Disassembly,
+    index: BTreeMap<u64, usize>,
+    low: BTreeMap<u64, usize>,
+    stack: Vec<u64>,
+    on_stack: BTreeSet<u64>,
+    component_of: BTreeMap<u64, usize>,
+    members: Vec<Vec<u64>>,
+}
+
+impl Components<'_> {
+    fn visit(&mut self, address: u64) -> Result<(), DisasmError> {
+        let order = self.index.len();
+        self.index.insert(address, order);
+        self.low.insert(address, order);
+        self.stack.push(address);
+        self.on_stack.insert(address);
+        let function = self
+            .disassembly
+            .functions
+            .get(&address)
+            .ok_or(DisasmError::MissingFunction(address))?;
+        for child in &function.calls {
+            let reach = if let Some(&seen) = self.index.get(child) {
+                self.on_stack.contains(child).then_some(seen)
+            } else {
+                self.visit(*child)?;
+                self.low.get(child).copied()
+            };
+            if let Some(reach) = reach {
+                let low = self.low.entry(address).or_insert(order);
+                *low = (*low).min(reach);
+            }
+        }
+        if self.low.get(&address) == Some(&order) {
+            let id = self.members.len();
+            let mut members = Vec::new();
+            while let Some(member) = self.stack.pop() {
+                self.on_stack.remove(&member);
+                self.component_of.insert(member, id);
+                members.push(member);
+                if member == address {
+                    break;
+                }
+            }
+            members.sort_unstable();
+            self.members.push(members);
+        }
+        Ok(())
     }
 }
 
