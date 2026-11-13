@@ -75,6 +75,30 @@ profile = "qemu-m3"
 case-set = "smoke"
 ```
 
+Presets are `qemu-cortex-m0`, `qemu-cortex-m3`, `qemu-cortex-m4`,
+`qemu-riscv32-sifive-e`, `simavr-atmega2560` and `probe-rs-rtt`. A profile
+field overrides the preset's value.
+
+`probe-rs-rtt` runs an image on physical hardware with `probe-rs run` and reads
+the event protocol over RTT. Its chip and probe come from the `PROBE_RS_CHIP`
+and `PROBE_RS_PROBE` bindings (a venue's `bindings`, or the environment), and
+both are required, so an image never runs on whichever probe is found first.
+The target triple depends on the chip, so the profile names it:
+
+```toml
+[venues.bench]
+bindings = { PROBE_RS_CHIP = "STM32L431KCUx", PROBE_RS_PROBE = "0483:374f:000000000000" }
+
+[profiles.l431]
+preset = "probe-rs-rtt"
+target = "thumbv7em-none-eabihf"
+venue = "bench"
+```
+
+The run ends at the `EM_OUTCOME` event, and probe-rs is interrupted rather
+than killed so it releases the probe. The bindings are needed only where the
+case runs, not by `build --output`.
+
 Then validate or run it:
 
 ```sh

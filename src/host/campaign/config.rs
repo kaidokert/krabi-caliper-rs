@@ -562,6 +562,11 @@ pub enum RunnerPreset {
     QemuCortexM4,
     QemuRiscv32SifiveE,
     SimavrAtmega2560,
+    /// A physical target flashed and run by `probe-rs run`, reporting over RTT. The chip and
+    /// probe are bindings, `PROBE_RS_CHIP` and `PROBE_RS_PROBE`, so a bench with several
+    /// probes attached never runs an image on whichever probe happens to be found first. The
+    /// target triple depends on the chip, so the profile sets `target`.
+    ProbeRsRtt,
 }
 
 #[derive(Clone, Debug)]
@@ -652,9 +657,19 @@ impl RunnerProfile {
         let target = self
             .target
             .clone()
-            .or_else(|| preset.as_ref().map(|value| value.target.to_string()))
+            .or_else(|| {
+                preset
+                    .as_ref()
+                    .and_then(|value| value.target.map(str::to_string))
+            })
             .ok_or_else(|| {
-                CampaignError::InvalidConfig("runner profile requires target or preset".to_string())
+                CampaignError::InvalidConfig(match self.preset {
+                    Some(_) => format!(
+                        "runner profile {profile_name:?} requires target: its preset spans \
+                         several targets"
+                    ),
+                    None => "runner profile requires target or preset".to_string(),
+                })
             })?;
         let executable = self
             .executable
@@ -731,7 +746,11 @@ impl RunnerProfile {
             prepare: self.prepare.clone().unwrap_or_default(),
             build_features: self.build_features.clone().unwrap_or_default(),
             completion_marker,
-            completion_action: self.completion_action.unwrap_or_default(),
+            completion_action: self.completion_action.unwrap_or_else(|| {
+                preset
+                    .as_ref()
+                    .map_or_else(CompletionAction::default, |value| value.completion_action)
+            }),
             board: self.board.clone().or_else(|| {
                 preset
                     .as_ref()
@@ -747,7 +766,11 @@ impl RunnerProfile {
                     .as_ref()
                     .and_then(|value| value.transport.map(str::to_string))
             }),
-            probe: self.probe.clone(),
+            probe: self.probe.clone().or_else(|| {
+                preset
+                    .as_ref()
+                    .and_then(|value| value.probe.map(str::to_string))
+            }),
             clock_frequency_hz,
             host_usb_path: self.host_usb_path.clone(),
             require_external_measurements: self.require_external_measurements.unwrap_or(false),
@@ -798,14 +821,17 @@ fn validate_constant_time_config(policy: &ConstantTimeConfig) -> Result<(), Camp
 
 struct PresetValues {
     runner: RunnerKind,
-    target: &'static str,
+    /// `None` when the preset spans several targets and the profile must choose.
+    target: Option<&'static str>,
     executable: &'static str,
     args: &'static [&'static str],
     completion_marker: Option<&'static str>,
+    completion_action: CompletionAction,
     artifact_extension: &'static str,
     board: Option<&'static str>,
     mcu: Option<&'static str>,
     transport: Option<&'static str>,
+    probe: Option<&'static str>,
     clock_frequency_hz: Option<u64>,
 }
 
@@ -813,7 +839,7 @@ fn preset_values(preset: RunnerPreset) -> PresetValues {
     match preset {
         RunnerPreset::QemuCortexM0 => PresetValues {
             runner: RunnerKind::Command,
-            target: "thumbv6m-none-eabi",
+            target: Some("thumbv6m-none-eabi"),
             executable: "qemu-system-arm",
             args: &[
                 "-cpu",
@@ -827,15 +853,17 @@ fn preset_values(preset: RunnerPreset) -> PresetValues {
                 "{artifact}",
             ],
             completion_marker: None,
+            completion_action: CompletionAction::Kill,
             artifact_extension: "",
             board: Some("qemu-microbit"),
             mcu: Some("nrf51822"),
             transport: Some("semihosting"),
+            probe: None,
             clock_frequency_hz: None,
         },
         RunnerPreset::QemuCortexM3 => PresetValues {
             runner: RunnerKind::Command,
-            target: "thumbv7m-none-eabi",
+            target: Some("thumbv7m-none-eabi"),
             executable: "qemu-system-arm",
             args: &[
                 "-cpu",
@@ -849,15 +877,17 @@ fn preset_values(preset: RunnerPreset) -> PresetValues {
                 "{artifact}",
             ],
             completion_marker: None,
+            completion_action: CompletionAction::Kill,
             artifact_extension: "",
             board: Some("qemu-lm3s6965evb"),
             mcu: Some("lm3s6965"),
             transport: Some("semihosting"),
+            probe: None,
             clock_frequency_hz: None,
         },
         RunnerPreset::QemuCortexM4 => PresetValues {
             runner: RunnerKind::Command,
-            target: "thumbv7em-none-eabi",
+            target: Some("thumbv7em-none-eabi"),
             executable: "qemu-system-arm",
             args: &[
                 "-cpu",
@@ -871,15 +901,17 @@ fn preset_values(preset: RunnerPreset) -> PresetValues {
                 "{artifact}",
             ],
             completion_marker: None,
+            completion_action: CompletionAction::Kill,
             artifact_extension: "",
             board: Some("qemu-netduinoplus2"),
             mcu: Some("stm32f405rg"),
             transport: Some("semihosting"),
+            probe: None,
             clock_frequency_hz: None,
         },
         RunnerPreset::QemuRiscv32SifiveE => PresetValues {
             runner: RunnerKind::Command,
-            target: "riscv32imac-unknown-none-elf",
+            target: Some("riscv32imac-unknown-none-elf"),
             executable: "qemu-system-riscv32",
             args: &[
                 "-nographic",
@@ -891,23 +923,51 @@ fn preset_values(preset: RunnerPreset) -> PresetValues {
                 "{artifact}",
             ],
             completion_marker: Some("EM_OUTCOME"),
+            completion_action: CompletionAction::Kill,
             artifact_extension: "",
             board: Some("qemu-sifive-e"),
             mcu: Some("sifive-e31"),
             transport: Some("uart"),
+            probe: None,
             clock_frequency_hz: None,
         },
         RunnerPreset::SimavrAtmega2560 => PresetValues {
             runner: RunnerKind::Simavr,
-            target: "avr-none",
+            target: Some("avr-none"),
             executable: "simavr",
             args: &["-m", "atmega2560", "-f", "16000000"],
             completion_marker: Some("EM_OUTCOME"),
+            completion_action: CompletionAction::Kill,
             artifact_extension: "elf",
             board: Some("simavr-atmega2560"),
             mcu: Some("atmega2560"),
             transport: Some("uart"),
+            probe: None,
             clock_frequency_hz: Some(16_000_000),
+        },
+        RunnerPreset::ProbeRsRtt => PresetValues {
+            runner: RunnerKind::Command,
+            target: None,
+            executable: "probe-rs",
+            args: &[
+                "run",
+                "--chip",
+                "${PROBE_RS_CHIP}",
+                "--probe",
+                "${PROBE_RS_PROBE}",
+                "--non-interactive",
+                "{artifact}",
+            ],
+            completion_marker: Some("EM_OUTCOME"),
+            // An interrupt lets probe-rs detach from the target instead of leaving the probe
+            // claimed.
+            completion_action: CompletionAction::Interrupt,
+            artifact_extension: "",
+            board: None,
+            mcu: Some("${PROBE_RS_CHIP}"),
+            transport: Some("rtt"),
+            probe: Some("${PROBE_RS_PROBE}"),
+            clock_frequency_hz: None,
         },
     }
 }

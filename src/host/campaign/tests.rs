@@ -904,6 +904,117 @@ cases = [{ name = "fixture", example = "fixture" }]
     assert_eq!(profile.completion_marker.as_deref(), Some("EM_OUTCOME"));
 }
 
+#[test]
+fn probe_rs_rtt_preset_runs_on_a_named_chip_and_probe() {
+    let config = parse(
+        r#"
+[venues.bench]
+bindings = { PROBE_RS_CHIP = "STM32L431KCUx", PROBE_RS_PROBE = "0483:374f:0001" }
+
+[profiles.board]
+preset = "probe-rs-rtt"
+target = "thumbv7em-none-eabihf"
+venue = "bench"
+
+[campaigns.test]
+profile = "board"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let profile = config.resolve_profile("board").unwrap();
+    assert_eq!(profile.executable.as_deref(), Some("probe-rs"));
+    assert_eq!(
+        profile.args,
+        [
+            "run",
+            "--chip",
+            "STM32L431KCUx",
+            "--probe",
+            "0483:374f:0001",
+            "--non-interactive",
+            "{artifact}"
+        ]
+    );
+    assert_eq!(profile.completion_marker.as_deref(), Some("EM_OUTCOME"));
+    assert_eq!(profile.completion_action, CompletionAction::Interrupt);
+    assert_eq!(profile.transport.as_deref(), Some("rtt"));
+    assert_eq!(profile.mcu.as_deref(), Some("STM32L431KCUx"));
+    assert_eq!(profile.probe.as_deref(), Some("0483:374f:0001"));
+    assert_eq!(
+        profile.resolved_bindings["PROBE_RS_PROBE"],
+        "0483:374f:0001"
+    );
+    // The build job needs neither binding, so it can run where no probe is attached.
+    assert!(config.validate_for_build().is_ok());
+}
+
+#[test]
+fn probe_rs_rtt_preset_requires_a_target_and_both_bindings() {
+    let without_target = parse(
+        r#"
+[venues.bench]
+bindings = { PROBE_RS_CHIP = "STM32L431KCUx", PROBE_RS_PROBE = "0483:374f:0001" }
+[profiles.board]
+preset = "probe-rs-rtt"
+venue = "bench"
+[campaigns.test]
+profile = "board"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    let error = without_target.validate().unwrap_err().to_string();
+    assert!(error.contains("requires target"), "{error}");
+    assert!(without_target.validate_for_build().is_err());
+
+    // No probe binding: refuse rather than run on whichever probe probe-rs finds first.
+    let without_probe = parse(
+        r#"
+[venues.bench]
+bindings = { PROBE_RS_CHIP = "STM32L431KCUx" }
+[profiles.board]
+preset = "probe-rs-rtt"
+target = "thumbv7em-none-eabihf"
+venue = "bench"
+[campaigns.test]
+profile = "board"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    if std::env::var_os("PROBE_RS_PROBE").is_none() {
+        let error = without_probe.validate().unwrap_err().to_string();
+        assert!(error.contains("PROBE_RS_PROBE"), "{error}");
+    }
+}
+
+#[test]
+fn presets_keep_their_completion_action_unless_overridden() {
+    let config = parse(
+        r#"
+[venues.bench]
+bindings = { PROBE_RS_CHIP = "ATSAMD21G18A", PROBE_RS_PROBE = "1366:1020:0001" }
+[profiles.qemu]
+preset = "qemu-cortex-m3"
+[profiles.board]
+preset = "probe-rs-rtt"
+target = "thumbv6m-none-eabi"
+venue = "bench"
+completion-action = "kill"
+[campaigns.test]
+profile = "qemu"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    assert_eq!(
+        config.resolve_profile("qemu").unwrap().completion_action,
+        CompletionAction::Kill
+    );
+    assert_eq!(
+        config.resolve_profile("board").unwrap().completion_action,
+        CompletionAction::Kill
+    );
+}
+
 #[cfg(unix)]
 fn failure_workspace(name: &str, source: &str) -> PathBuf {
     let workspace =
