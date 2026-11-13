@@ -243,6 +243,28 @@ attributes to a source line range, `first_stack_allocation` reads explicit
 frame allocations, and `ChainBudget` checks a chain of known frames against
 per-frame and total ceilings.
 
+### Analytical Cortex-M cycle model
+
+`host::disasm::cycles` costs an executed instruction sequence (for example the
+PCs of a QEMU execution trace) with Cortex-M0, Cortex-M3 or Cortex-M4
+instruction timings:
+
+```rust,ignore
+use krabi_caliper::host::disasm::cycles::{CortexMCore, estimate_cycles};
+
+let estimate = estimate_cycles(CortexMCore::M4, &image, &pcs)?;
+println!("{}..{} cycles", estimate.minimum, estimate.maximum);
+```
+
+The timings assume zero-wait-state memory, no bus contention and no interrupts.
+A range covers what a listing cannot decide: pipeline refill after a branch, the
+Cortex-M0 multiplier option, and early-terminating divides. A conditional
+branch is taken when the next traced PC is not the following instruction.
+Instructions outside the model, such as floating point, DSP and exclusives, are
+errors rather than guesses. The result also gives per-address cycles and timing
+classes, branch-direction counts and a mnemonic histogram. Parts with flash
+wait states, caches or accelerators run differently, so measure on them.
+
 ## Counting instructions from QEMU execution traces
 
 `host::exec_trace` (feature `host`) counts the instructions an image executes

@@ -1144,5 +1144,7 @@ pub mod thumb {
     }
 }
 
+pub mod cycles;
+
 #[cfg(test)]
 mod tests;
