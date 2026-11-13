@@ -47,6 +47,16 @@ impl ToolkitConfig {
                 |case_set| self.case_sets[case_set].as_slice(),
             );
             validate_cases(name, campaign, cases)?;
+            if campaign.retry.attempts == 0 {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "campaign {name:?} retry attempts must be at least 1"
+                )));
+            }
+            if campaign.retry.on.contains(&CaseStatus::Pass) {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "campaign {name:?} cannot retry a passing case"
+                )));
+            }
             for (axis, values) in &campaign.matrix {
                 validate_artifact_component("matrix axis", axis)?;
                 if values.is_empty() {

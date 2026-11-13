@@ -73,6 +73,19 @@ pub struct CaseReport {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stderr: String,
     pub result: Option<RunResult>,
+    /// Runs of this case, counting the one reported; above one when a retry policy applied.
+    #[serde(default = "one_attempt")]
+    pub attempts: u32,
+    /// The status and error of each earlier attempt that was retried, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retried: Vec<RetriedAttempt>,
+}
+
+/// One discarded attempt of a retried case.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetriedAttempt {
+    pub status: CaseStatus,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -354,6 +367,18 @@ impl CaseReport {
             failure_reason(self),
             failure_command(self),
         );
+        if self.attempts > 1 {
+            output.push_str(&format!("\nAttempts: {}.", self.attempts));
+            for (index, attempt) in self.retried.iter().enumerate() {
+                output.push_str(&format!(
+                    "\n- Attempt {}: {:?}, {}",
+                    index + 1,
+                    attempt.status,
+                    attempt.error.as_deref().unwrap_or("no reason recorded")
+                ));
+            }
+            output.push('\n');
+        }
         render_output_stream(&mut output, "stdout", &self.stdout, 2);
         render_output_stream(&mut output, "stderr", &self.stderr, 2);
         output

@@ -211,17 +211,19 @@ impl CampaignExecutor {
         let campaign_dir = artifact_child(&artifact_root, campaign_name, "campaign name")?;
         let mut reports = Vec::new();
         for case in cases {
-            let report = self.run_case(
-                (campaign_name, &campaign.profile),
-                &profile,
-                workspace,
-                &campaign_dir,
-                &case,
-                RunContext {
-                    environment: &environment,
-                    silent: selection.silent,
-                },
-            )?;
+            let report = run_with_retry(&campaign.retry, &campaign_dir, selection.silent, || {
+                self.run_case(
+                    (campaign_name, &campaign.profile),
+                    &profile,
+                    workspace,
+                    &campaign_dir,
+                    &case,
+                    RunContext {
+                        environment: &environment,
+                        silent: selection.silent,
+                    },
+                )
+            })?;
             let passed = report.status == CaseStatus::Pass;
             reports.push(report);
             if !passed && !campaign.continue_on_failure {
@@ -340,16 +342,18 @@ impl CampaignExecutor {
             case_environment.source = prepared.source.clone();
             case_environment.build = prepared.build.clone();
             case_environment.build.features = prepared_case.case.features.clone();
-            let report = self.run_prepared_case(
-                (campaign_name, &campaign.profile),
-                &profile,
-                workspace,
-                &campaign_dir,
-                prepared_case,
-                &canonical_artifact,
-                case_environment,
-                selection.silent,
-            )?;
+            let report = run_with_retry(&campaign.retry, &campaign_dir, selection.silent, || {
+                self.run_prepared_case(
+                    (campaign_name, &campaign.profile),
+                    &profile,
+                    workspace,
+                    &campaign_dir,
+                    prepared_case,
+                    &canonical_artifact,
+                    case_environment.clone(),
+                    selection.silent,
+                )
+            })?;
             let passed = report.status == CaseStatus::Pass;
             reports.push(report);
             if !passed && !campaign.continue_on_failure {
@@ -421,6 +425,8 @@ impl CampaignExecutor {
                 stdout: build_output.stdout_lossy(),
                 stderr: build_output.stderr_lossy(),
                 result: None,
+                attempts: 1,
+                retried: Vec::new(),
             };
             write_case_artifacts(&case_dir, &report)?;
             return Ok(report);
@@ -475,6 +481,8 @@ impl CampaignExecutor {
                     stdout: output.stdout_lossy(),
                     stderr: output.stderr_lossy(),
                     result: None,
+                    attempts: 1,
+                    retried: Vec::new(),
                 };
                 write_case_artifacts(&case_dir, &report)?;
                 return Ok(report);
@@ -531,6 +539,8 @@ impl CampaignExecutor {
                 String::new()
             },
             result,
+            attempts: 1,
+            retried: Vec::new(),
         };
         write_case_artifacts(&case_dir, &report)?;
         Ok(report)
@@ -612,6 +622,8 @@ impl CampaignExecutor {
                     stdout: output.stdout_lossy(),
                     stderr: output.stderr_lossy(),
                     result: None,
+                    attempts: 1,
+                    retried: Vec::new(),
                 };
                 write_case_artifacts(&case_dir, &report)?;
                 return Ok(report);
@@ -674,6 +686,8 @@ impl CampaignExecutor {
                 String::new()
             },
             result,
+            attempts: 1,
+            retried: Vec::new(),
         };
         write_case_artifacts(&case_dir, &report)?;
         Ok(report)
@@ -1519,6 +1533,48 @@ fn write_case_metadata(path: &Path, report: &CaseReport) -> Result<(), CampaignE
         &path.join("metadata.json"),
         &serde_json::to_string_pretty(report).map_err(CampaignError::Json)?,
     )
+}
+
+/// Runs one case, then runs it again while `policy` says its status is transient.
+///
+/// Each attempt replaces the case's artifact directory. The kept report, and its rewritten
+/// metadata, record how many attempts ran and what each discarded attempt reported.
+fn run_with_retry(
+    policy: &RetryPolicy,
+    campaign_dir: &Path,
+    silent: bool,
+    mut attempt: impl FnMut() -> Result<CaseReport, CampaignError>,
+) -> Result<CaseReport, CampaignError> {
+    let mut retried = Vec::new();
+    let mut number = 1;
+    loop {
+        let mut report = attempt()?;
+        if policy.retries(number, report.status) {
+            if !silent {
+                std::eprintln!(
+                    "retrying case {:?} after {:?} (attempt {}/{})",
+                    report.id,
+                    report.status,
+                    number + 1,
+                    policy.attempts
+                );
+            }
+            retried.push(RetriedAttempt {
+                status: report.status,
+                error: report.error.take(),
+            });
+            number += 1;
+            continue;
+        }
+        if retried.is_empty() {
+            return Ok(report);
+        }
+        report.attempts = number;
+        report.retried = retried;
+        let case_dir = artifact_child(campaign_dir, &report.id, "expanded case id")?;
+        write_case_artifacts(&case_dir, &report)?;
+        return Ok(report);
+    }
 }
 
 fn write_case_artifacts(path: &Path, report: &CaseReport) -> Result<(), CampaignError> {
