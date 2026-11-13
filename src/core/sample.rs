@@ -40,13 +40,10 @@ impl<const N: usize> SampleSet<N> {
         })
     }
 
-    pub fn summary(&self) -> Result<Summary, SummaryError> {
-        let first = *self.iter().next().ok_or(SummaryError::Empty)?;
-        let mut min = first.ticks;
-        let mut max = first.ticks;
-        let mut total = first.ticks as u128;
-        let mut wrapped = first.wrapped;
-
+    /// Checks that the set is non-empty and shares one unit and frequency, returning the first
+    /// measurement with `wrapped` set if any sample wrapped.
+    fn compatible(&self) -> Result<Measurement, SummaryError> {
+        let mut first = *self.iter().next().ok_or(SummaryError::Empty)?;
         for sample in self.iter().skip(1) {
             if sample.unit != first.unit {
                 return Err(SummaryError::UnitMismatch);
@@ -54,10 +51,22 @@ impl<const N: usize> SampleSet<N> {
             if sample.frequency_hz != first.frequency_hz {
                 return Err(SummaryError::FrequencyMismatch);
             }
+            first.wrapped |= sample.wrapped;
+        }
+        Ok(first)
+    }
+
+    pub fn summary(&self) -> Result<Summary, SummaryError> {
+        let first = self.compatible()?;
+        let mut min = first.ticks;
+        let mut max = first.ticks;
+        let mut total = first.ticks as u128;
+        let wrapped = first.wrapped;
+
+        for sample in self.iter().skip(1) {
             min = min.min(sample.ticks);
             max = max.max(sample.ticks);
             total += sample.ticks as u128;
-            wrapped |= sample.wrapped;
         }
 
         Ok(Summary {
@@ -71,30 +80,44 @@ impl<const N: usize> SampleSet<N> {
         })
     }
 
-    /// Returns the measurement with the `index`-th smallest tick count, counting from zero.
+    /// Returns the `index`-th smallest tick count, counting from zero, as a measurement.
     ///
     /// The samples must be non-empty and share a unit and frequency, as for
-    /// [`summary`](Self::summary). Ties between equal tick counts may return any of the equal
-    /// measurements; they differ at most in `wrapped`. The selection sorts a copy of the samples
-    /// on the stack, so it needs no allocator and leaves the set unchanged.
+    /// [`summary`](Self::summary). The result carries that unit and frequency, and `wrapped` is
+    /// set if any sample in the set wrapped, again as for `summary`: a selected value is only as
+    /// trustworthy as the set it was selected from.
+    ///
+    /// The selection counts in place instead of sorting: no copy of the set, no allocator and
+    /// no panic path, in O(len²) comparisons. That suits the small fixed capacities a target
+    /// collects; for large sets on a host, sort the ticks instead.
     pub fn order_statistic(&self, index: usize) -> Result<Measurement, SummaryError> {
-        self.summary()?;
-        let mut sorted = self.samples;
-        let initialized = sorted
-            .get_mut(..self.len)
-            .ok_or(SummaryError::IndexOutOfRange)?;
-        initialized.sort_unstable_by_key(|sample| sample.map(|sample| sample.ticks));
-        initialized
-            .get(index)
-            .copied()
-            .flatten()
-            .ok_or(SummaryError::IndexOutOfRange)
+        let mut result = self.compatible()?;
+        if index >= self.len {
+            return Err(SummaryError::IndexOutOfRange);
+        }
+        // The answer is the candidate with fewer than `index + 1` smaller samples and at least
+        // `index + 1` samples no larger than it.
+        for candidate in self.iter() {
+            let mut smaller = 0;
+            let mut not_larger = 0;
+            for sample in self.iter() {
+                smaller += usize::from(sample.ticks < candidate.ticks);
+                not_larger += usize::from(sample.ticks <= candidate.ticks);
+            }
+            if smaller <= index && index < not_larger {
+                result.ticks = candidate.ticks;
+                return Ok(result);
+            }
+        }
+        Err(SummaryError::IndexOutOfRange)
     }
 
     /// Returns the upper median: the measurement at sorted index `len / 2`.
     ///
     /// For an odd count this is the median. For an even count it is the larger of the two
     /// middle measurements, so the result is always an observed value rather than an average.
+    /// Note that [`percentile(1, 2)`](Self::percentile) is the lower of the two for an even
+    /// count, by the nearest-rank definition.
     pub fn median(&self) -> Result<Measurement, SummaryError> {
         self.order_statistic(self.len / 2)
     }
@@ -104,7 +127,8 @@ impl<const N: usize> SampleSet<N> {
     /// The result is the measurement at rank `ceil(numerator * len / denominator)`, counting
     /// from one, with rank 0 taken as rank 1. So `0 / 1` is the minimum and `1 / 1` the maximum.
     /// Nothing is interpolated: the result is always an observed value. A zero denominator or a
-    /// fraction above one returns [`SummaryError::InvalidQuantile`].
+    /// fraction above one returns [`SummaryError::InvalidQuantile`]. The rank takes one 64-bit
+    /// multiply and divide.
     pub fn percentile(
         &self,
         numerator: u32,
@@ -113,7 +137,9 @@ impl<const N: usize> SampleSet<N> {
         if denominator == 0 || numerator > denominator {
             return Err(SummaryError::InvalidQuantile);
         }
-        let scaled = u64::from(numerator) * self.len as u64;
+        let scaled = u64::from(numerator)
+            .checked_mul(self.len as u64)
+            .ok_or(SummaryError::IndexOutOfRange)?;
         let rank = scaled.div_ceil(u64::from(denominator)).max(1);
         let index = usize::try_from(rank - 1).map_err(|_| SummaryError::IndexOutOfRange)?;
         self.order_statistic(index)
@@ -322,6 +348,48 @@ mod tests {
         mixed.push(Measurement::new(2, Unit::TimerTicks)).unwrap();
         assert_eq!(mixed.median(), Err(SummaryError::UnitMismatch));
         assert_eq!(mixed.percentile(1, 2), Err(SummaryError::UnitMismatch));
+
+        let mut clocks = SampleSet::<2>::new();
+        clocks
+            .push(Measurement::new(1, Unit::CoreCycles).with_frequency(1))
+            .unwrap();
+        clocks
+            .push(Measurement::new(2, Unit::CoreCycles).with_frequency(2))
+            .unwrap();
+        assert_eq!(clocks.median(), Err(SummaryError::FrequencyMismatch));
+    }
+
+    #[test]
+    fn order_statistics_carry_the_set_qualification() {
+        let mut samples = SampleSet::<3>::new();
+        for (ticks, wrapped) in [(30, false), (10, true), (20, false)] {
+            let mut sample = Measurement::new(ticks, Unit::TimerTicks).with_frequency(15_625);
+            sample.wrapped = wrapped;
+            samples.push(sample).unwrap();
+        }
+        // The median sample itself did not wrap, but the set did, as `summary` reports.
+        let median = samples.median().unwrap();
+        assert_eq!(median.ticks, 20);
+        assert_eq!(median.unit, Unit::TimerTicks);
+        assert_eq!(median.frequency_hz, Some(15_625));
+        assert!(median.wrapped);
+        assert_eq!(median.wrapped, samples.summary().unwrap().wrapped);
+    }
+
+    #[test]
+    fn median_and_half_percentile_differ_for_even_counts() {
+        let samples = cycles::<4>(&[1, 2, 3, 4]);
+        assert_eq!(samples.median().unwrap().ticks, 3);
+        assert_eq!(samples.percentile(1, 2).unwrap().ticks, 2);
+        let single = cycles::<1>(&[7]);
+        for (numerator, denominator) in [(0, 1), (1, 2), (99, 100), (1, 1)] {
+            assert_eq!(single.percentile(numerator, denominator).unwrap().ticks, 7);
+        }
+        // All equal: every rank is that value.
+        let flat = cycles::<5>(&[4, 4, 4, 4, 4]);
+        for index in 0..5 {
+            assert_eq!(flat.order_statistic(index).unwrap().ticks, 4);
+        }
     }
 
     #[cfg(feature = "host")]

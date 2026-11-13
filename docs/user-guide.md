@@ -43,7 +43,9 @@ Target facilities include:
 
 - allocation-free measurements, samples, summaries, and repeated benchmarks;
 - order statistics on a `SampleSet`: `median` (the upper median, always an
-  observed value), `percentile` (nearest rank) and `order_statistic`;
+  observed value), `percentile` (nearest rank) and `order_statistic`. They
+  select in place in O(len²) comparisons, with no copy, sort or allocator,
+  and report `wrapped` for the whole set, as `summary` does;
 - stack painting through an application-supplied memory contract;
 - Cortex-M SysTick and DWT, RISC-V cycle/instruction CSRs, and ATmega2560
   Timer1 adapters;
