@@ -246,8 +246,13 @@ fn capture_writes_the_trace_under_cwd() {
 #[cfg(unix)]
 #[test]
 fn capture_times_out_a_run_that_never_exits() {
+    use std::os::unix::fs::PermissionsExt;
     let directory = scratch("hang");
-    let error = QemuExecTrace::new("sleep", ["30"])
+    // Ignores the QEMU arguments and never exits on its own.
+    let hang = directory.join("hanging-qemu");
+    fs::write(&hang, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    fs::set_permissions(&hang, fs::Permissions::from_mode(0o755)).unwrap();
+    let error = QemuExecTrace::new(hang, ["-kernel", "app"])
         .timeout(Duration::from_millis(200))
         .capture(&directory.join("trace.log"))
         .unwrap_err();
