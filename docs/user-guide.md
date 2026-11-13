@@ -185,20 +185,26 @@ let sources = SourceTree::new(".")
     .extension("rs");
 let record = Provenance::new()
     .source_tree(&sources)?
-    .lockfile("Cargo.lock".as_ref())?
+    .lockfile("Cargo.lock")?
     .tool("rustc", "rustc", ["--version"])?
     .tool("emulator", "qemu-system-arm", ["--version"])?
-    .image("app", "target/thumbv7m-none-eabi/release/app".as_ref())?;
+    .image("app", "target/thumbv7m-none-eabi/release/app")?;
 ```
 
 The source-tree digest covers exactly the selected files (directories are
 searched for the listed extensions, skipping `target`), including their
 relative paths, so adding, renaming or editing a selected file changes it and
-nothing else does. It is independent of the checkout location and the host's
-path separator. Missing files and failing tools are errors. Store the record
-beside the results, and use `Provenance::differences` to list what changed
-between two records; deciding whether a change invalidates a comparison is up
-to the caller.
+nothing else does. It does not depend on the checkout location or the host's
+path separator, but contents are hashed as stored: a checkout that converts
+line endings gives a different digest for the same commit. Paths may not leave
+the root, and missing files, empty selections and failing tools are errors.
+
+Tools run in the current directory. A rustup proxy picks its toolchain from
+the directory's `rust-toolchain.toml`, so record it with `tool_command` and
+the project directory set. Store the record beside the results, and use
+`Provenance::differences` to list the fields that changed between two
+records; deciding whether a change invalidates a comparison is up to the
+caller.
 
 ## Feature groups
 

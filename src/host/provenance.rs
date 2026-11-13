@@ -7,19 +7,21 @@
 //! - [`SourceTree`] hashes a selected set of source files into one digest, so a change to any
 //!   of them (and nothing else) changes the record;
 //! - [`sha256_file`] hashes one file, such as a lockfile or a built image;
-//! - [`tool_version`] records the first line a tool prints for its version flag, for a
-//!   toolchain, emulator, simulator or probe driver.
+//! - [`tool_version`] and [`command_version`] record the first line a tool prints for its
+//!   version flag, for a toolchain, emulator, simulator or probe driver.
 //!
-//! The record says nothing about whether two figures may be compared; that policy belongs to
-//! the consumer.
+//! Every input is required: a missing file, an empty selection or a failing tool is an error,
+//! never an empty or default field. The record says nothing about whether two figures may be
+//! compared; [`Provenance::differences`] lists what changed and the policy belongs to the
+//! consumer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::format;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::string::{String, ToString};
 use std::vec::Vec;
@@ -27,22 +29,24 @@ use std::vec::Vec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// A failure to compute provenance. Every input is required: a missing file or a failing tool
-/// is an error, never an empty field.
+/// A failure to compute provenance.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ProvenanceError {
-    Io {
-        path: PathBuf,
-        source: io::Error,
-    },
-    /// A tool could not be started, or exited unsuccessfully.
-    Tool {
-        program: String,
-        detail: String,
-    },
-    /// A selected file is not below the source tree root.
+    /// A file or directory could not be read.
+    #[non_exhaustive]
+    Io { path: PathBuf, source: io::Error },
+    /// A tool could not be started, exited unsuccessfully, or printed no version on stdout.
+    #[non_exhaustive]
+    Tool { program: String, detail: String },
+    /// A selected path is absolute or leaves the source tree root (`..`).
     OutsideRoot(PathBuf),
+    /// A selected path is not valid Unicode, so its name in the digest would be ambiguous.
+    NonUnicodePath(PathBuf),
+    /// An extension was given with its leading dot, or empty, so it could never match.
+    InvalidExtension(String),
+    /// The selection matched no files, so its digest would describe nothing.
+    EmptySelection,
 }
 
 impl fmt::Display for ProvenanceError {
@@ -50,12 +54,20 @@ impl fmt::Display for ProvenanceError {
         match self {
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::Tool { program, detail } => write!(formatter, "{program}: {detail}"),
-            Self::OutsideRoot(path) => {
-                write!(
-                    formatter,
-                    "{} is outside the source tree root",
-                    path.display()
-                )
+            Self::OutsideRoot(path) => write!(
+                formatter,
+                "{} is outside the source tree root",
+                path.display()
+            ),
+            Self::NonUnicodePath(path) => {
+                write!(formatter, "{} is not a Unicode path", path.display())
+            }
+            Self::InvalidExtension(extension) => write!(
+                formatter,
+                "extension {extension:?} must be non-empty and given without its dot"
+            ),
+            Self::EmptySelection => {
+                formatter.write_str("the source tree selection matched no files")
             }
         }
     }
@@ -77,25 +89,42 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> ProvenanceError + '_ {
     }
 }
 
-/// The lowercase hex SHA-256 of a file's contents.
-pub fn sha256_file(path: &Path) -> Result<String, ProvenanceError> {
+/// The lowercase hex SHA-256 of a file's contents, as stored on disk.
+pub fn sha256_file(path: impl AsRef<Path>) -> Result<String, ProvenanceError> {
+    let path = path.as_ref();
     let bytes = fs::read(path).map_err(io_error(path))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-/// The first line `program arguments...` prints on stdout, trimmed: for example
+/// The first non-blank line `program arguments...` prints on stdout, trimmed: for example
 /// `tool_version("rustc", ["--version"])` or `tool_version("qemu-system-arm", ["--version"])`.
-pub fn tool_version<I, S>(program: &str, arguments: I) -> Result<String, ProvenanceError>
+///
+/// The tool runs in the current working directory. Where that matters, as with a rustup proxy
+/// that honours the `rust-toolchain.toml` of its directory, use [`command_version`] with the
+/// directory set. A tool that prints its version only on stderr is reported as an error.
+/// There is no timeout.
+pub fn tool_version<I, S>(
+    program: impl AsRef<OsStr>,
+    arguments: I,
+) -> Result<String, ProvenanceError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let mut command = Command::new(program);
+    command.args(arguments);
+    command_version(&mut command)
+}
+
+/// The first non-blank line `command` prints on stdout, trimmed. Configure the working
+/// directory and environment on `command` first.
+pub fn command_version(command: &mut Command) -> Result<String, ProvenanceError> {
+    let program = command.get_program().to_string_lossy().into_owned();
     let failure = |detail: String| ProvenanceError::Tool {
-        program: program.to_string(),
+        program: program.clone(),
         detail,
     };
-    let output = Command::new(program)
-        .args(arguments)
+    let output = command
         .output()
         .map_err(|error| failure(error.to_string()))?;
     if !output.status.success() {
@@ -106,28 +135,35 @@ where
         )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().next().unwrap_or_default().trim();
-    if line.is_empty() {
-        return Err(failure("printed no version".to_string()));
-    }
-    Ok(line.to_string())
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| failure("printed no version on stdout".to_string()))
 }
 
 /// A selection of source files hashed into one digest.
 ///
-/// The selection is the listed `files` plus every file below the listed `directories` whose
-/// extension is in `extensions`, skipping directories named in `skip_directories` (by default
-/// `target`). Paths are relative to `root`.
+/// The selection is the listed `files` plus every regular file below the listed `directories`
+/// whose extension is in `extensions`. A directory whose name is in `skip_directories` (by
+/// default `target`) is not descended into wherever it occurs below a listed directory; a
+/// listed directory itself is always searched. Paths are relative to `root`, may not be
+/// absolute or contain `..`, and must be valid Unicode. Symbolic links are followed. An empty
+/// selection is an error.
 ///
 /// The digest is SHA-256 over the selected files in path order (compared component by
 /// component), each contributing its relative path with `/` separators, a `0x00` byte, its
-/// contents and a `0xff` byte. The digest therefore changes when a file is added, removed,
-/// renamed or edited, and does not depend on the platform's path separator or the location of
-/// `root`.
+/// contents and a `0xff` byte. It therefore changes when a selected file is added, removed,
+/// renamed or edited, and does not depend on where `root` is or which separator the platform
+/// uses. Contents are hashed as stored, so checkouts that convert line endings, and paths
+/// spelled in a different case on a case-insensitive file system, give different digests for
+/// the same commit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SourceTree {
+    /// The directory every selected path is relative to.
     pub root: PathBuf,
     /// Individual files, which must exist.
     #[serde(default)]
@@ -148,6 +184,7 @@ fn default_skip_directories() -> Vec<String> {
 }
 
 impl SourceTree {
+    /// An empty selection below `root`, skipping `target` directories.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -188,50 +225,65 @@ impl SourceTree {
 
     /// The selected files, relative to the root, in hashing order and without duplicates.
     pub fn select(&self) -> Result<Vec<PathBuf>, ProvenanceError> {
-        let mut paths = Vec::new();
+        if let Some(extension) = self
+            .extensions
+            .iter()
+            .find(|extension| extension.is_empty() || extension.starts_with('.'))
+        {
+            return Err(ProvenanceError::InvalidExtension(extension.clone()));
+        }
+        let mut selected = BTreeSet::new();
         for file in &self.files {
-            let path = self.root.join(file);
-            if !path.is_file() {
+            let relative = checked_relative(file)?;
+            let path = self.root.join(&relative);
+            let metadata = fs::metadata(&path).map_err(io_error(&path))?;
+            if !metadata.is_file() {
                 return Err(ProvenanceError::Io {
                     path,
-                    source: io::Error::new(io::ErrorKind::NotFound, "selected file not found"),
+                    source: io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"),
                 });
             }
-            paths.push(path);
+            selected.insert(relative);
         }
         for directory in &self.directories {
-            self.walk(&self.root.join(directory), &mut paths)?;
+            let relative = checked_relative(directory)?;
+            self.walk(&relative, &mut selected)?;
         }
-        let mut relative = paths
-            .into_iter()
-            .map(|path| {
-                path.strip_prefix(&self.root)
-                    .map(Path::to_path_buf)
-                    .map_err(|_| ProvenanceError::OutsideRoot(path.clone()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        relative.sort();
-        relative.dedup();
-        Ok(relative)
+        if selected.is_empty() {
+            return Err(ProvenanceError::EmptySelection);
+        }
+        Ok(selected.into_iter().collect())
     }
 
-    fn walk(&self, directory: &Path, paths: &mut Vec<PathBuf>) -> Result<(), ProvenanceError> {
-        for entry in fs::read_dir(directory).map_err(io_error(directory))? {
-            let path = entry.map_err(io_error(directory))?.path();
-            if path.is_dir() {
-                let skipped = path
-                    .file_name()
-                    .and_then(OsStr::to_str)
+    fn walk(
+        &self,
+        relative: &Path,
+        selected: &mut BTreeSet<PathBuf>,
+    ) -> Result<(), ProvenanceError> {
+        let directory = self.root.join(relative);
+        for entry in fs::read_dir(&directory).map_err(io_error(&directory))? {
+            let entry = entry.map_err(io_error(&directory))?;
+            let name = entry.file_name();
+            let child = relative.join(&name);
+            let path = entry.path();
+            // Follows symbolic links, like reading the file does.
+            let metadata = fs::metadata(&path).map_err(io_error(&path))?;
+            if metadata.is_dir() {
+                let skipped = name
+                    .to_str()
                     .is_some_and(|name| self.skip_directories.iter().any(|skip| skip == name));
                 if !skipped {
-                    self.walk(&path, paths)?;
+                    self.walk(&child, selected)?;
                 }
-            } else if path
-                .extension()
-                .and_then(OsStr::to_str)
-                .is_some_and(|extension| self.extensions.iter().any(|wanted| wanted == extension))
+            } else if metadata.is_file()
+                && Path::new(&name)
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|extension| {
+                        self.extensions.iter().any(|wanted| wanted == extension)
+                    })
             {
-                paths.push(path);
+                selected.insert(checked_relative(&child)?);
             }
         }
         Ok(())
@@ -243,8 +295,13 @@ impl SourceTree {
         for relative in self.select()? {
             let name = relative
                 .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
+                .map(|component| {
+                    component
+                        .as_os_str()
+                        .to_str()
+                        .ok_or_else(|| ProvenanceError::NonUnicodePath(relative.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?
                 .join("/");
             let path = self.root.join(&relative);
             digest.update(name.as_bytes());
@@ -256,10 +313,32 @@ impl SourceTree {
     }
 }
 
+/// `path` reduced to its normal components, rejecting anything that could leave the root.
+fn checked_relative(path: &Path) -> Result<PathBuf, ProvenanceError> {
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                if part.to_str().is_none() {
+                    return Err(ProvenanceError::NonUnicodePath(path.to_path_buf()));
+                }
+                relative.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ProvenanceError::OutsideRoot(path.to_path_buf()));
+            }
+        }
+    }
+    // An empty result is the root itself: a valid directory to search, and as a file it fails
+    // the regular-file check.
+    Ok(relative)
+}
+
 /// Where a measurement came from. Every field is optional, so a consumer records what applies
 /// to it; [`Provenance::differences`] compares two records field by field.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Provenance {
     /// The digest of the measured sources, from [`SourceTree::sha256`].
@@ -276,7 +355,53 @@ pub struct Provenance {
     pub images: BTreeMap<String, String>,
 }
 
+/// One field of a [`Provenance`] record.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "kind", content = "name")]
+#[non_exhaustive]
+pub enum ProvenanceField {
+    SourceTree,
+    Lockfile,
+    Tool(String),
+    Image(String),
+}
+
+impl fmt::Display for ProvenanceField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceTree => formatter.write_str("source-tree-sha256"),
+            Self::Lockfile => formatter.write_str("lockfile-sha256"),
+            Self::Tool(name) => write!(formatter, "tool {name:?}"),
+            Self::Image(name) => write!(formatter, "image {name:?}"),
+        }
+    }
+}
+
+/// A field whose value differs between two records; `None` where a record lacks it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub struct ProvenanceDifference {
+    pub field: ProvenanceField,
+    pub this: Option<String>,
+    pub other: Option<String>,
+}
+
+impl fmt::Display for ProvenanceDifference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let show = |value: &Option<String>| value.clone().unwrap_or_else(|| "(absent)".to_string());
+        write!(
+            formatter,
+            "{}: {} -> {}",
+            self.field,
+            show(&self.this),
+            show(&self.other)
+        )
+    }
+}
+
 impl Provenance {
+    /// An empty record.
     pub fn new() -> Self {
         Self::default()
     }
@@ -288,16 +413,16 @@ impl Provenance {
     }
 
     /// Records the digest of the lockfile at `path`.
-    pub fn lockfile(mut self, path: &Path) -> Result<Self, ProvenanceError> {
+    pub fn lockfile(mut self, path: impl AsRef<Path>) -> Result<Self, ProvenanceError> {
         self.lockfile_sha256 = Some(sha256_file(path)?);
         Ok(self)
     }
 
-    /// Records `name` as the version line `program arguments...` prints.
+    /// Records `name` as the version line `program arguments...` prints; see [`tool_version`].
     pub fn tool<I, S>(
         mut self,
-        name: &str,
-        program: &str,
+        name: impl Into<String>,
+        program: impl AsRef<OsStr>,
         arguments: I,
     ) -> Result<Self, ProvenanceError>
     where
@@ -305,48 +430,66 @@ impl Provenance {
         S: AsRef<OsStr>,
     {
         self.tools
-            .insert(name.to_string(), tool_version(program, arguments)?);
+            .insert(name.into(), tool_version(program, arguments)?);
+        Ok(self)
+    }
+
+    /// Records `name` as the version line `command` prints; see [`command_version`].
+    pub fn tool_command(
+        mut self,
+        name: impl Into<String>,
+        command: &mut Command,
+    ) -> Result<Self, ProvenanceError> {
+        self.tools.insert(name.into(), command_version(command)?);
         Ok(self)
     }
 
     /// Records `name` as the digest of the image at `path`.
-    pub fn image(mut self, name: &str, path: &Path) -> Result<Self, ProvenanceError> {
-        self.images.insert(name.to_string(), sha256_file(path)?);
+    pub fn image(
+        mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, ProvenanceError> {
+        self.images.insert(name.into(), sha256_file(path)?);
         Ok(self)
     }
 
-    /// Every field that differs from `other`, as `field: this -> other`, with tools and images
-    /// keyed by name. A field present in only one record counts as a difference.
-    pub fn differences(&self, other: &Self) -> Vec<String> {
-        fn show(value: Option<&String>) -> &str {
-            value.map_or("(absent)", String::as_str)
-        }
+    /// Every field whose value differs from `other`'s, in field order. A field present in only
+    /// one record counts as a difference.
+    pub fn differences(&self, other: &Self) -> Vec<ProvenanceDifference> {
         let mut out = Vec::new();
-        let mut field = |name: String, this: Option<&String>, that: Option<&String>| {
+        let mut compare = |field: ProvenanceField, this: Option<&String>, that: Option<&String>| {
             if this != that {
-                out.push(format!("{name}: {} -> {}", show(this), show(that)));
+                out.push(ProvenanceDifference {
+                    field,
+                    this: this.cloned(),
+                    other: that.cloned(),
+                });
             }
         };
-        field(
-            "source-tree-sha256".to_string(),
+        compare(
+            ProvenanceField::SourceTree,
             self.source_tree_sha256.as_ref(),
             other.source_tree_sha256.as_ref(),
         );
-        field(
-            "lockfile-sha256".to_string(),
+        compare(
+            ProvenanceField::Lockfile,
             self.lockfile_sha256.as_ref(),
             other.lockfile_sha256.as_ref(),
         );
-        for (kind, this, that) in [
-            ("tools", &self.tools, &other.tools),
-            ("images", &self.images, &other.images),
-        ] {
-            let mut names = this.keys().chain(that.keys()).collect::<Vec<_>>();
-            names.sort();
-            names.dedup();
-            for name in names {
-                field(format!("{kind}.{name}"), this.get(name), that.get(name));
-            }
+        let names = |this: &BTreeMap<String, String>, that: &BTreeMap<String, String>| {
+            this.keys()
+                .chain(that.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        for name in names(&self.tools, &other.tools) {
+            let (this, that) = (self.tools.get(&name), other.tools.get(&name));
+            compare(ProvenanceField::Tool(name.clone()), this, that);
+        }
+        for name in names(&self.images, &other.images) {
+            let (this, that) = (self.images.get(&name), other.images.get(&name));
+            compare(ProvenanceField::Image(name.clone()), this, that);
         }
         out
     }
@@ -456,6 +599,90 @@ mod tests {
     }
 
     #[test]
+    fn order_is_by_component_not_by_string() {
+        // As strings "a-b/x" < "a/b" ('-' sorts before '/'); by component "a" < "a-b".
+        let scratch = Scratch::new("order");
+        scratch.write("d/a-b/x.rs", "1");
+        scratch.write("d/a/b.rs", "2");
+        let tree = SourceTree::new(&scratch.0).directory("d").extension("rs");
+        assert_eq!(
+            tree.select().unwrap(),
+            [
+                Path::new("d").join("a").join("b.rs"),
+                Path::new("d").join("a-b").join("x.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_selections_count_each_file_once() {
+        let scratch = Scratch::new("overlap");
+        sample(&scratch);
+        let once = tree(&scratch.0);
+        let twice = tree(&scratch.0)
+            .file("crate/src/lib.rs")
+            .file("./Cargo.toml")
+            .directory("crate/src");
+        assert_eq!(twice.select().unwrap(), once.select().unwrap());
+        assert_eq!(twice.sha256().unwrap(), once.sha256().unwrap());
+    }
+
+    #[test]
+    fn paths_may_not_leave_the_root() {
+        let scratch = Scratch::new("escape");
+        sample(&scratch);
+        for escaping in [
+            tree(&scratch.0).file("../outside.toml"),
+            tree(&scratch.0).file("crate/../Cargo.toml"),
+            tree(&scratch.0).directory(".."),
+            tree(&scratch.0).file(scratch.0.join("Cargo.toml")),
+        ] {
+            assert!(
+                matches!(escaping.select(), Err(ProvenanceError::OutsideRoot(_))),
+                "{escaping:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selections_that_match_nothing_are_errors() {
+        let scratch = Scratch::new("empty");
+        sample(&scratch);
+        assert!(matches!(
+            SourceTree::new(&scratch.0).directory("crate").select(),
+            Err(ProvenanceError::EmptySelection)
+        ));
+        assert!(matches!(
+            SourceTree::new(&scratch.0)
+                .directory("crate")
+                .extension("md")
+                .directory("crate/target")
+                .skip_directories(["crate"])
+                .extension("zig")
+                .select()
+                .map(|selected| selected.len()),
+            // README.md is still found: skips apply below a listed directory, not to it.
+            Ok(1)
+        ));
+        assert!(matches!(
+            SourceTree::new(&scratch.0)
+                .directory("crate")
+                .extension(".rs")
+                .select(),
+            Err(ProvenanceError::InvalidExtension(extension)) if extension == ".rs"
+        ));
+    }
+
+    #[test]
+    fn failing_tools_are_errors() {
+        let error = tool_version("cargo", ["--no-such-flag-for-provenance"]).unwrap_err();
+        assert!(matches!(error, ProvenanceError::Tool { .. }), "{error}");
+        let mut command = Command::new("cargo");
+        command.arg("--version").current_dir(std::env::temp_dir());
+        assert!(command_version(&mut command).unwrap().starts_with("cargo "));
+    }
+
+    #[test]
     fn missing_inputs_are_errors() {
         let scratch = Scratch::new("missing");
         sample(&scratch);
@@ -468,7 +695,7 @@ mod tests {
             Err(ProvenanceError::Io { .. })
         ));
         assert!(matches!(
-            sha256_file(&scratch.0.join("absent.lock")),
+            sha256_file(scratch.0.join("absent.lock")),
             Err(ProvenanceError::Io { .. })
         ));
         assert!(matches!(
@@ -485,11 +712,11 @@ mod tests {
         let record = Provenance::new()
             .source_tree(&tree(&scratch.0))
             .unwrap()
-            .lockfile(&scratch.0.join("Cargo.toml"))
+            .lockfile(scratch.0.join("Cargo.toml"))
             .unwrap()
             .tool("cargo", "cargo", ["--version"])
             .unwrap()
-            .image("app", &scratch.0.join("app.elf"))
+            .image("app", scratch.0.join("app.elf"))
             .unwrap();
         assert!(record.tools["cargo"].starts_with("cargo "));
         assert_eq!(
@@ -505,12 +732,30 @@ mod tests {
         other.images.remove("app");
         other
             .images
-            .insert("bootloader".to_string(), "00".to_string());
+            .insert("boot.loader: x".to_string(), "00".to_string());
         let differences = other.differences(&record);
-        assert_eq!(differences.len(), 3, "{differences:?}");
-        assert!(differences[0].starts_with("tools.cargo: cargo 0.0.0 -> cargo "));
-        assert!(differences[1].starts_with("images.app: (absent) -> "));
-        assert_eq!(differences[2], "images.bootloader: 00 -> (absent)");
+        assert_eq!(
+            differences
+                .iter()
+                .map(|difference| &difference.field)
+                .collect::<Vec<_>>(),
+            [
+                &ProvenanceField::Tool("cargo".to_string()),
+                &ProvenanceField::Image("app".to_string()),
+                &ProvenanceField::Image("boot.loader: x".to_string()),
+            ]
+        );
+        assert_eq!(differences[0].this.as_deref(), Some("cargo 0.0.0"));
+        assert_eq!(differences[1].this, None);
+        assert_eq!(
+            differences[2].to_string(),
+            "image \"boot.loader: x\": 00 -> (absent)"
+        );
+        // Unknown fields are refused rather than silently dropped from a comparison.
+        assert!(
+            serde_json::from_value::<Provenance>(serde_json::json!({"compiler-flags": "x"}))
+                .is_err()
+        );
 
         let json = serde_json::to_value(&record).unwrap();
         assert!(json.get("source-tree-sha256").is_some());
