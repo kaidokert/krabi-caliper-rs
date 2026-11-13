@@ -118,31 +118,37 @@ use krabi_caliper::host::exec_trace::{
     ExecTracePcs, QemuExecTrace, TraceMarker, marker_intervals,
 };
 
-let trace = std::path::Path::new("target/trace.log");
-QemuExecTrace::new(
+let (trace, _attempts) = QemuExecTrace::new(
     "qemu-system-arm",
     ["-cpu", "cortex-m4", "-machine", "mps2-an386", "-nographic",
      "-semihosting-config", "enable=on,target=native", "-kernel", "app.elf"],
 )
 .attempts(3)
-.capture(trace)?;
-// Marker functions from the symbol table: address and size.
-let begin = TraceMarker::function(0x1000, 4);
-let end = TraceMarker::function(0x1004, 4);
-let intervals = marker_intervals(ExecTracePcs::open(trace)?, &begin, &end, None)?;
+.timeout(std::time::Duration::from_secs(120))
+.capture(std::path::Path::new("target/trace.log"))?;
+// Marker functions from the symbol table: value (bit 0 is ignored) and size.
+let begin = TraceMarker::function(0x1001, 4);
+let end = TraceMarker::function(0x1005, 4);
+let intervals = marker_intervals(ExecTracePcs::open(&trace)?, &begin, &end, None)?;
 let counts: Vec<usize> = intervals.iter().map(Vec::len).collect();
 ```
 
 `capture` appends `-accel tcg,one-insn-per-tb=on -d exec,nochain -D <trace>`,
-which makes every executed instruction one log line (QEMU 8.1 or later), and
-retries failed runs. The image must exit on its own; there is no timeout.
+which makes every executed instruction one log line (QEMU 8.1 or later). It
+kills a run at the timeout, which also bounds the trace size, and retries
+failed runs. A relative trace path is resolved against `cwd`. The image must
+exit on its own, for example through semihosting.
 
-An interval opens on a PC in `begin`, skips the rest of the begin function's
-own body, and holds every later PC up to (not including) the first PC in `end`.
+An interval opens on a PC in `begin` and skips PCs that stay in `begin` right
+after it. It then holds every later PC up to (not including) the first PC in
+`end`, including callees, returns into `begin` and interrupt handlers.
 `TraceMarker::Address` marks a single address instead of a function. Pass a
-limit to stop after that many intervals. A trace that ends inside an interval is
-an error. Each interval keeps its PCs, so callers can attribute them to
-functions (for example with a disassembly) before counting.
+limit to stop after that many intervals. A trace that ends inside an interval,
+or never reaches `begin`, is an error, as is a `Trace` line without a readable
+PC. Each interval keeps its PCs, so callers can attribute them to functions
+(for example with a disassembly) before counting. PCs and markers are compared
+with bit 0 cleared (Thumb), and the CPU index is ignored, so trace single-core
+machines.
 
 These are instruction counts from an emulator, not cycles: QEMU models no
 pipeline, caches or wait states. Record the QEMU version with the counts, since
