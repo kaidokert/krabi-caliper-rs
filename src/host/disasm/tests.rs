@@ -104,8 +104,108 @@ fn call_edges_and_frames() {
     // A tail branch to another function counts as an edge.
     assert_eq!(indirect.calls, BTreeSet::from([0x120]));
     assert_eq!(indirect.unresolved_calls, ["0x12e: blx r3"]);
-    // A self-call is not an edge.
+    // A self-call is not an edge, but it is recorded.
     assert!(d.functions[&0x140].calls.is_empty());
+    assert!(d.functions[&0x140].calls_self);
+    assert!(!entry.calls_self);
+    assert!(d.functions.values().all(|f| f.uncounted.is_empty()));
+}
+
+#[test]
+fn what_the_estimate_cannot_see_is_listed() {
+    let nm = "00000100 00000040 T f\n00000200 00000004 T g\n";
+    let objdump = "
+00000100 <f>:
+     100: \tvpush\t{d8}
+     104: \tsubw\tsp, sp, #0x404
+     108: \tsub\tsp, #16
+     10a: \tadd\tsp, r1
+     10c: \tstr\tr0, [sp, #-0x8]!
+     110: \tbx\tr3
+     112: \tmov\tpc, r2
+     114: \tldr\tpc, [r0]
+     118: \tbl\t0x300
+     11c: \tb\t120 <g>
+     120: \tb\t0x204 <g+0x4>
+     124: \tb\t0x100 <f>
+     128: \tbne\t0x110 <f+0x10>
+     12a: \ttbb\t[pc, r0]
+     12e: \tbx\tlr
+
+00000200 <g>:
+     200: \tbx\tlr
+";
+    let d = Disassembly::parse(nm, objdump).unwrap();
+    let f = &d.functions[&0x100];
+    let reasons = f
+        .uncounted
+        .iter()
+        .map(|line| line.split_once(' ').unwrap().1)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        [
+            "vpush {d8} (vpush not counted)",
+            "subw sp, sp, #0x404 (subw not counted)",
+            "sub sp, #16 (stack adjustment not counted)",
+            "add sp, r1 (register stack adjustment not counted)",
+            "str r0, [sp, #-0x8]! (pre-indexed store to sp not counted)",
+            "bx r3 (indirect branch)",
+            "mov pc, r2 (indirect branch)",
+            "ldr pc, [r0] (indirect branch)",
+            "bl 0x300 (target starts no function)",
+            "b 120 <g> (indirect branch)",
+            "b 0x204 <g+0x4> (target starts no function)",
+        ]
+    );
+    // A `b` to its own start is a loop, not recursion; internal branches and table branches
+    // are fine.
+    assert!(!f.calls_self);
+    assert!(f.calls.is_empty());
+    assert_eq!(f.local_stack_upper, 0);
+    assert_eq!(
+        d.composed_stack_upper(0x100).unwrap(),
+        ComposedStack {
+            bytes: 0,
+            bounded: false
+        }
+    );
+}
+
+#[test]
+fn shared_callees_compose_once_and_identically() {
+    // A diamond: a calls b and c, both call d. Each level doubles the paths.
+    let mut nm = String::new();
+    let mut objdump = String::new();
+    let levels = 40u64;
+    for level in 0..levels {
+        for side in 0..2u64 {
+            let address = 0x1000 + level * 0x20 + side * 0x10;
+            nm.push_str(&format!("{address:08x} 00000010 T f{level}_{side}\n"));
+            objdump.push_str(&format!(
+                "{address:08x} <f{level}_{side}>:\n {address:x}: \tpush\t{{r7, lr}}\n"
+            ));
+            if level + 1 < levels {
+                for next in 0..2u64 {
+                    let target = 0x1000 + (level + 1) * 0x20 + next * 0x10;
+                    objdump.push_str(&format!(
+                        " {:x}: \tbl\t{target:#x} <f{}_{next}>\n",
+                        address + 2 + next * 4,
+                        level + 1
+                    ));
+                }
+            }
+        }
+    }
+    let d = Disassembly::parse(&nm, &objdump).unwrap();
+    // 2^40 paths; memoised composition still answers at once.
+    assert_eq!(
+        d.composed_stack_upper(0x1000).unwrap(),
+        ComposedStack {
+            bytes: 8 * levels,
+            bounded: true
+        }
+    );
 }
 
 #[test]
@@ -126,15 +226,16 @@ fn lookups_and_reachability() {
         Err(DisasmError::NotUnique { matches: 0, .. })
     ));
     assert_eq!(
-        d.reachable_from(0x100, UnresolvedCalls::Allow).unwrap(),
+        d.reachable_from(0x100, UnresolvedCallPolicy::Allow)
+            .unwrap(),
         BTreeSet::from([0x100, 0x120, 0x12c])
     );
     assert!(matches!(
-        d.reachable_from(0x100, UnresolvedCalls::Reject),
+        d.reachable_from(0x100, UnresolvedCallPolicy::Reject),
         Err(DisasmError::UnresolvedCalls { .. })
     ));
     assert!(matches!(
-        d.reachable_from(0x999, UnresolvedCalls::Allow),
+        d.reachable_from(0x999, UnresolvedCallPolicy::Allow),
         Err(DisasmError::MissingFunction(0x999))
     ));
 }
@@ -165,6 +266,11 @@ fn composed_stack_follows_the_deepest_chain() {
         )
         .unwrap()
         .composed_stack_upper(0x140),
+        Err(DisasmError::Recursive(0x140))
+    ));
+    // Direct recursion through `bl` to its own start.
+    assert!(matches!(
+        d.composed_stack_upper(0x140),
         Err(DisasmError::Recursive(0x140))
     ));
     assert!(matches!(
@@ -258,14 +364,11 @@ fn first_stack_allocation_takes_one_per_function() {
 #[test]
 fn chain_budget_reports_every_frame_and_the_total() {
     let frames = BTreeMap::from([("entry", 16), ("a", 8), ("b", 24), ("c", 40), ("d", 32)]);
-    let budget = ChainBudget {
-        entry: ("entry".to_string(), 16),
-        serial: vec![("a".to_string(), 8), ("b".to_string(), 16)],
-        nested: vec![("c".to_string(), 64), ("d".to_string(), 64)],
-        overhead: 4,
-        entry_overhead: 8,
-        chain_limit: 100,
-    };
+    let mut budget = ChainBudget::new("entry", 16, 100);
+    budget.serial = vec![("a".to_string(), 8), ("b".to_string(), 16)];
+    budget.nested = vec![("c".to_string(), 64), ("d".to_string(), 64)];
+    budget.overhead = 4;
+    budget.entry_overhead = 8;
     let lines = budget
         .check(|name| Ok(frames[name]))
         .unwrap()
@@ -283,4 +386,30 @@ fn chain_budget_reports_every_frame_and_the_total() {
             ("chain".to_string(), 16 + 32 + 40 + 4 + 8, true),
         ]
     );
+    // Sums saturate instead of overflowing.
+    let mut huge = ChainBudget::new("entry", u64::MAX, u64::MAX);
+    huge.serial = vec![("a".to_string(), u64::MAX), ("b".to_string(), u64::MAX)];
+    let lines = huge.check(|_| Ok(u64::MAX)).unwrap();
+    assert_eq!(lines.last().unwrap().bytes, u64::MAX);
+}
+
+#[test]
+fn llvm_line_annotations_and_tool_errors() {
+    // LLVM's `objdump -l` prints `; path:line` comments.
+    let listing = "\
+00001000 <compute>:
+; compute():
+; /src/app/src/filter.rs:10
+    1000: \tpush\t{r7, lr}
+; /src/app/src/other.rs:3
+    1002: \tbx\tlr
+";
+    assert_eq!(
+        line_attributed_instructions(listing, "src/filter.rs", 10..=10, true),
+        1
+    );
+    let missing = DisasmTools::new("krabi-caliper-no-such-nm", "krabi-caliper-no-such-objdump");
+    let error = Disassembly::from_elf("image", &missing).unwrap_err();
+    assert!(matches!(error, DisasmError::Tool { .. }), "{error}");
+    assert!(error.to_string().contains("krabi-caliper-no-such-nm"));
 }

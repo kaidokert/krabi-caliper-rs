@@ -1,6 +1,11 @@
 //! Disassembly of linked Arm Thumb (Cortex-M) images: functions with their sizes, instructions,
-//! static call edges, a conservative per-function stack frame, and composed call-chain stack
-//! bounds, plus helpers over objdump listings for source-line attribution and frame lookup.
+//! static call edges, a per-function stack frame estimate, and composed call-chain stack
+//! estimates, plus helpers over objdump listings for source-line attribution and frame lookup.
+//! A32 (Arm-state) code is untested.
+//!
+//! The frame and call analysis is a text heuristic, not a proof. What it can see it leaves out
+//! is listed per function ([`Function::unresolved_calls`], [`Function::uncounted`]) and clears
+//! [`ComposedStack::bounded`]; exception entry and interrupt handlers are never included.
 //!
 //! Symbol names come from the LLVM tools' own demangler (`nm -C`, `objdump --demangle`), not
 //! from Caliper's, so a name matches what `nm` prints. For legacy Rust mangling that keeps the
@@ -9,7 +14,10 @@
 //!
 //! [`Disassembly::parse`] works on the text of `nm -S -n -C` and
 //! `objdump -d --demangle --no-show-raw-insn`; [`Disassembly::from_elf`] runs them. Immediates
-//! are read in hexadecimal (`#0x..`), as LLVM's objdump prints them.
+//! are read in hexadecimal (`#0x..`) and branch targets as `0x..` addresses, as current LLVM
+//! objdump prints them. GNU objdump's decimal immediates and bare targets are not read: a
+//! `sub sp` immediate or branch target that cannot be read is listed in
+//! [`Function::uncounted`] (or [`Function::unresolved_calls`] for `bl`/`blx`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -110,9 +118,9 @@ impl DisasmTools {
 #[non_exhaustive]
 pub struct Function {
     pub address: u64,
-    /// The symbol size from `nm`, or 0 when `nm` gives none.
+    /// The symbol size from `nm`, or 0 when `nm` gives none at the objdump header's address.
     pub size: u64,
-    /// The `nm` name at this address (the first in address order when several share it), or
+    /// The `nm` name at this address (when several share it, the first in `nm -n` output), or
     /// the objdump header's name when `nm` has none.
     pub name: String,
     /// Instruction addresses, ascending.
@@ -123,8 +131,18 @@ pub struct Function {
     /// `bl`/`blx` instructions whose target is not a literal address (indirect calls), as
     /// `address: mnemonic operands`.
     pub unresolved_calls: Vec<String>,
-    /// A conservative frame size: four bytes per register pushed plus every `sub sp, #imm`.
-    /// `vpush`, pre-indexed stores to `sp` and register-sized adjustments are not counted.
+    /// Whether a `bl`/`blx` targets this function's own start (direct recursion). A `b` to its
+    /// own start is indistinguishable from a loop and is not counted.
+    pub calls_self: bool,
+    /// Instructions that make [`Function::local_stack_upper`] or the call edges incomplete, as
+    /// `address: mnemonic operands (reason)`: indirect branches other than `bx lr`, branches or
+    /// calls to an address that starts no function and is not inside this one, and stack
+    /// adjustments the frame estimate does not count.
+    pub uncounted: Vec<String>,
+    /// A frame estimate: four bytes per register pushed plus every `sub sp, ..., #0x..`. Not
+    /// counted, and listed in [`Function::uncounted`]: `subw`, `vpush`, pre-indexed stores to
+    /// `sp`, register-sized adjustments (`sub sp, rN`, the `ldr`/`add sp` sequence Armv6-M uses
+    /// for large frames) and decimal immediates.
     pub local_stack_upper: u64,
 }
 
@@ -133,9 +151,9 @@ pub struct Function {
 #[non_exhaustive]
 pub struct Instruction {
     pub address: u64,
-    /// Inferred from the next instruction's address (or the function's end), clamped to 2..=4;
-    /// literal pools between instructions therefore never make an instruction look longer
-    /// than 4 bytes.
+    /// Inferred from the gap to the next instruction (or to the function's end, or 2 when the
+    /// size is unknown): gaps of 5 to 255 bytes give 4, so literal pools never make an
+    /// instruction look longer than 4 bytes, and gaps above 255 bytes give 2.
     pub size: u8,
     /// Lowercase, as printed (`bne.w`, `push`).
     pub mnemonic: String,
@@ -153,20 +171,22 @@ pub struct Disassembly {
     pub instructions: BTreeMap<u64, Instruction>,
 }
 
-/// A composed call-chain stack bound.
+/// A composed call-chain stack estimate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ComposedStack {
     /// The largest sum of [`Function::local_stack_upper`] along any static call chain.
     pub bytes: u64,
-    /// False when a function on the way makes unresolved (indirect) calls, whose callees are
-    /// not included: `bytes` is then not an upper bound.
+    /// True when no function in the chains made an unresolved call or had anything listed in
+    /// [`Function::uncounted`]. This rules out the omissions the analysis can see; it is not a
+    /// proof that `bytes` bounds the stack. Exception entry (32 bytes, or 104 with the
+    /// floating-point context) and interrupt handlers are never included.
     pub bounded: bool,
 }
 
 /// Whether a reachability walk accepts functions with unresolved calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnresolvedCalls {
+pub enum UnresolvedCallPolicy {
     Reject,
     Allow,
 }
@@ -247,6 +267,8 @@ impl Disassembly {
                     instructions: Vec::new(),
                     calls: BTreeSet::new(),
                     unresolved_calls: Vec::new(),
+                    calls_self: false,
+                    uncounted: Vec::new(),
                     local_stack_upper: 0,
                 });
                 current = Some(address);
@@ -300,35 +322,67 @@ impl Disassembly {
 
         let starts = functions.keys().copied().collect::<BTreeSet<_>>();
         for function in functions.values_mut() {
-            let mut pushes = 0;
-            let mut allocations = 0;
+            let mut pushes: u64 = 0;
+            let mut allocations: u64 = 0;
             for address in &function.instructions {
                 let Some(instruction) = instructions.get(address) else {
                     continue;
                 };
+                let describe = |reason: &str| {
+                    format!(
+                        "{:#x}: {} {} ({reason})",
+                        instruction.address, instruction.mnemonic, instruction.operands
+                    )
+                };
                 let mnemonic = thumb::normalize_mnemonic(&instruction.mnemonic);
+                let operands = instruction.operands.trim_start();
                 if mnemonic == "push" {
-                    pushes += thumb::register_count(&instruction.operands) * 4;
-                } else if mnemonic == "sub" && instruction.operands.trim_start().starts_with("sp,")
-                {
-                    allocations += thumb::immediate_value(&instruction.operands).unwrap_or(0);
+                    pushes = pushes.saturating_add(
+                        thumb::register_count(&instruction.operands).saturating_mul(4),
+                    );
+                } else if mnemonic == "sub" && operands.starts_with("sp,") {
+                    match thumb::immediate_value(&instruction.operands) {
+                        Some(bytes) => allocations = allocations.saturating_add(bytes),
+                        None => function
+                            .uncounted
+                            .push(describe("stack adjustment not counted")),
+                    }
+                } else if let Some(reason) = uncounted_stack_change(&mnemonic, operands) {
+                    function.uncounted.push(describe(reason));
                 }
                 if thumb::is_control_transfer(&mnemonic) {
+                    let call = mnemonic == "bl" || mnemonic == "blx";
                     match thumb::target_address(&instruction.operands) {
-                        Some(target) if starts.contains(&target) && target != function.address => {
+                        Some(target) if target == function.address => {
+                            function.calls_self |= call;
+                        }
+                        Some(target) if starts.contains(&target) => {
                             function.calls.insert(target);
                         }
-                        None if mnemonic == "bl" || mnemonic == "blx" => {
+                        Some(target)
+                            if instructions
+                                .get(&target)
+                                .is_some_and(|inside| inside.owner == function.address) => {}
+                        Some(_) => function
+                            .uncounted
+                            .push(describe("target starts no function")),
+                        None if call => {
                             function.unresolved_calls.push(format!(
                                 "{:#x}: {} {}",
                                 instruction.address, instruction.mnemonic, instruction.operands
                             ));
                         }
-                        _ => {}
+                        None if mnemonic == "bx" && operands == "lr" => {}
+                        None if mnemonic == "tbb" || mnemonic == "tbh" => {}
+                        None => function.uncounted.push(describe("indirect branch")),
                     }
+                } else if (mnemonic == "mov" || mnemonic.starts_with("ldr"))
+                    && operands.starts_with("pc,")
+                {
+                    function.uncounted.push(describe("indirect branch"));
                 }
             }
-            function.local_stack_upper = pushes + allocations;
+            function.local_stack_upper = pushes.saturating_add(allocations);
         }
         Ok(Self {
             functions,
@@ -370,7 +424,7 @@ impl Disassembly {
     pub fn reachable_from(
         &self,
         root: u64,
-        unresolved: UnresolvedCalls,
+        unresolved: UnresolvedCallPolicy,
     ) -> Result<BTreeSet<u64>, DisasmError> {
         let mut reachable = BTreeSet::new();
         let mut pending = vec![root];
@@ -382,7 +436,7 @@ impl Disassembly {
                 .functions
                 .get(&address)
                 .ok_or(DisasmError::MissingFunction(address))?;
-            if unresolved == UnresolvedCalls::Reject && !function.unresolved_calls.is_empty() {
+            if unresolved == UnresolvedCallPolicy::Reject && !function.unresolved_calls.is_empty() {
                 return Err(DisasmError::UnresolvedCalls {
                     function: function.name.clone(),
                     calls: function.unresolved_calls.clone(),
@@ -394,17 +448,24 @@ impl Disassembly {
     }
 
     /// The deepest static call chain below `root`, summing each function's
-    /// [`Function::local_stack_upper`]. Recursion is an error.
+    /// [`Function::local_stack_upper`]. Recursion through call edges, and a `bl`/`blx` to a
+    /// function's own start, are errors. Each function is composed once, so shared callees
+    /// cost nothing extra.
     pub fn composed_stack_upper(&self, root: u64) -> Result<ComposedStack, DisasmError> {
         let mut visiting = BTreeSet::new();
-        self.compose(root, &mut visiting)
+        let mut done = BTreeMap::new();
+        self.compose(root, &mut visiting, &mut done)
     }
 
     fn compose(
         &self,
         address: u64,
         visiting: &mut BTreeSet<u64>,
+        done: &mut BTreeMap<u64, ComposedStack>,
     ) -> Result<ComposedStack, DisasmError> {
+        if let Some(composed) = done.get(&address) {
+            return Ok(*composed);
+        }
         if !visiting.insert(address) {
             return Err(DisasmError::Recursive(address));
         }
@@ -412,19 +473,41 @@ impl Disassembly {
             .functions
             .get(&address)
             .ok_or(DisasmError::MissingFunction(address))?;
+        if function.calls_self {
+            return Err(DisasmError::Recursive(address));
+        }
         let mut deepest = 0;
-        let mut bounded = function.unresolved_calls.is_empty();
+        let mut bounded = function.unresolved_calls.is_empty() && function.uncounted.is_empty();
         for child in &function.calls {
-            let below = self.compose(*child, visiting)?;
+            let below = self.compose(*child, visiting, done)?;
             deepest = deepest.max(below.bytes);
             bounded &= below.bounded;
         }
         visiting.remove(&address);
-        Ok(ComposedStack {
-            bytes: function.local_stack_upper + deepest,
+        let composed = ComposedStack {
+            bytes: function.local_stack_upper.saturating_add(deepest),
             bounded,
-        })
+        };
+        done.insert(address, composed);
+        Ok(composed)
     }
+}
+
+/// Why an instruction that moves the stack pointer down is left out of the frame estimate.
+fn uncounted_stack_change(mnemonic: &str, operands: &str) -> Option<&'static str> {
+    if mnemonic == "vpush" {
+        return Some("vpush not counted");
+    }
+    if mnemonic == "subw" && operands.starts_with("sp,") {
+        return Some("subw not counted");
+    }
+    if mnemonic == "add" && operands.starts_with("sp,") && !operands.contains('#') {
+        return Some("register stack adjustment not counted");
+    }
+    if mnemonic.starts_with("str") && operands.contains("[sp, #-") && operands.ends_with("]!") {
+        return Some("pre-indexed store to sp not counted");
+    }
+    None
 }
 
 fn parse_hex(value: &str) -> Option<u64> {
@@ -483,7 +566,8 @@ pub fn function_body(listing: &str, name: &str) -> Option<String> {
 }
 
 /// Counts instructions an `objdump -d -l` listing attributes to `lines` of the source file
-/// whose `/`-separated path ends with `file_suffix`.
+/// whose `/`-separated path contains `file_suffix` (a substring match: `filter.rs` also
+/// matches `prefilter.rs`, so pass enough of the path to be unique).
 ///
 /// A `<path>:<line>` annotation for that file starts attribution when its line is in range;
 /// an annotation for any other `.rs` file, or a function header, ends it. Backslashes in
@@ -527,8 +611,11 @@ pub fn line_attributed_instructions(
 
 /// The largest explicit frame allocation among functions whose header contains `fragment`:
 /// for each, the immediate of the first line that mentions `sub` and `sp,` with a `#0x..`
-/// immediate. Pushes are not counted. With `allow_inlined`, no allocation gives 0 (the function
-/// may have been inlined away); otherwise it is an error.
+/// immediate. This is a text match: `sub.w r4, sp, #0x40` (address arithmetic) also matches,
+/// the header match includes the address text, and pushes, `subw` and the register sequences
+/// Armv6-M uses for large frames are not seen. With `allow_inlined`, no allocation gives 0
+/// (the function may have been inlined away, or allocate in a way this does not see);
+/// otherwise it is an error.
 pub fn first_stack_allocation(
     listing: &str,
     fragment: &str,
@@ -598,17 +685,28 @@ impl BudgetLine {
 }
 
 impl ChainBudget {
+    /// A budget with an entry frame and a chain ceiling; add frames and overheads through the
+    /// public fields.
+    pub fn new(entry: impl Into<String>, entry_limit: u64, chain_limit: u64) -> Self {
+        Self {
+            entry: (entry.into(), entry_limit),
+            chain_limit,
+            ..Self::default()
+        }
+    }
+
     /// Measures each frame with `frame(fragment)` and returns every frame and the chain total
-    /// against its ceiling, in order: serial, nested, entry, chain.
+    /// against its ceiling, in order: serial, nested, entry, then the total named `chain`.
+    /// Sums saturate.
     pub fn check<F>(&self, mut frame: F) -> Result<Vec<BudgetLine>, DisasmError>
     where
         F: FnMut(&str) -> Result<u64, DisasmError>,
     {
         let mut lines = Vec::new();
-        let mut serial_sum = 0;
+        let mut serial_sum: u64 = 0;
         for (name, limit) in &self.serial {
             let bytes = frame(name)?;
-            serial_sum += bytes;
+            serial_sum = serial_sum.saturating_add(bytes);
             lines.push(BudgetLine {
                 name: name.clone(),
                 bytes,
@@ -633,7 +731,11 @@ impl ChainBudget {
         });
         lines.push(BudgetLine {
             name: "chain".to_string(),
-            bytes: entry + serial_sum + nested_max + self.overhead + self.entry_overhead,
+            bytes: entry
+                .saturating_add(serial_sum)
+                .saturating_add(nested_max)
+                .saturating_add(self.overhead)
+                .saturating_add(self.entry_overhead),
             limit: self.chain_limit,
         });
         Ok(lines)
@@ -730,20 +832,20 @@ pub mod thumb {
             || matches!(mnemonic, "b" | "bl" | "blx" | "bx" | "tbb" | "tbh")
     }
 
-    /// Single-cycle-class multiplies.
-    pub fn is_multiply(mnemonic: &str) -> bool {
+    /// Multiplies with a 32-bit result (a stem list; timing differs between cores).
+    pub(crate) fn is_multiply(mnemonic: &str) -> bool {
         matches!(mnemonic, "mul" | "muls" | "mla" | "mls")
             || mnemonic.starts_with("smla")
             || mnemonic.starts_with("smul")
     }
 
     /// Long (64-bit result) multiplies.
-    pub fn is_long_multiply(mnemonic: &str) -> bool {
+    pub(crate) fn is_long_multiply(mnemonic: &str) -> bool {
         matches!(mnemonic, "smull" | "umull" | "smlal" | "umlal" | "umaal")
     }
 
-    /// Data-processing and hint instructions with no memory access or branch.
-    pub fn is_simple_alu(mnemonic: &str) -> bool {
+    /// Data-processing and hint instructions with no memory access or branch (a stem list).
+    pub(crate) fn is_simple_alu(mnemonic: &str) -> bool {
         matches!(
             mnemonic,
             "adc"

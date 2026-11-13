@@ -204,24 +204,35 @@ symbols.
 `host::disasm` (with `host`) reads a linked Arm Thumb image through LLVM's
 `nm -S -n -C` and `objdump -d --demangle --no-show-raw-insn`:
 
-```rust
-use krabi_caliper::host::disasm::{Disassembly, DisasmTools, UnresolvedCalls};
+```rust,ignore
+use krabi_caliper::host::disasm::{Disassembly, DisasmTools, UnresolvedCallPolicy};
 
-let image = Disassembly::from_elf("target/thumbv7em-none-eabi/release/app",
-                                  &DisasmTools::cargo_binutils())?;
-let root = image.find_unique("app::measured::")?.address;
-let reachable = image.reachable_from(root, UnresolvedCalls::Reject)?;
-let stack = image.composed_stack_upper(root)?;
-assert!(stack.bounded, "indirect calls below the root are not counted");
+fn stack_of(elf: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let image = Disassembly::from_elf(elf, &DisasmTools::cargo_binutils())?;
+    let root = image.find_unique("app::measured::")?.address;
+    let _reachable = image.reachable_from(root, UnresolvedCallPolicy::Reject)?;
+    let stack = image.composed_stack_upper(root)?;
+    if !stack.bounded {
+        return Err("the analysis skipped something below the root".into());
+    }
+    Ok(stack.bytes)
+}
 ```
 
 Each function carries its `nm` size, instructions, static call edges (calls,
-tail calls and conditional branches into another function) and a conservative
-frame: four bytes per pushed register plus every `sub sp, #imm`.
-`composed_stack_upper` sums frames along the deepest static chain, rejects
-recursion, and reports `bounded = false` when an indirect call was skipped.
-Names are the LLVM tools' demangled names, hashes included, so record those
-tools' versions with the measurement.
+tail calls and conditional branches into another function) and a frame
+estimate: four bytes per pushed register plus every `sub sp, #0x..`.
+`composed_stack_upper` sums frames along the deepest static chain and rejects
+recursion. It is a heuristic, not a proof: indirect calls, indirect branches,
+branches to addresses that start no function, and stack adjustments it does not
+count (`subw`, `vpush`, register adjustments, decimal immediates) are listed per
+function and clear `bounded`. Exception entry and interrupt handlers are never
+included. Literal-pool words that objdump decodes as branches also show up as
+uncounted, so a cleared `bounded` needs a look at the listed lines rather than
+being an error by itself. Read the listing with current LLVM tools: GNU objdump's decimal
+immediates and bare targets are not parsed (they show up as uncounted). Names
+are the LLVM tools' demangled names, hashes included, so record those tools'
+versions with the measurement.
 
 For objdump listings, `function_body` extracts one function,
 `line_attributed_instructions` counts instructions that `objdump -d -l`
