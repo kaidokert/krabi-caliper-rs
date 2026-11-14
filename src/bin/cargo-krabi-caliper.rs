@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use krabi_caliper::host::CommandRunner;
 #[cfg(feature = "ctgrind")]
 use krabi_caliper::host::ctgrind::CtgrindCommand;
+use krabi_caliper::host::elf_audit::{ElfAuditRules, StringScope, audit_elf};
 use krabi_caliper::host::panic_audit::{
     ArtifactKind, DEFAULT_FORBIDDEN_TARGETS, PanicAuditConfig, run as run_panic_audit,
 };
@@ -18,6 +19,12 @@ use krabi_caliper::host::{
     ToolkitConfig, compare_campaigns, ensure_parent, read_campaign, read_combined_inputs,
     run_timestamped_command,
 };
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AuditStringScope {
+    AllocatedSections,
+    WholeFile,
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum PanicArtifactKind {
@@ -82,6 +89,33 @@ enum Command {
         /// Override llvm-objdump or avr-objdump discovery.
         #[arg(long)]
         objdump: Option<PathBuf>,
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+    /// Check built ELF images for required and forbidden symbols and strings.
+    ///
+    /// Symbol rules match substrings of demangled symbol names; string rules match bytes in the
+    /// image. Exits with failure if any image breaks any rule.
+    AuditElf {
+        /// ELF images to audit, each against the same rules.
+        #[arg(required = true)]
+        elf: Vec<PathBuf>,
+        /// TOML rule file (`require-symbols`, `forbid-symbols`, `require-strings`,
+        /// `forbid-strings`, `string-scope`); flags add to it.
+        #[arg(long)]
+        rules: Option<PathBuf>,
+        #[arg(long)]
+        require_symbol: Vec<String>,
+        #[arg(long)]
+        forbid_symbol: Vec<String>,
+        #[arg(long)]
+        require_string: Vec<String>,
+        #[arg(long)]
+        forbid_string: Vec<String>,
+        /// Bytes searched by string rules; defaults to the rule file's, else allocated sections.
+        #[arg(long, value_enum)]
+        string_scope: Option<AuditStringScope>,
+        /// Write every image's report as JSON.
         #[arg(long)]
         json: Option<PathBuf>,
     },
@@ -341,6 +375,64 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             })?;
             report.print_human();
             Ok(report.success())
+        }
+        Command::AuditElf {
+            elf,
+            rules,
+            require_symbol,
+            forbid_symbol,
+            require_string,
+            forbid_string,
+            string_scope,
+            json,
+        } => {
+            let mut audit_rules = match rules {
+                Some(path) => {
+                    let text = fs::read_to_string(&path)
+                        .map_err(|error| format!("{}: {error}", path.display()))?;
+                    toml::from_str::<ElfAuditRules>(&text)
+                        .map_err(|error| format!("{}: {error}", path.display()))?
+                }
+                None => ElfAuditRules::new(),
+            };
+            audit_rules.require_symbols.extend(require_symbol);
+            audit_rules.forbid_symbols.extend(forbid_symbol);
+            audit_rules.require_strings.extend(require_string);
+            audit_rules.forbid_strings.extend(forbid_string);
+            if let Some(scope) = string_scope {
+                audit_rules.string_scope = match scope {
+                    AuditStringScope::AllocatedSections => StringScope::AllocatedSections,
+                    AuditStringScope::WholeFile => StringScope::WholeFile,
+                };
+            }
+            if audit_rules == ElfAuditRules::new().string_scope(audit_rules.string_scope) {
+                return Err("audit-elf needs at least one rule".into());
+            }
+            let mut passed = true;
+            let mut reports = Vec::new();
+            for path in elf {
+                let report = audit_elf(&path, &audit_rules)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                if report.passed() {
+                    println!("{}: pass", path.display());
+                } else {
+                    passed = false;
+                    for violation in &report.violations {
+                        println!("{}: {violation}", path.display());
+                    }
+                }
+                if json.is_some() {
+                    reports.push(serde_json::json!({
+                        "elf": path.to_string_lossy(),
+                        "report": report,
+                    }));
+                }
+            }
+            if let Some(json) = json {
+                ensure_parent(&json)?;
+                fs::write(json, serde_json::to_string_pretty(&reports)?)?;
+            }
+            Ok(passed)
         }
         Command::ValidateConfig { config } => {
             let path = resolve_config(config);
@@ -685,6 +777,42 @@ mod tests {
                 ..
             } if path.as_os_str() == "prepared/manifest.json"
         ));
+    }
+
+    #[test]
+    fn parses_elf_audit_rules() {
+        let parsed = Cli::try_parse_from([
+            "cargo-krabi-caliper",
+            "audit-elf",
+            "a.elf",
+            "b.elf",
+            "--forbid-symbol",
+            "core::panicking",
+            "--forbid-symbol",
+            "__rust_alloc",
+            "--require-string",
+            "org.example/feature",
+            "--string-scope",
+            "whole-file",
+        ])
+        .unwrap();
+        let Command::AuditElf {
+            elf,
+            forbid_symbol,
+            require_string,
+            string_scope,
+            rules,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected audit-elf");
+        };
+        assert_eq!(elf, [PathBuf::from("a.elf"), PathBuf::from("b.elf")]);
+        assert_eq!(forbid_symbol, ["core::panicking", "__rust_alloc"]);
+        assert_eq!(require_string, ["org.example/feature"]);
+        assert!(matches!(string_scope, Some(AuditStringScope::WholeFile)));
+        assert!(rules.is_none());
+        assert!(Cli::try_parse_from(["cargo-krabi-caliper", "audit-elf"]).is_err());
     }
 
     #[test]

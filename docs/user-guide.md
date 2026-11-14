@@ -169,6 +169,36 @@ skips, such as a linker-script `.uninit` region or `.got`, so a size gate can
 require the list to be empty. Runtime reservations such as `riscv-rt`'s
 `.stack` and `.heap` are listed too; a gate allows those by name.
 
+`cargo krabi-caliper audit-elf` checks a built image for symbols and strings
+that must or must not be there, for example that a feature compiled out or that
+an allocator, formatting or soft float never reached the image:
+
+```sh
+cargo krabi-caliper audit-elf target/thumbv7m-none-eabi/release/app \
+  --forbid-symbol core::panicking --forbid-symbol __rust_alloc \
+  --forbid-string "panicked at" --require-symbol app::feature::enable
+```
+
+- Symbol rules are substrings of a symbol's name, as stored or demangled, with
+  or without hashes and crate disambiguators. `core::panicking` matches legacy
+  and v0 mangling.
+- Only a defined symbol satisfies a required rule. Any mention, including an
+  undefined reference, breaks a forbidden one.
+- String rules search the contents of allocated sections, which is what reaches
+  the target. `--string-scope whole-file` also searches debug information and
+  symbol tables.
+- `--rules` reads the same rules from a TOML file, and `--json` writes every
+  image's report.
+
+The command reports every broken rule and fails if any image breaks one. A
+non-ELF file, an unreadable section, and rules with nothing to search (symbol
+rules on a stripped image) are errors.
+
+The library is `host::elf_audit`. Its `elf_symbols` lists the symbols the audit
+examines in each form a rule matches, for checks a substring cannot express,
+such as an anchored pattern or every match. It also fails on an image with no
+symbols.
+
 ## Counting instructions from QEMU execution traces
 
 `host::exec_trace` (feature `host`) counts the instructions an image executes
