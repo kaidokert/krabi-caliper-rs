@@ -10,7 +10,16 @@ nm="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bi
 symbols() {
     rm -rf target/obj
     cargo rustc --quiet --release --target "$target" --target-dir target/obj "$@" -- --emit=obj
-    "$nm" target/obj/$target/release/deps/ufmt_u64_check-*.o
+    # rustc names the object differently per host; there is exactly one.
+    objects="$(find target/obj/$target/release -name '*.o')"
+    if [ "$(printf '%s
+' "$objects" | grep -c .)" -ne 1 ]; then
+        printf 'expected one object file, found:
+%s
+' "$objects" >&2
+        exit 1
+    fi
+    "$nm" "$objects"
 }
 
 encoder="$(symbols)"
