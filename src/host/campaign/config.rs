@@ -572,9 +572,8 @@ pub enum RunnerPreset {
     QemuRiscv32SifiveE,
     SimavrAtmega2560,
     /// A physical target flashed and run by `probe-rs run`, reporting over RTT. The chip and
-    /// probe are bindings, `PROBE_RS_CHIP` and `PROBE_RS_PROBE`, so a bench with several
-    /// probes attached never runs an image on whichever probe happens to be found first. The
-    /// target triple depends on the chip, so the profile sets `target`.
+    /// probe come from the required `PROBE_RS_CHIP` and `PROBE_RS_PROBE` bindings, and the
+    /// profile sets `target`, which depends on the chip.
     ProbeRsRtt,
 }
 

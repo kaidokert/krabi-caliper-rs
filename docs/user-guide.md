@@ -80,10 +80,16 @@ Presets are `qemu-cortex-m0`, `qemu-cortex-m3`, `qemu-cortex-m4`,
 field overrides the preset's value.
 
 `probe-rs-rtt` runs an image on physical hardware with `probe-rs run` and reads
-the event protocol over RTT. Its chip and probe come from the `PROBE_RS_CHIP`
-and `PROBE_RS_PROBE` bindings (a venue's `bindings`, or the environment), and
-both are required, so an image never runs on whichever probe is found first.
-The target triple depends on the chip, so the profile names it:
+the event protocol over RTT, so the firmware must report through the `rtt`
+transport. With `cortex_m_reporter!`, list the application feature that selects
+RTT in the profile's `build-features`; otherwise the image reports over
+semihosting and the run times out.
+
+The chip and probe come from the `PROBE_RS_CHIP` and `PROBE_RS_PROBE` bindings
+(a venue's `bindings`, or the environment), and both are required. Give the
+probe as `VID:PID:Serial` when several probes of one model are attached, since
+`VID:PID` alone matches each of them. The target triple depends on the chip, so
+the profile sets it:
 
 ```toml
 [venues.bench]
