@@ -1,14 +1,16 @@
 //! Require/forbid audit of the symbols and strings in a built ELF image.
 //!
-//! A firmware build can prove that a feature compiled out, or that a forbidden facility (an
+//! A build can prove that a feature compiled out, or that a forbidden facility (an
 //! allocator, formatting, a soft-float helper, a panic message) never reached the image, only by
 //! looking at the image. These rules say which symbol names and byte strings must or must not
 //! appear.
 //!
 //! A rule is a substring. A symbol rule matches a symbol if any of three forms of its name contains
-//! the text: the demangled name with hashes and crate disambiguators (as `nm -C` prints legacy
-//! Rust names; it drops a v0 name's `[...]` disambiguators), the demangled name without them
-//! (`core::panicking::panic` for legacy and v0 mangling alike), or the name as stored. Rust names
+//! the text: the demangled name with hashes and crate disambiguators (`rustc-demangle`'s default
+//! output), the demangled name without them (its alternate output: `core::panicking::panic` for
+//! legacy and v0 mangling alike), or the name as stored. Tools differ in which form they print:
+//! `llvm-nm -C` keeps a legacy name's `::h<hash>` and GNU `nm -C` drops it, and both drop a v0
+//! name's `[<hex>]` crate disambiguators. Rust names
 //! are demangled; C++ names are matched as stored. [`elf_symbols`] lists the same symbols in all
 //! three forms, for a check a substring cannot express.
 //! Only a defined symbol satisfies a required rule, while any mention, including an undefined
@@ -368,10 +370,14 @@ pub fn audit_elf_bytes(
 }
 
 /// One symbol name in every form a rule may be written against.
+///
+/// Symbols order by `demangled`, then `plain`, `raw`, and an undefined reference before a
+/// definition.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct ElfSymbol {
-    /// Demangled with hashes and crate disambiguators: `core[1234]::panicking::panic` for a v0
+    /// Demangled with hashes and crate disambiguators: `core[3c1c0]::panicking::panic` for a v0
     /// name, `core::panicking::panic::h0123456789abcdef` for a legacy one. A C name is as stored.
     pub demangled: String,
     /// Demangled without them: `core::panicking::panic` for legacy and v0 names alike.
@@ -403,8 +409,12 @@ impl ElfSymbol {
 /// The symbols an audit of the ELF image at `path` examines, for checks its substring rules
 /// cannot express (a pattern, or listing every match).
 ///
-/// Defined and undefined symbols alike, file and section symbols excluded, sorted and listed once
-/// each. An image without symbols gives an empty list.
+/// Defined and undefined symbols alike, file and section symbols excluded, sorted, and listed
+/// once per name and definedness: a name both defined and referenced appears twice.
+///
+/// Fails closed like the audit: an image with no symbols (a stripped image) is
+/// [`ElfAuditError::NothingToSearch`], so a forbid-style check over the list cannot pass on an
+/// image it could not examine.
 pub fn elf_symbols(path: &Path) -> Result<Vec<ElfSymbol>, ElfAuditError> {
     let bytes = fs::read(path).map_err(|error| ElfAuditError::Elf(ElfError::Io(error)))?;
     elf_symbols_bytes(&bytes)
@@ -417,7 +427,11 @@ pub fn elf_symbols_bytes(bytes: &[u8]) -> Result<Vec<ElfSymbol>, ElfAuditError> 
     if object.format() != BinaryFormat::Elf {
         return Err(ElfAuditError::NotElf);
     }
-    collect_symbols(&object)
+    let symbols = collect_symbols(&object)?;
+    if symbols.is_empty() {
+        return Err(ElfAuditError::NothingToSearch("symbols"));
+    }
+    Ok(symbols)
 }
 
 fn collect_symbols(object: &object::File<'_>) -> Result<Vec<ElfSymbol>, ElfAuditError> {
@@ -623,6 +637,7 @@ mod tests {
         assert_eq!(panic.demangled, "core::panicking::panic::h0123456789abcdef");
         assert_eq!(panic.raw, "_ZN4core9panicking5panic17h0123456789abcdefE");
         assert!(panic.defined && panic.matches("core::panicking"));
+        assert!(panic.matches("h0123456789abcdef") && !panic.matches("alloc"));
 
         let helper = symbols
             .iter()
@@ -647,7 +662,14 @@ mod tests {
             panic!("one symbol");
         };
         assert_eq!(symbol.plain, "core::panicking::panic");
-        assert_ne!(symbol.demangled, symbol.plain);
+        assert_eq!(symbol.demangled, "core[3c1c0]::panicking::panic");
+        assert!(symbol.matches("core[3c1c0]::panicking") && symbol.matches("core::panicking"));
+
+        let stripped = image(b"code", b"x", b"", &[]);
+        assert!(matches!(
+            elf_symbols_bytes(&stripped),
+            Err(ElfAuditError::NothingToSearch("symbols"))
+        ));
 
         assert!(matches!(
             elf_symbols_bytes(b"not an image"),

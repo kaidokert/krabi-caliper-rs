@@ -189,8 +189,9 @@ symbol tables. Every broken rule is reported, and the command fails if any
 image breaks one. The audit fails closed: a non-ELF file, an unreadable
 section, or rules with nothing to search (symbol rules on a stripped image) are
 errors. `--rules` reads the same rules from TOML, and `host::elf_audit` offers
-them as a library, with `elf_symbols` listing every symbol in each form a rule
-matches, for checks a substring cannot express.
+them as a library, with `elf_symbols` listing the symbols the audit examines, in
+each form a rule matches, for checks a substring cannot express (an anchored
+pattern, or every match). Like the audit, it fails on an image with no symbols.
 
 ## Counting instructions from QEMU execution traces
 
