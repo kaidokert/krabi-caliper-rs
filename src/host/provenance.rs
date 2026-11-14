@@ -156,16 +156,20 @@ pub fn command_version(command: &mut Command) -> Result<String, ProvenanceError>
 /// whose extension is in `extensions`. A directory whose name is in `skip_directories` (by
 /// default `target`) is not descended into wherever it occurs below a listed directory; a
 /// listed directory itself is always searched. Paths are relative to `root`, may not be
-/// absolute or contain `..`, and must be valid Unicode. Symbolic links are followed. An empty
-/// selection is an error.
+/// absolute or contain `..`, and must be valid Unicode. Symbolic links are followed, and a link
+/// back to a directory being searched is an error. An empty selection is an error.
 ///
 /// The digest is SHA-256 over the selected files in path order (compared component by
 /// component), each contributing its relative path with `/` separators, a `0x00` byte, its
-/// contents and a `0xff` byte. It therefore changes when a selected file is added, removed,
-/// renamed or edited, and does not depend on where `root` is or which separator the platform
-/// uses. Contents are hashed as stored, so checkouts that convert line endings, and paths
-/// spelled in a different case on a case-insensitive file system, give different digests for
-/// the same commit.
+/// contents and a `0xff` byte. It changes when a selected file is added, removed, renamed or
+/// edited, and does not depend on where `root` is or which separator the platform uses.
+///
+/// - Contents are hashed as stored, so checkouts that convert line endings give different
+///   digests for the same commit, as do listed paths spelled in a different case on a
+///   case-insensitive file system.
+/// - The `0xff` terminator never occurs in UTF-8, so the encoding is unambiguous for text
+///   files. A selected file containing `0xff` bytes, such as a binary blob, can make two
+///   different selections hash the same.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 #[non_exhaustive]
@@ -792,7 +796,7 @@ mod tests {
             differences[2].to_string(),
             "image \"boot.loader: x\": 00 -> (absent)"
         );
-        // Unknown fields are refused rather than silently dropped from a comparison.
+        // Unknown fields are errors, so a field from a newer record cannot drop out of a comparison.
         assert!(
             serde_json::from_value::<Provenance>(serde_json::json!({"compiler-flags": "x"}))
                 .is_err()

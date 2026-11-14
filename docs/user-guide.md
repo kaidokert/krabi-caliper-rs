@@ -232,8 +232,8 @@ versions, so record the QEMU version with the counts.
 
 ## Recording provenance
 
-A figure is comparable with another only when both came from the same sources,
-dependencies, tools and images. `host::provenance` (with `campaign`) records
+Two figures are comparable only when they came from the same sources,
+dependencies, tools and images. `host::provenance` (feature `campaign`) records
 those inputs as content hashes and version lines:
 
 ```rust
@@ -252,20 +252,25 @@ let record = Provenance::new()
     .image("app", "target/thumbv7m-none-eabi/release/app")?;
 ```
 
-The source-tree digest covers exactly the selected files (directories are
-searched for the listed extensions, skipping `target`), including their
-relative paths, so adding, renaming or editing a selected file changes it and
-nothing else does. It does not depend on the checkout location or the host's
-path separator, but contents are hashed as stored: a checkout that converts
-line endings gives a different digest for the same commit. Paths may not leave
-the root, and missing files, empty selections and failing tools are errors.
+A `SourceTree` selects the listed files, plus files with the listed extensions
+below the listed directories. It skips `target` directories by default. The
+digest covers each selected file's relative path and contents:
 
-Tools run in the current directory. A rustup proxy picks its toolchain from
-the directory's `rust-toolchain.toml`, so record it with `tool_command` and
-the project directory set. Store the record beside the results, and use
-`Provenance::differences` to list the fields that changed between two
-records; deciding whether a change invalidates a comparison is up to the
-caller.
+- adding, removing, renaming or editing a selected file changes it;
+- the checkout location and the host's path separator do not;
+- contents are hashed as stored, so a checkout that converts line endings gives
+  a different digest for the same commit.
+
+Paths may not leave the root. Missing files, an empty selection, a directory
+link back into the search and a failing tool are errors.
+
+`tool` runs the program in the current directory. A rustup proxy picks its
+toolchain from the `rust-toolchain.toml` of the directory it runs in, so for
+`rustc` use `tool_command` with the project directory set.
+
+Store the record beside the results. `Provenance::differences` lists the fields
+that differ between two records; whether a difference invalidates a comparison
+is up to the caller.
 
 ## Feature groups
 
