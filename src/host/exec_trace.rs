@@ -267,7 +267,8 @@ fn trace_line_pc(line: &[u8]) -> Option<u64> {
 
 /// Streams the program counters of an execution trace, bit 0 cleared, from its `Trace` lines.
 /// Other lines are skipped, and a `Trace` line without a readable PC is an error. The log is
-/// read as bytes, line by line, so traces of any size and with stray non-UTF-8 output are fine.
+/// read as bytes, one line at a time, so memory use does not grow with the trace and non-UTF-8
+/// guest output does not stop the read.
 pub struct ExecTracePcs<R> {
     reader: R,
     path: PathBuf,
