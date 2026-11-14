@@ -171,8 +171,8 @@ require the list to be empty. Runtime reservations such as `riscv-rt`'s
 
 ## Counting instructions from QEMU execution traces
 
-`host::exec_trace` (with `host`) counts the instructions an image executes
-between two markers, from QEMU's per-instruction exec log:
+`host::exec_trace` (feature `host`) counts the instructions an image executes
+between two markers, from QEMU's per-instruction execution log:
 
 ```rust,ignore
 use krabi_caliper::host::exec_trace::{
@@ -194,33 +194,41 @@ let intervals = marker_intervals(ExecTracePcs::open(&trace)?, &begin, &end, None
 let counts: Vec<usize> = intervals.iter().map(Vec::len).collect();
 ```
 
-`capture` appends `-accel tcg,one-insn-per-tb=on -d exec,nochain -D <trace>`,
-which makes every executed instruction one log line (QEMU 8.1 or later). It
-kills a run at the timeout, which also bounds the trace size, and retries
-failed runs. A relative trace path is resolved against `cwd`. The image must
-exit on its own, for example through semihosting.
+`QemuExecTrace::capture`:
+
+- appends `-accel tcg,one-insn-per-tb=on -d exec,nochain -D <trace>`, which
+  writes one log line per executed instruction (QEMU 8.1 or later);
+- resolves a relative trace path against `cwd`;
+- kills a run at the timeout, which also bounds the trace size;
+- retries failed runs up to `attempts`.
+
+The image must exit on its own, for example through semihosting.
+
+Markers are a function's range, from `TraceMarker::function(value, size)`, or
+one address, `TraceMarker::Address`. Bit 0 is cleared from markers and PCs, so
+Thumb symbol values can be passed as they are.
 
 `marker_intervals` cuts the trace into intervals:
 
 - An interval opens on a PC in `begin`. PCs that stay in `begin` right after it
   are skipped.
-- It then holds every PC up to, but not including, the first PC in `end`:
-  callees, returns into `begin` and interrupt handlers are all counted.
-- `TraceMarker::function` marks a function's range; `TraceMarker::Address`
-  marks a single address.
-- A limit stops reading after that many intervals.
+- It holds every PC up to, but not including, the first PC in `end`, including
+  callees, returns into `begin` and interrupt handlers.
+- A begin hit inside an open interval does not restart it.
+- With a limit, reading stops after that many intervals.
 
 A trace that ends inside an interval or never reaches `begin` is an error, as
 is a `Trace` line without a readable PC.
 
-Each interval keeps its PCs, so callers can attribute them to functions (for
-example with a disassembly) before counting. PCs and markers are compared with
-bit 0 cleared, for Thumb. The CPU index is ignored, so trace single-core
-machines.
+Each interval keeps its PCs, so callers can attribute them to functions, for
+example with a disassembly, before counting.
+
+The log's CPU index is ignored, so use single-core machines: PCs from several
+cores would be read as one sequence.
 
 These are instruction counts from an emulator, not cycles: QEMU models no
-pipeline, caches or wait states. Record the QEMU version with the counts, since
-the log format and translation belong to QEMU.
+pipeline, caches or wait states. The log format can change between QEMU
+versions, so record the QEMU version with the counts.
 
 ## Feature groups
 

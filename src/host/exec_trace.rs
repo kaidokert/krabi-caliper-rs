@@ -8,10 +8,12 @@
 //! addresses.
 //!
 //! The counts are an instruction-count proxy: QEMU models no pipeline, caches or wait states.
-//! `one-insn-per-tb` needs QEMU 8.1 or later, and the log format belongs to QEMU, so record the
-//! QEMU version with the counts. The module is written for Arm Thumb images: PCs and marker
-//! addresses are compared with bit 0 cleared. The log's CPU index is ignored, so trace
-//! single-core machines.
+//! `one-insn-per-tb` needs QEMU 8.1 or later, and the log format can change between QEMU
+//! versions, so record the QEMU version with the counts.
+//!
+//! PCs and marker addresses are compared with bit 0 cleared, for Arm Thumb images. The log's
+//! CPU index is ignored, so use single-core machines: PCs from several cores would be read as
+//! one sequence.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
