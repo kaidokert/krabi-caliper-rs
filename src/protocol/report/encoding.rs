@@ -449,25 +449,15 @@ pub enum UfmtReportError<E> {
 /// `ufmt`'s own `u64` formatting divides by ten in 64-bit arithmetic, which on a target without a
 /// 64-bit divider links the 64-bit division helpers (`__udivdi3`/`__umoddi3` on AVR,
 /// `__aeabi_uldivmod` on Armv6-M) into every image that reports a measurement. This needs only
-/// 64-bit compare and subtract, which those targets inline: at most nine subtractions per digit,
-/// 20 digits. CI checks the Armv6-M build of this module for a 64-bit division call.
+/// 64-bit compare, subtract and multiply by ten, which those targets inline: at most nine
+/// subtractions per digit, 20 digits. CI checks the Armv6-M build of this module for a 64-bit
+/// division call.
+///
+/// Each power of ten is computed when it is needed. A table of them would be read-only data,
+/// which AVR copies into RAM at startup: 160 bytes for 20 `u64`s.
 #[cfg(feature = "ufmt")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Decimal(pub(crate) u64);
-
-#[cfg(feature = "ufmt")]
-impl Decimal {
-    const POWERS: [u64; 20] = {
-        let mut powers = [1_u64; 20];
-        let mut index = 19;
-        while index > 0 {
-            powers[index - 1] = powers[index] * 10;
-            index -= 1;
-        }
-        powers
-    };
-    const DIGITS: &'static str = "0123456789";
-}
 
 #[cfg(feature = "ufmt")]
 impl ufmt::uDisplay for Decimal {
@@ -477,17 +467,21 @@ impl ufmt::uDisplay for Decimal {
     ) -> Result<(), W::Error> {
         let mut rest = self.0;
         let mut leading = true;
-        for power in Self::POWERS {
-            let mut digit = 0_usize;
+        for exponent in (0..20_u32).rev() {
+            let mut power = 1_u64;
+            for _ in 0..exponent {
+                // 10^19 is the largest power used and fits in a u64.
+                power = power.wrapping_mul(10);
+            }
+            let mut digit = 0_u8;
             while rest >= power {
                 rest -= power;
                 // At most 9, and 1 for the top power: `u64::MAX` is below 2 * 10^19.
                 digit = digit.wrapping_add(1);
             }
-            leading &= digit == 0 && power != 1;
+            leading &= digit == 0 && exponent != 0;
             if !leading {
-                // Slicing a one-byte ASCII digit: never fails, and needs no UTF-8 validation.
-                formatter.write_str(Self::DIGITS.get(digit..=digit).unwrap_or("?"))?;
+                formatter.write_char(char::from(b'0'.wrapping_add(digit)))?;
             }
         }
         Ok(())
