@@ -237,9 +237,9 @@ pub enum ElfAuditError {
     /// A section that string rules must search has no readable contents (a truncated or
     /// corrupt image).
     UnreadableSection(String),
-    /// Rules of one kind exist but the image has nothing for them to search ("symbols" for a
-    /// stripped image, "bytes" for one without loaded sections), so they could only pass
-    /// vacuously.
+    /// Rules of one kind exist but the image has nothing for them to search ("symbols" for an
+    /// image without `.symtab`, such as a stripped one, "bytes" for one without loaded
+    /// sections), so they could only pass vacuously.
     NothingToSearch(&'static str),
 }
 
@@ -297,7 +297,7 @@ pub fn audit_elf_bytes(
 
     let symbols = collect_symbols(&object)?;
     let has_symbol_rules = !rules.require_symbols.is_empty() || !rules.forbid_symbols.is_empty();
-    if has_symbol_rules && symbols.is_empty() {
+    if has_symbol_rules && !has_symbol_table(&object, &symbols) {
         return Err(ElfAuditError::NothingToSearch("symbols"));
     }
 
@@ -435,7 +435,7 @@ pub fn elf_symbols_bytes(bytes: &[u8]) -> Result<Vec<ElfSymbol>, ElfAuditError> 
         return Err(ElfAuditError::NotElf);
     }
     let symbols = collect_symbols(&object)?;
-    if symbols.is_empty() {
+    if !has_symbol_table(&object, &symbols) {
         return Err(ElfAuditError::NothingToSearch("symbols"));
     }
     Ok(symbols)
@@ -458,6 +458,12 @@ fn collect_symbols(object: &object::File<'_>) -> Result<Vec<ElfSymbol>, ElfAudit
     symbols.sort();
     symbols.dedup();
     Ok(symbols)
+}
+
+/// Whether the image keeps its full symbol table. A stripped image can still carry `.dynsym`,
+/// which lists only the symbols needed for dynamic linking.
+fn has_symbol_table(object: &object::File<'_>, symbols: &[ElfSymbol]) -> bool {
+    object.symbol_table().is_some() && !symbols.is_empty()
 }
 
 /// Whether a section occupies target memory with contents from the file.
@@ -743,6 +749,20 @@ mod tests {
     #[test]
     fn rules_with_nothing_to_search_fail_closed() {
         let stripped = image(b"code", b"data", b"", &[]);
+        // Stripping keeps the dynamic symbol table, which lists only the symbols needed for
+        // dynamic linking; an image whose only table is `.dynsym` has nothing to search.
+        let mut dynamic_only = sample();
+        let shoff = u32::from_le_bytes(dynamic_only[32..36].try_into().unwrap()) as usize;
+        let symtab_type = shoff + 5 * 40 + 4;
+        dynamic_only[symtab_type..symtab_type + 4].copy_from_slice(&11u32.to_le_bytes()); // SHT_DYNSYM
+        assert!(matches!(
+            elf_symbols_bytes(&dynamic_only),
+            Err(ElfAuditError::NothingToSearch("symbols"))
+        ));
+        assert!(matches!(
+            audit_elf_bytes(&dynamic_only, &ElfAuditRules::new().forbid_symbol("std::")),
+            Err(ElfAuditError::NothingToSearch("symbols"))
+        ));
         assert!(matches!(
             audit_elf_bytes(&stripped, &ElfAuditRules::new().forbid_symbol("std::")),
             Err(ElfAuditError::NothingToSearch("symbols"))

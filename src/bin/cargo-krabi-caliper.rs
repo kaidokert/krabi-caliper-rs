@@ -421,7 +421,12 @@ fn execute(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
                         println!("{}: {violation}", path.display());
                     }
                 }
-                reports.push(serde_json::json!({ "elf": path, "report": report }));
+                if json.is_some() {
+                    reports.push(serde_json::json!({
+                        "elf": path.to_string_lossy(),
+                        "report": report,
+                    }));
+                }
             }
             if let Some(json) = json {
                 ensure_parent(&json)?;
