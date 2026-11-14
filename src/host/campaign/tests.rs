@@ -981,7 +981,7 @@ cases = [{ name = "fixture", example = "fixture" }]
     assert!(error.contains("requires target"), "{error}");
     assert!(without_target.validate_for_build().is_err());
 
-    // No probe binding: refuse rather than run on whichever probe probe-rs finds first.
+    // Without a probe binding probe-rs would pick the first probe it finds.
     let without_probe = parse(
         r#"
 [venues.bench]
@@ -998,7 +998,7 @@ cases = [{ name = "fixture", example = "fixture" }]
     if std::env::var_os("PROBE_RS_PROBE").is_none() {
         let error = without_probe.validate().unwrap_err().to_string();
         assert!(error.contains("PROBE_RS_PROBE"), "{error}");
-        // The error names the profile that needs the binding.
+        // The error reports the profile that needs the binding.
         assert!(error.contains("\"board\""), "{error}");
     }
 }

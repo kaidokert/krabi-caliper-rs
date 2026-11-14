@@ -98,8 +98,8 @@ impl ToolkitConfig {
         profile
             .resolve(name, venue, initial_evidence)
             .map_err(|error| match error {
-                // Name the profile, so a binding missing for one profile is not mistaken for
-                // a problem with the campaign being run.
+                // Every profile is resolved, so the failing one may not belong to the campaign
+                // being run.
                 CampaignError::InvalidConfig(message) if !message.contains(&format!("{name:?}")) => {
                     CampaignError::InvalidConfig(format!("profile {name:?}: {message}"))
                 }
@@ -973,9 +973,8 @@ fn preset_values(preset: RunnerPreset) -> PresetValues {
             board: None,
             mcu: Some("${PROBE_RS_CHIP}"),
             transport: Some("rtt"),
-            // The selector is recorded in resolved bindings. As `probe` metadata it would enter
-            // the configuration identity, and swapping a probe would block comparisons that the
-            // probe field itself only warns about.
+            // Unset: `probe` is part of the configuration identity, so a swapped probe would block
+            // comparisons, where `compare` only warns on it. The selector stays in the bindings.
             probe: None,
             clock_frequency_hz: None,
         },
