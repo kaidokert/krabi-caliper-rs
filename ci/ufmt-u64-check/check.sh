@@ -12,22 +12,16 @@ symbols() {
     cargo rustc --quiet --release --target "$target" --target-dir target/obj "$@" -- --emit=obj
     # rustc names the object differently per host; there is exactly one.
     objects="$(find target/obj/$target/release -name '*.o')"
-    if [ "$(printf '%s
-' "$objects" | grep -c .)" -ne 1 ]; then
-        printf 'expected one object file, found:
-%s
-' "$objects" >&2
+    if [ "$(printf '%s\n' "$objects" | grep -c .)" -ne 1 ]; then
+        printf 'expected one object file, found:\n%s\n' "$objects" >&2
         exit 1
     fi
     "$nm" "$objects"
 }
 
 encoder="$(symbols)"
-if ! printf '%s
-' "$encoder" | grep -Eq ' T report_wide$'; then
-    printf 'the check object does not define report_wide:
-%s
-' "$encoder" >&2
+if ! printf '%s\n' "$encoder" | grep -Eq ' T report_wide$'; then
+    printf 'the check object does not define report_wide:\n%s\n' "$encoder" >&2
     exit 1
 fi
 if printf '%s\n' "$encoder" | grep -Eq "$helpers"; then

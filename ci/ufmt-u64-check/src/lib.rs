@@ -1,5 +1,5 @@
-//! Instantiates the ufmt encoder for one measurement, so the object file shows which helpers the
-//! encoder calls. See `Cargo.toml`.
+//! Instantiates the ufmt encoder for every event that carries a `u64`, so the object file shows
+//! which helpers the encoder calls. See `Cargo.toml`.
 #![no_std]
 
 use core::convert::Infallible;
@@ -21,32 +21,89 @@ impl ufmt::uWrite for Sink {
     }
 }
 
-/// Reports one measurement and one metric with caller-supplied `u64` values.
+/// Reports every event that carries a `u64`, with caller-supplied values.
 #[cfg(not(feature = "control"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn report_wide(ticks: u64, frequency: u64, bytes: u64) -> bool {
     use krabi_caliper::report::{
-        Field, MeasurementRecord, MetricPolicy, MetricRecord, Reporter, UfmtReporter,
+        BoundaryPhase, ComparisonRecord, CounterSnapshotRecord, Field, MeasurementRecord,
+        MetricPolicy, MetricRecord, Reporter, RunStart, SampleRecord, UfmtReporter,
     };
     use krabi_caliper::{Measurement, Unit};
 
     let fields = [Field::u64("bytes", bytes)];
-    let record = MeasurementRecord {
-        benchmark: "check",
-        measurement: Measurement::new(ticks, Unit::CoreCycles).with_frequency(frequency),
-        counter: Some("counter"),
+    let comparison = ComparisonRecord {
+        fixture: "check",
+        class: "check",
+        policy: None,
+        a_min: ticks,
+        a_max: frequency,
+        b_min: bytes,
+        b_max: ticks,
+        spread: frequency,
+        overlap: false,
+        wrapped: false,
+        output_ok: true,
+        passed: None,
         fields: &fields,
     };
-    let metric = MetricRecord {
-        benchmark: "check",
-        name: "bytes",
-        value: bytes,
-        unit: None,
-        policy: MetricPolicy::Informational,
-        fields: &[],
-    };
     let mut reporter = UfmtReporter::new(Sink);
-    reporter.indexed_measurement(&record, 0).is_ok() && reporter.metric(&metric).is_ok()
+    reporter
+        .run_start(&RunStart {
+            suite: "check",
+            target: "check",
+            board: None,
+            unit: Unit::CoreCycles,
+            frequency_hz: Some(frequency),
+            fields: &fields,
+        })
+        .is_ok()
+        && reporter
+            .sample(&SampleRecord {
+                fixture: "check",
+                side: 'A',
+                index: 0,
+                ticks,
+                wrapped: false,
+                fields: &fields,
+            })
+            .is_ok()
+        && reporter.result(&comparison).is_ok()
+        && reporter.diagnostic(&comparison).is_ok()
+        && reporter
+            .indexed_measurement(
+                &MeasurementRecord {
+                    benchmark: "check",
+                    measurement: Measurement::new(ticks, Unit::CoreCycles)
+                        .with_frequency(frequency),
+                    counter: Some("counter"),
+                    fields: &fields,
+                },
+                0,
+            )
+            .is_ok()
+        && reporter
+            .counter_snapshot(&CounterSnapshotRecord {
+                benchmark: "check",
+                trial: 0,
+                phase: BoundaryPhase::Begin,
+                ticks,
+                width_bits: 32,
+                unit: Unit::CoreCycles,
+                frequency_hz: Some(frequency),
+                fields: &fields,
+            })
+            .is_ok()
+        && reporter
+            .metric(&MetricRecord {
+                benchmark: "check",
+                name: "bytes",
+                value: bytes,
+                unit: None,
+                policy: MetricPolicy::Informational,
+                fields: &fields,
+            })
+            .is_ok()
 }
 
 /// Positive control: ufmt's own `u64` formatting.
