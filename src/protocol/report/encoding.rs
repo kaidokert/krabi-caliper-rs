@@ -449,12 +449,15 @@ pub enum UfmtReportError<E> {
 /// `ufmt`'s own `u64` formatting divides by ten in 64-bit arithmetic, which on a target without a
 /// 64-bit divider links the 64-bit division helpers (`__udivdi3`/`__umoddi3` on AVR,
 /// `__aeabi_uldivmod` on Armv6-M) into every image that reports a measurement. This needs only
-/// 64-bit compare, subtract and multiply by ten, which those targets inline: at most nine
+/// 64-bit compare, subtract, shift and add, which those targets inline: at most nine
 /// subtractions per digit, 20 digits. CI checks the Armv6-M build of this module for a 64-bit
 /// division call.
 ///
 /// Each power of ten is computed when it is needed. A table of them would be read-only data,
-/// which AVR copies into RAM at startup: 160 bytes for 20 `u64`s.
+/// which AVR copies into RAM at startup: 160 bytes for 20 `u64`s. Computing the power for each
+/// digit costs `n(n-1)/2` multiplications by ten, each two shifts and an add, for an `n`-digit
+/// value: 45 for 10 digits, 190 for 20. Values are printed after measurement, outside any
+/// measured window.
 #[cfg(feature = "ufmt")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Decimal(pub(crate) u64);
@@ -466,12 +469,20 @@ impl ufmt::uDisplay for Decimal {
         formatter: &mut ufmt::Formatter<'_, W>,
     ) -> Result<(), W::Error> {
         let mut rest = self.0;
-        let mut leading = true;
-        for exponent in (0..20_u32).rev() {
-            let mut power = 1_u64;
-            for _ in 0..exponent {
-                // 10^19 is the largest power used and fits in a u64.
-                power = power.wrapping_mul(10);
+        // The exponent of the leading digit: the largest `top` with 10^top <= the value.
+        let mut top = 0_u32;
+        let mut power = 1_u64;
+        // 10^19 is the largest power that fits in a u64, so `power` stops there.
+        while top < 19 && times_ten(power) <= rest {
+            power = times_ten(power);
+            top += 1;
+        }
+        for exponent in (0..=top).rev() {
+            if exponent != top {
+                power = 1;
+                for _ in 0..exponent {
+                    power = times_ten(power);
+                }
             }
             let mut digit = 0_u8;
             while rest >= power {
@@ -479,13 +490,17 @@ impl ufmt::uDisplay for Decimal {
                 // At most 9, and 1 for the top power: `u64::MAX` is below 2 * 10^19.
                 digit = digit.wrapping_add(1);
             }
-            leading &= digit == 0 && exponent != 0;
-            if !leading {
-                formatter.write_char(char::from(b'0'.wrapping_add(digit)))?;
-            }
+            formatter.write_char(char::from(b'0'.wrapping_add(digit)))?;
         }
         Ok(())
     }
+}
+
+/// `value * 10` as two shifts and an add: a 64-bit multiply is a libgcc call (`__muldi3`) on AVR.
+/// Callers stay at or below 10^19, which does not overflow.
+#[cfg(feature = "ufmt")]
+fn times_ten(value: u64) -> u64 {
+    (value << 3).wrapping_add(value << 1)
 }
 
 #[cfg(feature = "ufmt")]
