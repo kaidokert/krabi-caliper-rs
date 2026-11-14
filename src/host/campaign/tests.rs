@@ -1061,6 +1061,8 @@ cases = [{ name = "fixture", example = "fixture" }]
     );
 }
 
+/// A one-example workspace. Its campaigns set `target-dir`, so a `CARGO_TARGET_DIR` in the
+/// test environment cannot make fixtures share one `examples/fixture` binary.
 #[cfg(unix)]
 fn failure_workspace(name: &str, source: &str) -> PathBuf {
     let workspace =
@@ -1102,6 +1104,7 @@ fn build_failures_are_obvious_and_replace_stale_reports() {
 [profiles.host]
 runner = "command"
 target = "host"
+target-dir = "target"
 executable = "sh"
 args = ["-c", "exit 0"]
 
@@ -1141,6 +1144,7 @@ fn run_failures_show_the_command_reason_and_target_output() {
 [profiles.host]
 runner = "command"
 target = "host"
+target-dir = "target"
 executable = "sh"
 args = ["-c", "printf 'first target line\\n'; printf '%07000d\\n' 0; printf 'PANIC: reporter rejected reserved field\\n'; printf 'emulator warning\\n' >&2; exit 7"]
 
@@ -1181,6 +1185,7 @@ fn timeouts_report_the_command_and_elapsed_deadline() {
 [profiles.host]
 runner = "command"
 target = "host"
+target-dir = "target"
 executable = "sh"
 args = ["-c", "sleep 5"]
 timeout-seconds = 1
