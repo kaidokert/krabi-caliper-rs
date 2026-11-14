@@ -99,7 +99,9 @@ pub struct ExternalBenchmarkResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BenchmarkError<E> {
     Reporter(E),
-    SampleCapacity,
+    /// The platform returned a measurement the sample set rejected: more than `N`, or one
+    /// whose unit or frequency differs from the first.
+    Sample(crate::PushError),
     #[cfg(feature = "stack")]
     Stack(StackError),
 }
@@ -267,9 +269,7 @@ impl<'a, const N: usize> Benchmark<'a, N> {
                 && self
                     .max_sample_ticks
                     .is_none_or(|limit| measurement.ticks < limit);
-            samples
-                .push(measurement)
-                .map_err(|_| BenchmarkError::SampleCapacity)?;
+            samples.push(measurement).map_err(BenchmarkError::Sample)?;
         }
 
         #[cfg(feature = "stack")]
@@ -284,7 +284,7 @@ impl<'a, const N: usize> Benchmark<'a, N> {
         // Keep transport formatting and I/O outside the stack and cycle
         // evidence. All fixed-capacity measurements are retained above, so
         // reporting can happen after the workload boundary closes.
-        for (trial, measurement) in samples.iter().copied().enumerate() {
+        for (trial, measurement) in samples.iter().enumerate() {
             reporter
                 .event(Event::Measurement {
                     record: &MeasurementRecord {

@@ -1,17 +1,51 @@
 use crate::{Measurement, Unit};
 
-/// Fixed-capacity raw measurements collected without allocation.
+/// Fixed-capacity measurements from one counter, collected without allocation.
+///
+/// Every sample in a set shares the unit and frequency of the first one; [`push`](Self::push)
+/// rejects a sample that does not. So the set stores, per sample, only its tick count and whether
+/// it wrapped: `9 * N` bytes plus a few words, rather than a whole [`Measurement`] each.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleSet<const N: usize> {
-    samples: [Option<Measurement>; N],
+    ticks: [u64; N],
+    wrapped: [bool; N],
     len: usize,
+    /// The first sample's unit and frequency; meaningless while the set is empty.
+    unit: Unit,
+    frequency_hz: Option<u64>,
+}
+
+/// Why [`SampleSet::push`] rejected a measurement. Each variant hands the measurement back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PushError {
+    /// The set already holds `N` samples.
+    Full(Measurement),
+    /// The measurement's unit differs from the set's.
+    UnitMismatch(Measurement),
+    /// The measurement's frequency differs from the set's.
+    FrequencyMismatch(Measurement),
+}
+
+impl PushError {
+    /// The rejected measurement.
+    pub const fn measurement(self) -> Measurement {
+        match self {
+            Self::Full(measurement)
+            | Self::UnitMismatch(measurement)
+            | Self::FrequencyMismatch(measurement) => measurement,
+        }
+    }
 }
 
 impl<const N: usize> SampleSet<N> {
     pub const fn new() -> Self {
         Self {
-            samples: [None; N],
+            ticks: [0; N],
+            wrapped: [false; N],
             len: 0,
+            unit: Unit::CoreCycles,
+            frequency_hz: None,
         }
     }
 
@@ -23,89 +57,113 @@ impl<const N: usize> SampleSet<N> {
         self.len == 0
     }
 
-    pub fn push(&mut self, measurement: Measurement) -> Result<(), Measurement> {
-        if self.len == N {
-            return Err(measurement);
+    /// Appends a measurement. The first sample sets the unit and frequency; a later one must
+    /// match them. On error the set is unchanged.
+    pub fn push(&mut self, measurement: Measurement) -> Result<(), PushError> {
+        if self.len > 0 {
+            if measurement.unit != self.unit {
+                return Err(PushError::UnitMismatch(measurement));
+            }
+            if measurement.frequency_hz != self.frequency_hz {
+                return Err(PushError::FrequencyMismatch(measurement));
+            }
         }
-        self.samples[self.len] = Some(measurement);
+        let (Some(ticks), Some(wrapped)) =
+            (self.ticks.get_mut(self.len), self.wrapped.get_mut(self.len))
+        else {
+            return Err(PushError::Full(measurement));
+        };
+        *ticks = measurement.ticks;
+        *wrapped = measurement.wrapped;
+        if self.len == 0 {
+            self.unit = measurement.unit;
+            self.frequency_hz = measurement.frequency_hz;
+        }
         self.len += 1;
         Ok(())
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Measurement> {
-        self.samples[..self.len].iter().map(|sample| {
-            sample
-                .as_ref()
-                .expect("entries below SampleSet::len are initialized")
+    /// The samples, in the order they were pushed.
+    pub fn iter(&self) -> impl Iterator<Item = Measurement> + '_ {
+        self.ticks
+            .iter()
+            .zip(&self.wrapped)
+            .take(self.len)
+            .map(|(&ticks, &wrapped)| Measurement {
+                ticks,
+                unit: self.unit,
+                frequency_hz: self.frequency_hz,
+                wrapped,
+            })
+    }
+
+    /// The tick counts, in the order they were pushed.
+    pub fn ticks(&self) -> &[u64] {
+        self.ticks.get(..self.len).unwrap_or(&[])
+    }
+
+    /// The set's unit and frequency with `wrapped` set if any sample wrapped, or `Empty`.
+    fn qualification(&self) -> Result<Measurement, SummaryError> {
+        if self.len == 0 {
+            return Err(SummaryError::Empty);
+        }
+        Ok(Measurement {
+            ticks: 0,
+            unit: self.unit,
+            frequency_hz: self.frequency_hz,
+            wrapped: self.wrapped.iter().take(self.len).any(|&wrapped| wrapped),
         })
     }
 
-    /// Checks that the set is non-empty and shares one unit and frequency, returning the first
-    /// measurement with `wrapped` set if any sample wrapped.
-    fn compatible(&self) -> Result<Measurement, SummaryError> {
-        let mut first = *self.iter().next().ok_or(SummaryError::Empty)?;
-        for sample in self.iter().skip(1) {
-            if sample.unit != first.unit {
-                return Err(SummaryError::UnitMismatch);
-            }
-            if sample.frequency_hz != first.frequency_hz {
-                return Err(SummaryError::FrequencyMismatch);
-            }
-            first.wrapped |= sample.wrapped;
-        }
-        Ok(first)
-    }
-
     pub fn summary(&self) -> Result<Summary, SummaryError> {
-        let first = self.compatible()?;
-        let mut min = first.ticks;
-        let mut max = first.ticks;
-        let mut total = first.ticks as u128;
-        let wrapped = first.wrapped;
-
-        for sample in self.iter().skip(1) {
-            min = min.min(sample.ticks);
-            max = max.max(sample.ticks);
-            total += sample.ticks as u128;
+        let qualification = self.qualification()?;
+        let mut min = u64::MAX;
+        let mut max = 0;
+        let mut total = 0_u128;
+        for &value in self.ticks() {
+            min = min.min(value);
+            max = max.max(value);
+            total += u128::from(value);
         }
 
         Ok(Summary {
             count: self.len,
             min,
             max,
+            // `len` is non-zero here, and the mean of u64 values fits in a u64.
             mean: (total / self.len as u128) as u64,
-            unit: first.unit,
-            frequency_hz: first.frequency_hz,
-            wrapped,
+            unit: qualification.unit,
+            frequency_hz: qualification.frequency_hz,
+            wrapped: qualification.wrapped,
         })
     }
 
     /// Returns the `index`-th smallest tick count, counting from zero, as a measurement.
     ///
-    /// The samples must be non-empty and share a unit and frequency, as for
-    /// [`summary`](Self::summary). The result carries that unit and frequency, and `wrapped` is
-    /// set if any sample in the set wrapped, again as for `summary`: a selected value is only as
-    /// trustworthy as the set it was selected from.
+    /// The set must be non-empty. The result carries the set's unit and frequency, and `wrapped`
+    /// is set if any sample in the set wrapped, as for [`summary`](Self::summary): a selected
+    /// value is only as trustworthy as the set it was selected from.
     ///
     /// The selection counts in place instead of sorting: no copy of the set, no allocator and
     /// no panic path, in O(len²) comparisons. That suits the small fixed capacities a target
     /// collects; for large sets on a host, sort the ticks instead.
     pub fn order_statistic(&self, index: usize) -> Result<Measurement, SummaryError> {
-        let mut result = self.compatible()?;
+        let mut result = self.qualification()?;
         if index >= self.len {
             return Err(SummaryError::IndexOutOfRange);
         }
+        let ticks = self.ticks();
         // The answer is the candidate with fewer than `index + 1` smaller samples and at least
         // `index + 1` samples no larger than it.
-        for candidate in self.iter() {
+        for &candidate in ticks {
             let mut smaller = 0;
             let mut not_larger = 0;
-            for sample in self.iter() {
-                smaller += usize::from(sample.ticks < candidate.ticks);
-                not_larger += usize::from(sample.ticks <= candidate.ticks);
+            for &sample in ticks {
+                smaller += usize::from(sample < candidate);
+                not_larger += usize::from(sample <= candidate);
             }
             if smaller <= index && index < not_larger {
-                result.ticks = candidate.ticks;
+                result.ticks = candidate;
                 return Ok(result);
             }
         }
@@ -159,7 +217,7 @@ impl<const N: usize> serde::Serialize for SampleSet<N> {
 
         let mut sequence = serializer.serialize_seq(Some(self.len))?;
         for sample in self.iter() {
-            sequence.serialize_element(sample)?;
+            sequence.serialize_element(&sample)?;
         }
         sequence.end()
     }
@@ -257,32 +315,58 @@ mod tests {
     }
 
     #[test]
-    fn rejects_full_and_incompatibly_qualified_sample_sets() {
+    fn rejects_full_and_incompatibly_qualified_samples_at_push() {
         let mut full = SampleSet::<1>::new();
         full.push(Measurement::new(1, Unit::CoreCycles)).unwrap();
+        let before = full;
+        let extra = Measurement::new(2, Unit::CoreCycles);
+        assert_eq!(full.push(extra), Err(PushError::Full(extra)));
+        assert_eq!(full, before);
+
+        let mut set = SampleSet::<3>::new();
+        set.push(Measurement::new(1, Unit::CoreCycles).with_frequency(1))
+            .unwrap();
+        let before = set;
+        let timer = Measurement::new(2, Unit::TimerTicks).with_frequency(1);
+        assert_eq!(set.push(timer), Err(PushError::UnitMismatch(timer)));
+        let clock = Measurement::new(2, Unit::CoreCycles).with_frequency(2);
+        assert_eq!(set.push(clock), Err(PushError::FrequencyMismatch(clock)));
+        let unknown = Measurement::new(2, Unit::CoreCycles);
         assert_eq!(
-            full.push(Measurement::new(2, Unit::CoreCycles)),
-            Err(Measurement::new(2, Unit::CoreCycles))
+            set.push(unknown),
+            Err(PushError::FrequencyMismatch(unknown))
         );
-
-        let mut incompatible = SampleSet::<2>::new();
-        incompatible
-            .push(Measurement::new(1, Unit::CoreCycles))
-            .unwrap();
-        incompatible
-            .push(Measurement::new(2, Unit::TimerTicks))
-            .unwrap();
-        assert_eq!(incompatible.summary(), Err(SummaryError::UnitMismatch));
-
-        let mut incompatible = SampleSet::<2>::new();
-        incompatible
-            .push(Measurement::new(1, Unit::CoreCycles).with_frequency(1))
-            .unwrap();
-        incompatible
-            .push(Measurement::new(2, Unit::CoreCycles).with_frequency(2))
-            .unwrap();
-        assert_eq!(incompatible.summary(), Err(SummaryError::FrequencyMismatch));
+        assert_eq!(set, before);
+        assert_eq!(PushError::UnitMismatch(timer).measurement(), timer);
         assert_eq!(SampleSet::<1>::new().summary(), Err(SummaryError::Empty));
+    }
+
+    #[test]
+    fn iterates_samples_in_push_order_with_their_wrap_flags() {
+        let mut samples = SampleSet::<4>::new();
+        let pushed = [
+            Measurement::new(9, Unit::TimerTicks).with_frequency(15_625),
+            Measurement::new(3, Unit::TimerTicks)
+                .with_frequency(15_625)
+                .with_wrapped(true),
+            Measurement::new(u64::MAX, Unit::TimerTicks).with_frequency(15_625),
+        ];
+        for sample in pushed {
+            samples.push(sample).unwrap();
+        }
+        assert!(samples.iter().eq(pushed));
+        assert_eq!(samples.ticks(), &[9, 3, u64::MAX]);
+        let mut none = SampleSet::<0>::new();
+        assert_eq!(none.iter().count(), 0);
+        let sample = Measurement::new(1, Unit::CoreCycles);
+        assert_eq!(none.push(sample), Err(PushError::Full(sample)));
+    }
+
+    #[test]
+    fn stores_ticks_and_wrap_flags_rather_than_whole_measurements() {
+        // Per sample, a u64 and a bool; the rest is one shared qualification and the length.
+        let shared = core::mem::size_of::<Measurement>() + 2 * core::mem::size_of::<usize>();
+        assert!(core::mem::size_of::<SampleSet<31>>() <= 31 * 9 + shared);
     }
 
     fn cycles<const N: usize>(ticks: &[u64]) -> SampleSet<N> {
@@ -341,22 +425,11 @@ mod tests {
     }
 
     #[test]
-    fn order_statistics_keep_summary_checks() {
-        assert_eq!(SampleSet::<3>::new().median(), Err(SummaryError::Empty));
-        let mut mixed = SampleSet::<2>::new();
-        mixed.push(Measurement::new(1, Unit::CoreCycles)).unwrap();
-        mixed.push(Measurement::new(2, Unit::TimerTicks)).unwrap();
-        assert_eq!(mixed.median(), Err(SummaryError::UnitMismatch));
-        assert_eq!(mixed.percentile(1, 2), Err(SummaryError::UnitMismatch));
-
-        let mut clocks = SampleSet::<2>::new();
-        clocks
-            .push(Measurement::new(1, Unit::CoreCycles).with_frequency(1))
-            .unwrap();
-        clocks
-            .push(Measurement::new(2, Unit::CoreCycles).with_frequency(2))
-            .unwrap();
-        assert_eq!(clocks.median(), Err(SummaryError::FrequencyMismatch));
+    fn order_statistics_of_an_empty_set_are_errors() {
+        let empty = SampleSet::<3>::new();
+        assert_eq!(empty.median(), Err(SummaryError::Empty));
+        assert_eq!(empty.percentile(1, 2), Err(SummaryError::Empty));
+        assert_eq!(empty.order_statistic(0), Err(SummaryError::Empty));
     }
 
     #[test]
