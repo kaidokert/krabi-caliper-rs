@@ -23,7 +23,7 @@ Trace 0x7f0000000180 [0000000000000000/0000000000000142/00000000/ff200000] old l
     // Stray non-UTF-8 guest output does not stop the read.
     log.extend_from_slice(b"\xff\xfe guest bytes\n");
     log.extend_from_slice(b"Trace 0: 0x0 [0/0x150/0/0]");
-    // The bit 0 is cleared, CRLF is fine, and lines that are not Trace lines are skipped.
+    // Bit 0 is cleared, CRLF is accepted, and lines other than Trace lines are skipped.
     assert_eq!(read(&log).unwrap(), [0x136, 0x138, 0x142, 0x150]);
     assert_eq!(parse_exec_trace_line(b"no brackets"), None);
     assert_eq!(
