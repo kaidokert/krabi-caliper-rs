@@ -18,14 +18,14 @@ pub struct ElfFootprint {
     pub static_ram_bytes: u64,
 }
 
-/// A named ELF section with its address and size.
+/// An ELF section's name, address and size.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ElfSection {
-    /// The section's name, with any bytes that are not UTF-8 replaced by U+FFFD.
+    /// Invalid UTF-8 is replaced by U+FFFD.
     pub name: String,
-    /// The section's address in memory (`sh_addr`).
+    /// `sh_addr`.
     pub address: u64,
-    /// The section's size in bytes (`sh_size`), whether or not it occupies file space.
+    /// `sh_size`, which NOBITS sections have too.
     pub size: u64,
 }
 
@@ -51,15 +51,11 @@ pub fn read_elf_footprint(path: &Path) -> Result<ElfFootprint, ElfError> {
     footprint_from_bytes(&bytes).map_err(ElfError::Object)
 }
 
-/// Lists the allocated (`SHF_ALLOC`), non-empty sections that [`read_elf_footprint`] leaves out
-/// of every total, in section-header order: those whose name and kind place them in none of
-/// text, read-only data, data or BSS, such as a linker-script `.uninit` region or `.got`.
+/// The allocated, non-empty sections that [`read_elf_footprint`] counts in no total, in
+/// section-header order, such as a linker-script `.uninit` region or `.got`.
 ///
-/// The footprint classifies sections by name and then by kind, and skips the rest. A size gate
-/// that must not miss memory can require this list to be empty, so that a new section fails
-/// the gate instead of going uncounted. Runtime reservations are allocated too and appear
-/// here, such as `riscv-rt`'s `.stack` and, when a heap is configured, `.heap`; a gate on such
-/// an image allows those by name.
+/// A size gate can require this list to be empty. Runtime reservations such as `riscv-rt`'s
+/// `.stack` and `.heap` are listed too, so a gate allows those by name.
 pub fn read_elf_unclassified_sections(path: &Path) -> Result<Vec<ElfSection>, ElfError> {
     let bytes = fs::read(path).map_err(ElfError::Io)?;
     unclassified_from_bytes(&bytes).map_err(ElfError::Object)
@@ -75,7 +71,7 @@ fn unclassified_from_bytes(bytes: &[u8]) -> Result<Vec<ElfSection>, object::Erro
                 section.flags(),
                 SectionFlags::Elf { sh_flags } if sh_flags & SHF_ALLOC != 0
             );
-            // The footprint classifies an undecodable name as empty; so does this test.
+            // Match the footprint, which classifies an undecodable name as empty.
             allocated
                 && section.size() != 0
                 && classify(section.name().unwrap_or_default(), section.kind()).is_none()
@@ -149,7 +145,7 @@ enum SectionClass {
     Bss,
 }
 
-/// The footprint's one classification rule: by name first, then by kind.
+/// By name, then by kind; shared by the footprint and the unclassified list.
 fn classify(name: &str, kind: SectionKind) -> Option<SectionClass> {
     let family = |base: &str| {
         name == base
@@ -238,8 +234,8 @@ mod section_tests {
     const SHF_ALLOC: u32 = 0x2;
     const SHF_EXECINSTR: u32 = 0x4;
 
-    /// A minimal little-endian ELF32 Arm image with the given (name, type, flags, size)
-    /// sections and no data: every section is NOBITS or points at the header bytes.
+    /// A little-endian ELF32 Arm image of (name, type, flags, size) sections with no section
+    /// data: PROGBITS sections all point at offset 0, so their sizes must fit in the image.
     fn elf32(sections: &[(&str, u32, u32, u32)]) -> Vec<u8> {
         let mut names = std::vec![0_u8];
         let mut offsets = Vec::new();
@@ -248,7 +244,7 @@ mod section_tests {
             names.extend_from_slice(name.as_bytes());
             names.push(0);
         }
-        // The section header table that follows must be 4-byte aligned.
+        // The section header table must be 4-byte aligned.
         names.resize(names.len().next_multiple_of(4), 0);
         let names_offset = 52_u32;
         let headers_offset = names_offset + u32::try_from(names.len()).unwrap();
@@ -269,7 +265,6 @@ mod section_tests {
         image.resize(image.len() + 40, 0);
         let mut address = 0x1000_u32;
         for ((_, kind, flags, size), name) in sections.iter().zip(&offsets) {
-            // PROGBITS sections point at the ELF header, so every size used here is in bounds.
             for word in [*name, *kind, *flags, address, 0, *size, 0, 0, 1, 0] {
                 image.extend_from_slice(&word.to_le_bytes());
             }
@@ -306,7 +301,7 @@ mod section_tests {
             (".datafoo", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, 4),
             (".empty", SHT_NOBITS, SHF_ALLOC | SHF_WRITE, 0),
             (".comment", SHT_PROGBITS, 0, 4),
-            // Counted by kind alone: executable code under a name no rule knows.
+            // Counted by kind: no name rule matches `.isr`.
             (".isr", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, 2),
         ]);
         let footprint = footprint_from_bytes(&image).unwrap();
@@ -320,8 +315,7 @@ mod section_tests {
             .iter()
             .map(|section| (section.name.as_str(), section.size))
             .collect::<Vec<_>>();
-        // `.datafoo` is not in the `.data` family; `.empty` has no bytes; `.comment` is not
-        // allocated.
+        // `.datafoo` is outside the `.data` family; `.empty` and unallocated `.comment` are omitted.
         assert_eq!(listed, [(".uninit", 20), (".got", 8), (".datafoo", 4)]);
         let uninit = 0x1000 + 8 + 16 + 4 + 4 + 12;
         let addresses = unclassified
@@ -343,7 +337,7 @@ mod section_tests {
     #[test]
     fn an_undecodable_name_is_listed_lossily() {
         let mut image = elf32(&[(".odd", SHT_NOBITS, SHF_ALLOC | SHF_WRITE, 4)]);
-        // Replace the `o` of `.odd` in the name table, which starts at offset 52 + 1.
+        // The name table is at 52; `.odd` follows its leading NUL, so 54 is the `o`.
         image[54] = 0xff;
         let unclassified = unclassified_from_bytes(&image).unwrap();
         assert_eq!(unclassified.len(), 1);
