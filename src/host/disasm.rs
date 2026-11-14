@@ -135,14 +135,15 @@ pub struct Function {
     /// own start is indistinguishable from a loop and is not counted.
     pub calls_self: bool,
     /// Instructions that make [`Function::local_stack_upper`] or the call edges incomplete, as
-    /// `address: mnemonic operands (reason)`: indirect branches other than `bx lr`, branches or
-    /// calls to an address that starts no function and is not inside this one, and stack
-    /// adjustments the frame estimate does not count.
+    /// `address: mnemonic operands (reason)`: indirect branches other than `bx lr`, table
+    /// branches (`tbb`/`tbh`), branches or calls to an address that starts no function and is
+    /// not inside this one, and stack adjustments the frame estimate does not count.
     pub uncounted: Vec<String>,
     /// A frame estimate: four bytes per register pushed plus every `sub sp, ..., #0x..`. Not
-    /// counted, and listed in [`Function::uncounted`]: `subw`, `vpush`, pre-indexed stores to
-    /// `sp`, register-sized adjustments (`sub sp, rN`, the `ldr`/`add sp` sequence Armv6-M uses
-    /// for large frames) and decimal immediates.
+    /// counted, and listed in [`Function::uncounted`]: `subw`, `vpush` (conditional forms
+    /// too), pre-indexed stores to `sp`, register-sized adjustments (`sub sp, rN`, the
+    /// `ldr`/`add sp` sequence Armv6-M uses for large frames), `mov sp, rN` other than directly
+    /// before a `pop`, and decimal immediates.
     pub local_stack_upper: u64,
 }
 
@@ -338,10 +339,15 @@ impl Disassembly {
         for function in functions.values_mut() {
             let mut pushes: u64 = 0;
             let mut allocations: u64 = 0;
-            for address in &function.instructions {
+            for (position, address) in function.instructions.iter().enumerate() {
                 let Some(instruction) = instructions.get(address) else {
                     continue;
                 };
+                let next_mnemonic = function
+                    .instructions
+                    .get(position + 1)
+                    .and_then(|next| instructions.get(next))
+                    .map(|next| thumb::normalize_mnemonic(&next.mnemonic));
                 let describe = |reason: &str| {
                     format!(
                         "{:#x}: {} {} ({reason})",
@@ -361,6 +367,16 @@ impl Disassembly {
                             .uncounted
                             .push(describe("stack adjustment not counted")),
                     }
+                } else if mnemonic == "mov"
+                    && operands.starts_with("sp,")
+                    && next_mnemonic.as_deref() != Some("pop")
+                {
+                    // Directly before a `pop` it is an epilogue: it resets `sp` to the counted
+                    // frame (from a frame pointer) before the pushed registers are restored.
+                    // Anywhere else the new value could lie below the counted frame.
+                    function
+                        .uncounted
+                        .push(describe("register stack transfer not counted"));
                 } else if let Some(reason) = uncounted_stack_change(&mnemonic, operands) {
                     function.uncounted.push(describe(reason));
                 }
@@ -387,7 +403,10 @@ impl Disassembly {
                             ));
                         }
                         None if mnemonic == "bx" && operands == "lr" => {}
-                        None if mnemonic == "tbb" || mnemonic == "tbh" => {}
+                        // The targets come from a table in memory and may leave the function.
+                        None if mnemonic == "tbb" || mnemonic == "tbh" => function
+                            .uncounted
+                            .push(describe("table branch targets not resolved")),
                         None => function.uncounted.push(describe("indirect branch")),
                     }
                 } else if (mnemonic == "mov" || mnemonic.starts_with("ldr"))
@@ -924,6 +943,8 @@ pub mod thumb {
                     | "strd"
                     | "push"
                     | "pop"
+                    | "vpush"
+                    | "vpop"
             )
     }
 

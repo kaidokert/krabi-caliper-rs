@@ -226,9 +226,10 @@ estimate: four bytes per pushed register plus every `sub sp, #0x..`.
 recursion; `composed_stack_upper_with(root, RecursionPolicy::CountOnce)` instead
 counts each recursive frame once and clears `bounded`, for recursion that is
 bounded in practice (library sorts, for example). It is a heuristic, not a proof: indirect calls, indirect branches,
-branches to addresses that start no function, and stack adjustments it does not
-count (`subw`, `vpush`, register adjustments, decimal immediates) are listed per
-function and clear `bounded`. Exception entry and interrupt handlers are never
+table branches (`tbb`/`tbh`), branches to addresses that start no function, and
+stack adjustments it does not count (`subw`, `vpush`, register adjustments,
+`mov sp, rN` other than directly before a `pop`, decimal immediates) are listed
+per function and clear `bounded`. Exception entry and interrupt handlers are never
 included. Literal-pool words that objdump decodes as branches also show up as
 uncounted, so a cleared `bounded` needs a look at the listed lines rather than
 being an error by itself. Read the listing with current LLVM tools: GNU objdump's decimal

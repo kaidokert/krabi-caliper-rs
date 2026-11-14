@@ -156,10 +156,10 @@ fn what_the_estimate_cannot_see_is_listed() {
             "bl 0x300 (target starts no function)",
             "b 120 <g> (indirect branch)",
             "b 0x204 <g+0x4> (target starts no function)",
+            "tbb [pc, r0] (table branch targets not resolved)",
         ]
     );
-    // A `b` to its own start is a loop, not recursion; internal branches and table branches
-    // are fine.
+    // A `b` to its own start is a loop, not recursion; internal branches are fine.
     assert!(!f.calls_self);
     assert!(f.calls.is_empty());
     assert_eq!(f.local_stack_upper, 0);
@@ -170,6 +170,38 @@ fn what_the_estimate_cannot_see_is_listed() {
             bounded: false
         }
     );
+}
+
+#[test]
+fn stack_pointer_transfers_count_only_as_epilogues() {
+    let nm = "00000400 00000010 T allocates\n00000500 00000010 T restores\n";
+    let objdump = "
+00000400 <allocates>:
+     400: \tsub.w\tr4, sp, #0x40
+     404: \tmov\tsp, r4
+     406: \tit\tne
+     408: \tvpushne\t{d8}
+     40c: \tbx\tlr
+
+00000500 <restores>:
+     500: \tpush\t{r4, r5, r6, r7, lr}
+     502: \tadd\tr7, sp, #0xc
+     504: \tsub\tsp, #0x10
+     506: \tsubs\tr6, r7, #0xc
+     508: \tmov\tsp, r6
+     50a: \tpop\t{r4, r5, r6, r7, pc}
+";
+    let d = Disassembly::parse(nm, objdump).unwrap();
+    assert_eq!(
+        d.functions[&0x400].uncounted,
+        [
+            "0x404: mov sp, r4 (register stack transfer not counted)",
+            "0x408: vpushne {d8} (vpush not counted)",
+        ]
+    );
+    let restores = &d.functions[&0x500];
+    assert!(restores.uncounted.is_empty(), "{:?}", restores.uncounted);
+    assert_eq!(restores.local_stack_upper, 20 + 16);
 }
 
 #[test]
@@ -354,6 +386,7 @@ fn thumb_helpers() {
     assert_eq!(normalize_mnemonic("bics"), "bics");
     assert_eq!(normalize_mnemonic("push.w"), "push");
     assert_eq!(normalize_mnemonic("vpush"), "vpush");
+    assert_eq!(normalize_mnemonic("vpushne"), "vpush");
     assert!(is_control_transfer("cbz"));
     assert!(is_control_transfer("tbb"));
     assert!(!is_control_transfer("bic"));
