@@ -15,19 +15,17 @@ pub const fn extend_timer16(wraps: u32, counter: u16, overflow_pending: bool) ->
     (wraps.wrapping_add(pending_wrap as u32) as u64) << 16 | counter as u64
 }
 
-/// Ticks between two [`extend_timer16`] readings, and whether the 48-bit extended count wrapped
-/// between them.
+/// Ticks between two [`extend_timer16`] readings, modulo 2^48, and whether the extended count
+/// wrapped between them.
 ///
-/// The extended count is 48 bits (a 32-bit overflow count above the 16-bit timer), so the
-/// difference is taken modulo 2^48: correct for any interval shorter than one full period, even
-/// across the overflow count's own rollover.
+/// Correct for any interval shorter than 2^48 ticks, including one that spans the rollover of
+/// the 32-bit overflow count.
 pub const fn elapsed_timer48(start: u64, end: u64) -> (u64, bool) {
     const PERIOD_MASK: u64 = (1 << 48) - 1;
     (end.wrapping_sub(start) & PERIOD_MASK, end < start)
 }
 
-/// Internal clock source for 16-bit Timer/Counter1 (and the identical Timer3/4/5): the CPU clock
-/// divided by a prescaler.
+/// Internal clock source for 16-bit Timer/Counter1: the CPU clock divided by a prescaler.
 ///
 /// A smaller divisor gives finer ticks but wraps sooner. Software wrap extension needs the
 /// overflow ISR to run within 0x8000 ticks of each wrap: about 2.1 s at `/1024` on a 16 MHz part,
@@ -126,8 +124,8 @@ mod atmega2560 {
 
     /// Wrap-extended ATmega2560 Timer/Counter1 at a caller-chosen prescaler.
     ///
-    /// The application owns the CPU clock and supplies the resulting timer
-    /// tick frequency. It must install an overflow ISR that calls
+    /// The application owns the CPU clock and supplies either it or the
+    /// resulting timer tick frequency. It must install an overflow ISR that calls
     /// [`timer1_overflow`] and enable global interrupts before relying on
     /// software wrap extension, and that ISR must run within 0x8000 ticks of
     /// each wrap (see [`Timer1Prescale`]). This adapter never changes global
@@ -139,8 +137,7 @@ mod atmega2560 {
     }
 
     impl<'timer> Timer1Counter<'timer> {
-        /// Stops and configures Timer1, clears stale overflow state, enables
-        /// its overflow interrupt, then starts it with the `/1024` prescaler.
+        /// [`start`](Self::start) with the `/1024` prescaler.
         pub fn start_prescale_1024(timer: &'timer mut TC1, frequency_hz: Option<u64>) -> Self {
             Self::start(timer, Timer1Prescale::Div1024, frequency_hz)
         }
@@ -389,7 +386,6 @@ mod tests {
         let start = extend_timer16(u32::MAX, 0xfffe, false);
         let end = extend_timer16(0, 0x0003, false);
         assert_eq!(elapsed_timer48(start, end), (5, true));
-        // An ordinary interval is unchanged.
         let start = extend_timer16(7, 0x1000, false);
         let end = extend_timer16(9, 0x0800, false);
         assert_eq!(elapsed_timer48(start, end), ((2 << 16) - 0x800, false));
