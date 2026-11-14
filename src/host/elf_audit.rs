@@ -480,7 +480,8 @@ fn is_loaded(flags: SectionFlags, kind: SectionKind) -> bool {
 fn section_at(object: &object::File<'_>, file_offset: u64) -> Option<String> {
     object.sections().find_map(|section| {
         let (start, size) = section.file_range()?;
-        (start..start + size)
+        // A corrupt header can give a range past u64::MAX; such a section contains nothing.
+        (start..start.checked_add(size)?)
             .contains(&file_offset)
             .then(|| section.name().ok().map(str::to_string))
             .flatten()
