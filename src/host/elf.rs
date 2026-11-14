@@ -18,13 +18,14 @@ pub struct ElfFootprint {
     pub static_ram_bytes: u64,
 }
 
-/// An allocated, non-empty section that [`read_elf_footprint`] does not count, because neither
-/// its name nor its kind places it in text, read-only data, data or BSS. Examples are a
-/// linker-script `.uninit` region, `.got`, or a new section a linker script added.
+/// A named ELF section with its address and size.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ElfSection {
+    /// The section's name, with any bytes that are not UTF-8 replaced by U+FFFD.
     pub name: String,
+    /// The section's address in memory (`sh_addr`).
     pub address: u64,
+    /// The section's size in bytes (`sh_size`), whether or not it occupies file space.
     pub size: u64,
 }
 
@@ -51,7 +52,8 @@ pub fn read_elf_footprint(path: &Path) -> Result<ElfFootprint, ElfError> {
 }
 
 /// Lists the allocated (`SHF_ALLOC`), non-empty sections that [`read_elf_footprint`] leaves out
-/// of every total, in section-header order.
+/// of every total, in section-header order: those whose name and kind place them in none of
+/// text, read-only data, data or BSS, such as a linker-script `.uninit` region or `.got`.
 ///
 /// The footprint classifies sections by name and then by kind, and skips the rest. A size gate
 /// that must not miss memory can require this list to be empty, so that a new section fails
@@ -71,12 +73,16 @@ fn unclassified_from_bytes(bytes: &[u8]) -> Result<Vec<ElfSection>, object::Erro
                 section.flags(),
                 SectionFlags::Elf { sh_flags } if sh_flags & SHF_ALLOC != 0
             );
+            // The footprint classifies an undecodable name as empty; so does this test.
             allocated
                 && section.size() != 0
                 && classify(section.name().unwrap_or_default(), section.kind()).is_none()
         })
         .map(|section| ElfSection {
-            name: section.name().unwrap_or_default().to_string(),
+            name: section
+                .name_bytes()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default(),
             address: section.address(),
             size: section.size(),
         })
@@ -298,9 +304,11 @@ mod section_tests {
             (".datafoo", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, 4),
             (".empty", SHT_NOBITS, SHF_ALLOC | SHF_WRITE, 0),
             (".comment", SHT_PROGBITS, 0, 4),
+            // Counted by kind alone: executable code under a name no rule knows.
+            (".isr", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, 2),
         ]);
         let footprint = footprint_from_bytes(&image).unwrap();
-        assert_eq!(footprint.text_bytes, 24);
+        assert_eq!(footprint.text_bytes, 26);
         assert_eq!(footprint.read_only_data_bytes, 4);
         assert_eq!(footprint.data_bytes, 4);
         assert_eq!(footprint.bss_bytes, 12);
@@ -313,7 +321,12 @@ mod section_tests {
         // `.datafoo` is not in the `.data` family; `.empty` has no bytes; `.comment` is not
         // allocated.
         assert_eq!(listed, [(".uninit", 20), (".got", 8), (".datafoo", 4)]);
-        assert_eq!(unclassified[0].address, 0x1000 + 8 + 16 + 4 + 4 + 12);
+        let uninit = 0x1000 + 8 + 16 + 4 + 4 + 12;
+        let addresses = unclassified
+            .iter()
+            .map(|section| section.address)
+            .collect::<Vec<_>>();
+        assert_eq!(addresses, [uninit, uninit + 20, uninit + 20 + 8]);
     }
 
     #[test]
@@ -323,6 +336,16 @@ mod section_tests {
             (".bss.counter", SHT_NOBITS, SHF_ALLOC | SHF_WRITE, 4),
         ]);
         assert!(unclassified_from_bytes(&image).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_undecodable_name_is_listed_lossily() {
+        let mut image = elf32(&[(".odd", SHT_NOBITS, SHF_ALLOC | SHF_WRITE, 4)]);
+        // Replace the `o` of `.odd` in the name table, which starts at offset 52 + 1.
+        image[54] = 0xff;
+        let unclassified = unclassified_from_bytes(&image).unwrap();
+        assert_eq!(unclassified.len(), 1);
+        assert_eq!(unclassified[0].name, ".\u{fffd}dd");
     }
 
     #[test]
