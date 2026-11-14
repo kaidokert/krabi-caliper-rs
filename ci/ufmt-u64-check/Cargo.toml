@@ -1,0 +1,26 @@
+# Checks that the ufmt encoder prints `u64` values without a 64-bit division call on a core with
+# no 64-bit divider. Its own workspace: CI builds it for thumbv6m-none-eabi and reads the object's
+# undefined symbols. The `control` feature formats a `u64` with ufmt itself, which must call the
+# division helper, so the check is shown to detect one.
+[package]
+name = "ufmt-u64-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+control = []
+
+[dependencies]
+krabi-caliper = { path = "../..", default-features = false, features = ["ufmt"] }
+ufmt = "0.2"
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+panic = "abort"

@@ -44,7 +44,9 @@ Target facilities include:
 - allocation-free measurements, samples, summaries, and repeated benchmarks;
 - stack painting through an application-supplied memory contract;
 - Cortex-M SysTick and DWT, RISC-V cycle/instruction CSRs, and ATmega2560
-  Timer1 adapters;
+  Timer1 adapters (Timer1 at a chosen prescaler, `Timer1Prescale`, from `/1`
+  for one tick per CPU cycle to `/1024` for long intervals; the overflow ISR
+  must run within 0x8000 ticks of each wrap);
 - the versioned `EM_*` event protocol over formatting sinks, `ufmt`, RTT,
   semihosting, or application-owned UART output;
 - balanced paired acquisition and deterministic fixtures.
@@ -103,10 +105,69 @@ resolves runner-only bindings such as probe selectors only in the execution
 job. CI remains responsible for artifact transfer and for acquiring any
 hardware lock after the bundle has been downloaded.
 
+### Runner presets
+
+A profile's `preset` supplies the runner command, the target and the recorded
+board, MCU and transport. A field set in the profile overrides the preset's
+value.
+
+- `qemu-cortex-m0`, `qemu-cortex-m3`, `qemu-cortex-m4`: QEMU, reporting over
+  semihosting.
+- `qemu-riscv32-sifive-e`: QEMU, reporting over UART.
+- `simavr-atmega2560`: simavr, reporting over UART.
+- `probe-rs-rtt`: physical hardware through `probe-rs run`, reporting over RTT.
+
+### `probe-rs-rtt`
+
+```toml
+[venues.bench]
+bindings = { PROBE_RS_CHIP = "STM32L431KCUx", PROBE_RS_PROBE = "0483:374f:000000000000" }
+
+[profiles.l431]
+preset = "probe-rs-rtt"
+target = "thumbv7em-none-eabihf"
+venue = "bench"
+```
+
+The preset needs two bindings, from a venue's `bindings` or the environment:
+
+- `PROBE_RS_CHIP`: the probe-rs chip name, recorded as the MCU.
+- `PROBE_RS_PROBE`: the probe selector. Use `VID:PID:Serial` when several
+  probes of one model are attached; `VID:PID` matches each of them. The
+  selector is not part of the configuration identity, so replacing a probe
+  does not block comparisons.
+
+The profile sets `target`, because the target triple depends on the chip.
+
+The firmware must report over RTT (the `rtt` feature). With
+`cortex_m_reporter!("<feature>")`, list that feature in the profile's
+`build-features`; without it the firmware reports over semihosting and the run
+times out.
+
+The run ends at the first `EM_OUTCOME` event. On Unix probe-rs then gets SIGINT
+so it can detach from the target, and is killed if it has not exited within
+three seconds. On Windows it is killed after those three seconds. A timeout
+kills it at once.
+
+`build --output` needs neither binding, so firmware can be built where no probe
+is attached. `validate` and `run` resolve every profile in the file, so set the
+bindings wherever those commands run, or keep hardware profiles in a separate
+configuration file.
+
+`mcu` and `probe` set in a profile are recorded metadata only. `args` replaces
+the whole command line, including the chip and probe selectors.
+
 Host facilities include Cargo artifact discovery, timeouts, retained logs, ELF
 footprint extraction, comparisons, JSON/CSV/Markdown reports, CT-grind
 integration, panic-path auditing, Welch analysis, and combined DWT/ETM
 evidence.
+
+`read_elf_footprint` counts each section as text, read-only data, data or BSS,
+by name and then by section kind, and skips the rest.
+`read_elf_unclassified_sections` lists the allocated, non-empty sections it
+skips, such as a linker-script `.uninit` region or `.got`, so a size gate can
+require the list to be empty. Runtime reservations such as `riscv-rt`'s
+`.stack` and `.heap` are listed too; a gate allows those by name.
 
 ## Counting instructions from QEMU execution traces
 
@@ -160,6 +221,9 @@ the log format and translation belong to QEMU.
 - Architectures: `cortex-m`, `cortex-m-dwt`, `risc-v`, `avr`,
   `avr-atmega2560`
 - Target transports: `rtt`, `semihosting`, `uart`, `ufmt`
+  (with `uart` and `ufmt` together, `protocol::uart::ufmt_reporter` reports
+  through any `protocol::uart::WriteByte` transmitter without requiring
+  `core::fmt`)
 - Host analysis: `host`, `campaign`, `ctgrind`
 - Cargo subcommand: `cli` plus `campaign`
 
