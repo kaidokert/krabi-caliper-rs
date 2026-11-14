@@ -211,17 +211,19 @@ impl CampaignExecutor {
         let campaign_dir = artifact_child(&artifact_root, campaign_name, "campaign name")?;
         let mut reports = Vec::new();
         for case in cases {
-            let report = self.run_case(
-                (campaign_name, &campaign.profile),
-                &profile,
-                workspace,
-                &campaign_dir,
-                &case,
-                RunContext {
-                    environment: &environment,
-                    silent: selection.silent,
-                },
-            )?;
+            let report = run_with_retry(&campaign.retry, &campaign_dir, selection.silent, || {
+                self.run_case(
+                    (campaign_name, &campaign.profile),
+                    &profile,
+                    workspace,
+                    &campaign_dir,
+                    &case,
+                    RunContext {
+                        environment: &environment,
+                        silent: selection.silent,
+                    },
+                )
+            })?;
             let passed = report.status == CaseStatus::Pass;
             reports.push(report);
             if !passed && !campaign.continue_on_failure {
@@ -340,16 +342,18 @@ impl CampaignExecutor {
             case_environment.source = prepared.source.clone();
             case_environment.build = prepared.build.clone();
             case_environment.build.features = prepared_case.case.features.clone();
-            let report = self.run_prepared_case(
-                (campaign_name, &campaign.profile),
-                &profile,
-                workspace,
-                &campaign_dir,
-                prepared_case,
-                &canonical_artifact,
-                case_environment,
-                selection.silent,
-            )?;
+            let report = run_with_retry(&campaign.retry, &campaign_dir, selection.silent, || {
+                self.run_prepared_case(
+                    (campaign_name, &campaign.profile),
+                    &profile,
+                    workspace,
+                    &campaign_dir,
+                    prepared_case,
+                    &canonical_artifact,
+                    case_environment.clone(),
+                    selection.silent,
+                )
+            })?;
             let passed = report.status == CaseStatus::Pass;
             reports.push(report);
             if !passed && !campaign.continue_on_failure {
@@ -421,6 +425,8 @@ impl CampaignExecutor {
                 stdout: build_output.stdout_lossy(),
                 stderr: build_output.stderr_lossy(),
                 result: None,
+                attempts: 1,
+                retried: Vec::new(),
             };
             write_case_artifacts(&case_dir, &report)?;
             return Ok(report);
@@ -475,6 +481,8 @@ impl CampaignExecutor {
                     stdout: output.stdout_lossy(),
                     stderr: output.stderr_lossy(),
                     result: None,
+                    attempts: 1,
+                    retried: Vec::new(),
                 };
                 write_case_artifacts(&case_dir, &report)?;
                 return Ok(report);
@@ -531,6 +539,8 @@ impl CampaignExecutor {
                 String::new()
             },
             result,
+            attempts: 1,
+            retried: Vec::new(),
         };
         write_case_artifacts(&case_dir, &report)?;
         Ok(report)
@@ -612,6 +622,8 @@ impl CampaignExecutor {
                     stdout: output.stdout_lossy(),
                     stderr: output.stderr_lossy(),
                     result: None,
+                    attempts: 1,
+                    retried: Vec::new(),
                 };
                 write_case_artifacts(&case_dir, &report)?;
                 return Ok(report);
@@ -674,6 +686,8 @@ impl CampaignExecutor {
                 String::new()
             },
             result,
+            attempts: 1,
+            retried: Vec::new(),
         };
         write_case_artifacts(&case_dir, &report)?;
         Ok(report)
@@ -1519,6 +1533,117 @@ fn write_case_metadata(path: &Path, report: &CaseReport) -> Result<(), CampaignE
         &path.join("metadata.json"),
         &serde_json::to_string_pretty(report).map_err(CampaignError::Json)?,
     )
+}
+
+/// Runs one case, then runs it again while `policy` says its status is transient.
+///
+/// Each attempt starts from an empty case directory. A discarded attempt's directory (its
+/// logs, metadata and failure report) is kept and ends up in the final case directory as
+/// `attempts/<n>/`. The kept report, and its rewritten metadata, record how many attempts ran
+/// and what each discarded attempt reported.
+fn run_with_retry(
+    policy: &RetryPolicy,
+    campaign_dir: &Path,
+    silent: bool,
+    mut attempt: impl FnMut() -> Result<CaseReport, CampaignError>,
+) -> Result<CaseReport, CampaignError> {
+    let mut retried = Vec::new();
+    let mut staged = Vec::new();
+    let mut stage_root = None;
+    let mut number = 1;
+    loop {
+        let mut report = attempt()?;
+        let case_dir = artifact_child(campaign_dir, &report.id, "expanded case id")?;
+        if policy.retries(number, report.status) {
+            if !silent {
+                std::eprintln!(
+                    "retrying case {:?} after {} (attempt {}/{})",
+                    report.id,
+                    report.status.name(),
+                    number + 1,
+                    policy.attempts
+                );
+            }
+            let mut artifacts = None;
+            if case_dir.is_dir() {
+                // Staged outside the case directory, which the next attempt empties, in a
+                // directory this run creates, so no other case's artifacts can be in the way.
+                let root = match &stage_root {
+                    Some(root) => root,
+                    None => stage_root.insert(create_unique_dir(campaign_dir, &report.id)?),
+                };
+                let stage = root.join(number.to_string());
+                move_dir(&case_dir, &stage)?;
+                staged.push((stage, number));
+                artifacts = Some(format!("attempts/{number}"));
+            }
+            retried.push(RetriedAttempt {
+                status: report.status,
+                error: report.error.take(),
+                artifacts,
+            });
+            number += 1;
+            continue;
+        }
+        if retried.is_empty() {
+            return Ok(report);
+        }
+        let attempts_dir = case_dir.join("attempts");
+        for (stage, attempt) in staged {
+            fs::create_dir_all(&attempts_dir).map_err(|source| CampaignError::Io {
+                path: attempts_dir.clone(),
+                source,
+            })?;
+            move_dir(&stage, &attempts_dir.join(attempt.to_string()))?;
+        }
+        if let Some(root) = &stage_root {
+            // Empty now; a failure to remove it loses nothing.
+            let _ = fs::remove_dir(root);
+        }
+        report.attempts = number;
+        report.retried = retried;
+        write_case_artifacts(&case_dir, &report)?;
+        return Ok(report);
+    }
+}
+
+/// Creates a new directory beside the case directories for staging discarded attempts of
+/// `case_id`. Creation is atomic and never reuses an existing path, so a case whose name looks
+/// like a staging directory is left untouched.
+fn create_unique_dir(campaign_dir: &Path, case_id: &str) -> Result<PathBuf, CampaignError> {
+    let pid = std::process::id();
+    for suffix in 0u32.. {
+        let path = campaign_dir.join(format!(".{case_id}.retry-{pid}-{suffix}"));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(CampaignError::Io { path, source }),
+        }
+    }
+    Err(CampaignError::Io {
+        path: campaign_dir.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "no free retry staging directory name",
+        ),
+    })
+}
+
+/// Moves `from` to `to`, which must not exist: nothing is ever deleted to make room.
+fn move_dir(from: &Path, to: &Path) -> Result<(), CampaignError> {
+    if to.exists() {
+        return Err(CampaignError::Io {
+            path: to.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "refusing to overwrite an existing path",
+            ),
+        });
+    }
+    fs::rename(from, to).map_err(|source| CampaignError::Io {
+        path: from.to_path_buf(),
+        source,
+    })
 }
 
 fn write_case_artifacts(path: &Path, report: &CaseReport) -> Result<(), CampaignError> {

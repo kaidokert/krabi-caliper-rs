@@ -787,6 +787,8 @@ mod tests {
                 error: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                attempts: 1,
+                retried: Vec::new(),
                 result: Some(result),
             }],
         }

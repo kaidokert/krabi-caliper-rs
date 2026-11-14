@@ -88,6 +88,23 @@ Commands are announced by default and complete stdout and stderr are retained
 for failed builds and runs. Use `--silent` only when command announcements are
 not wanted.
 
+An emulator, probe or host process can fail for reasons unrelated to the
+firmware. A campaign can run such a case again:
+
+```toml
+[campaigns.smoke]
+profile = "qemu-m3"
+case-set = "smoke"
+retry = { attempts = 3 }   # `on` defaults to ["run-failed", "timed-out"]
+```
+
+`attempts` counts every run, including the first. Only the statuses in `on` are
+retried; a workload or measurement failure is a result and is not retried
+unless listed. The kept report records `attempts` and, in `retried`, the status
+and error of each discarded attempt. Each discarded attempt's logs, metadata
+and failure report are kept in the case directory under `attempts/<n>/`, and
+the campaign Markdown and CSV reports show the attempt count.
+
 For a scarce hardware runner, build the firmware on a hosted runner and pass
 the prepared bundle to the hardware job:
 

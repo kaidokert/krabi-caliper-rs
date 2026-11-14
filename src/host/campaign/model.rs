@@ -48,6 +48,7 @@ pub enum CaseStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CaseReport {
     pub id: String,
     pub name: String,
@@ -73,6 +74,23 @@ pub struct CaseReport {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stderr: String,
     pub result: Option<RunResult>,
+    /// Runs of this case, counting the one reported; above one when a retry policy applied.
+    #[serde(default = "one_attempt")]
+    pub attempts: u32,
+    /// The status and error of each earlier attempt that was retried, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retried: Vec<RetriedAttempt>,
+}
+
+/// One discarded attempt of a retried case.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RetriedAttempt {
+    pub status: CaseStatus,
+    pub error: Option<String>,
+    /// The attempt's artifact directory, relative to the case directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -138,6 +156,7 @@ impl CampaignReport {
             for case in failed {
                 output.push_str(&format!("### `{}` — `{:?}`\n\n", case.id, case.status));
                 output.push_str(&format!("**Reason:** {}\n\n", failure_reason(case)));
+                render_retried(&mut output, case);
                 output.push_str("**Command:**\n\n```console\n");
                 output.push_str(failure_command(case));
                 output.push_str("\n```\n\n");
@@ -208,10 +227,10 @@ impl CampaignReport {
                 .as_ref()
                 .and_then(|id| self.cases.iter().find(|candidate| &candidate.id == id));
             output.push_str(&format!(
-                "| {} | {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 case.id,
                 parameters,
-                case.status,
+                status_cell(case),
                 case.footprint
                     .map_or_else(|| "—".to_string(), |value| value.flash_bytes.to_string()),
                 delta(
@@ -284,6 +303,9 @@ impl CampaignReport {
                         policy,
                     ));
                 };
+            if case.attempts > 1 {
+                row("", "retry", "attempts", u64::from(case.attempts), "", "");
+            }
             if let Some(footprint) = case.footprint {
                 row(
                     "",
@@ -354,6 +376,8 @@ impl CaseReport {
             failure_reason(self),
             failure_command(self),
         );
+        output.push('\n');
+        render_retried(&mut output, self);
         render_output_stream(&mut output, "stdout", &self.stdout, 2);
         render_output_stream(&mut output, "stderr", &self.stderr, 2);
         output
@@ -372,6 +396,57 @@ fn render_output_stream(output: &mut String, name: &str, contents: &str, heading
         output.push_str(&fenced_text(contents));
     }
     output.push_str("\n```\n");
+}
+
+impl CaseStatus {
+    /// The status as spelled in configuration and JSON, for example `run-failed`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::WorkloadFail => "workload-fail",
+            Self::MeasurementError => "measurement-error",
+            Self::BuildFailed => "build-failed",
+            Self::RunFailed => "run-failed",
+            Self::TimedOut => "timed-out",
+            Self::ProtocolError => "protocol-error",
+            Self::MissingTerminalRecord => "missing-terminal-record",
+        }
+    }
+}
+
+/// The status-table cell: the status, plus the attempt count when a retry policy applied.
+fn status_cell(case: &CaseReport) -> String {
+    if case.attempts > 1 {
+        format!("{:?} ({} attempts)", case.status, case.attempts)
+    } else {
+        format!("{:?}", case.status)
+    }
+}
+
+/// Lists a retried case's discarded attempts, one line each.
+fn render_retried(output: &mut String, case: &CaseReport) {
+    if case.retried.is_empty() {
+        return;
+    }
+    output.push_str(&format!("**Attempts:** {}\n\n", case.attempts));
+    for (index, attempt) in case.retried.iter().enumerate() {
+        let reason = attempt
+            .error
+            .as_deref()
+            .and_then(|error| error.lines().next())
+            .unwrap_or("no reason recorded");
+        output.push_str(&format!(
+            "- Attempt {}: `{}`, {}",
+            index + 1,
+            attempt.status.name(),
+            reason
+        ));
+        if let Some(artifacts) = &attempt.artifacts {
+            output.push_str(&format!(" (`{artifacts}/`)"));
+        }
+        output.push('\n');
+    }
+    output.push('\n');
 }
 
 fn failure_reason(case: &CaseReport) -> &str {

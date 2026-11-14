@@ -333,6 +333,7 @@ fn matrix_campaign() -> CampaignConfig {
         matrix_features: vec!["depth-{depth}".to_string(), "mode-{mode}".to_string()],
         continue_on_failure: true,
         artifact_dir: None,
+        retry: RetryPolicy::default(),
     }
 }
 
@@ -637,6 +638,41 @@ cases = [{ name = "prepared", example = "prepared-fixture", expected-benchmark =
         .unwrap();
     assert!(report.success());
     std::fs::remove_file(root_manifest).unwrap();
+
+    // The prepared path retries too: this runner fails until its marker file exists.
+    let marker = workspace.join("flaky.marker");
+    let flaky = parse(&format!(
+        r#"
+[profiles.prepared]
+runner = "command"
+target = "host"
+executable = "sh"
+args = [
+  "-c",
+  "if [ -e '{marker}' ]; then printf '%s\n' 'EM_OUTCOME schema:1 benchmark:prepared-fixture status:PASS'; else touch '{marker}'; exit 7; fi",
+]
+
+[campaigns.prepared]
+profile = "prepared"
+constant-time = {{ gate = false, welch-threshold = 4.5 }}
+retry = {{ attempts = 2 }}
+cases = [{{ name = "prepared", example = "prepared-fixture", expected-benchmark = "prepared-fixture" }}]
+"#,
+        marker = marker.display()
+    ));
+    let report = executor
+        .run_prepared(
+            &flaky,
+            "prepared",
+            &workspace,
+            &CampaignSelection::default(),
+            &manifest,
+        )
+        .unwrap();
+    assert!(report.success());
+    assert_eq!(report.cases[0].attempts, 2);
+    assert_eq!(report.cases[0].retried[0].status, CaseStatus::RunFailed);
+    std::fs::remove_file(marker).unwrap();
 
     let mut mismatched = prepared.clone();
     mismatched.build.target = Some("wrong-target".to_string());
@@ -1047,5 +1083,334 @@ cases = [{ name = "fixture", example = "fixture" }]
     let markdown = report.render_markdown();
     assert!(markdown.contains("runner command timed out after"));
     assert!(markdown.contains("sh -c"));
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+fn scripted_report(id: &str, status: CaseStatus, error: Option<&str>) -> CaseReport {
+    CaseReport {
+        id: id.to_string(),
+        name: id.to_string(),
+        cargo_target: CargoTarget::Example(id.to_string()),
+        environment: ReproducibilityMetadata {
+            recorded_unix_seconds: 0,
+            source: SourceMetadata::default(),
+            build: BuildMetadata::default(),
+            target: TargetMetadata::default(),
+        },
+        features: Vec::new(),
+        parameters: BTreeMap::new(),
+        artifact: None,
+        footprint: None,
+        baseline: None,
+        build_command: String::new(),
+        prepare_commands: Vec::new(),
+        delay_before_run_seconds: None,
+        run_command: None,
+        build_duration_ms: 0,
+        run_duration_ms: None,
+        status,
+        error: error.map(str::to_string),
+        stdout: String::new(),
+        stderr: String::new(),
+        result: None,
+        attempts: 1,
+        retried: Vec::new(),
+    }
+}
+
+fn run_script(policy: &RetryPolicy, statuses: &[CaseStatus]) -> (CaseReport, usize) {
+    let dir = std::env::temp_dir().join(format!(
+        "krabi-caliper-retry-{}-{}",
+        std::process::id(),
+        statuses.len()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let case_dir = dir.join("fixture");
+    let mut calls = 0;
+    let report = run_with_retry(policy, &dir, true, || {
+        let status = statuses[calls];
+        calls += 1;
+        // Like run_case: start from an empty case directory and leave a log in it.
+        let _ = std::fs::remove_dir_all(&case_dir);
+        std::fs::create_dir_all(&case_dir).unwrap();
+        std::fs::write(case_dir.join("raw-stdout.log"), format!("attempt {calls}")).unwrap();
+        Ok(scripted_report(
+            "fixture",
+            status,
+            (status != CaseStatus::Pass).then_some("attempt failed\nsecond line"),
+        ))
+    })
+    .unwrap();
+    if report.attempts > 1 {
+        let metadata = std::fs::read_to_string(case_dir.join("metadata.json"))
+            .expect("a retried case rewrites its metadata");
+        let written: CaseReport = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(written.attempts, report.attempts);
+        assert_eq!(written.retried, report.retried);
+        // Every discarded attempt's logs survive under attempts/<n>/, and the final
+        // attempt's stay at the top.
+        for attempt in 1..report.attempts {
+            let log = case_dir.join(format!("attempts/{attempt}/raw-stdout.log"));
+            assert_eq!(
+                std::fs::read_to_string(log).unwrap(),
+                format!("attempt {attempt}")
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(case_dir.join("raw-stdout.log")).unwrap(),
+            format!("attempt {}", report.attempts)
+        );
+    }
+    // Nothing is left staged beside the case directory.
+    let leftovers = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().file_name() != "fixture")
+        .count();
+    assert_eq!(leftovers, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+    (report, calls)
+}
+
+#[test]
+fn retry_staging_never_touches_other_case_directories() {
+    use CaseStatus::*;
+    let dir =
+        std::env::temp_dir().join(format!("krabi-caliper-retry-names-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Valid case names that look like staging directories, holding earlier cases' artifacts.
+    let lookalikes = [
+        ".fixture.attempt-1".to_string(),
+        format!(".fixture.retry-{}-0", std::process::id()),
+    ];
+    for name in &lookalikes {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(dir.join(name).join("metadata.json"), name).unwrap();
+    }
+    let case_dir = dir.join("fixture");
+    let statuses = [RunFailed, RunFailed, Pass];
+    let mut calls = 0;
+    let report = run_with_retry(&RetryPolicy::new(3, vec![RunFailed]), &dir, true, || {
+        let status = statuses[calls];
+        calls += 1;
+        let _ = std::fs::remove_dir_all(&case_dir);
+        std::fs::create_dir_all(&case_dir).unwrap();
+        std::fs::write(case_dir.join("raw-stdout.log"), format!("attempt {calls}")).unwrap();
+        Ok(scripted_report("fixture", status, None))
+    })
+    .unwrap();
+    assert_eq!(report.attempts, 3);
+    for name in &lookalikes {
+        assert_eq!(
+            std::fs::read_to_string(dir.join(name).join("metadata.json")).unwrap(),
+            *name,
+            "{name} was disturbed"
+        );
+    }
+    for attempt in 1..3 {
+        assert_eq!(
+            std::fs::read_to_string(case_dir.join(format!("attempts/{attempt}/raw-stdout.log")))
+                .unwrap(),
+            format!("attempt {attempt}")
+        );
+    }
+    // Only the case directory and the two lookalikes remain: the staging directory is gone.
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn retry_reruns_only_listed_statuses_up_to_the_attempt_limit() {
+    use CaseStatus::*;
+    let policy = RetryPolicy::new(3, vec![RunFailed, TimedOut]);
+
+    let (report, calls) = run_script(&policy, &[RunFailed, TimedOut, Pass]);
+    assert_eq!((report.status, report.attempts, calls), (Pass, 3, 3));
+    assert_eq!(
+        report.retried,
+        [
+            RetriedAttempt {
+                status: RunFailed,
+                error: Some("attempt failed\nsecond line".to_string()),
+                artifacts: Some("attempts/1".to_string()),
+            },
+            RetriedAttempt {
+                status: TimedOut,
+                error: Some("attempt failed\nsecond line".to_string()),
+                artifacts: Some("attempts/2".to_string()),
+            },
+        ]
+    );
+
+    // Reports show the retry: the per-case and campaign Markdown, and the CSV.
+    let failure = report.render_failure_markdown();
+    assert!(failure.contains("**Attempts:** 3"), "{failure}");
+    assert!(failure.contains("- Attempt 1: `run-failed`, attempt failed (`attempts/1/`)"));
+    assert!(!failure.contains("- Attempt 1: `run-failed`, attempt failed\nsecond line"));
+    let campaign = CampaignReport {
+        campaign: "flaky".to_string(),
+        profile: "host".to_string(),
+        cases: vec![report.clone()],
+    };
+    assert!(campaign.render_markdown().contains("| Pass (3 attempts) |"));
+    assert!(campaign.render_csv().contains("retry,attempts,3"));
+
+    // The limit counts every run; the last failure is the reported one.
+    let (report, calls) = run_script(&policy, &[RunFailed, RunFailed, RunFailed]);
+    assert_eq!((report.status, report.attempts, calls), (RunFailed, 3, 3));
+    assert_eq!(report.error.as_deref(), Some("attempt failed\nsecond line"));
+    assert_eq!(report.retried.len(), 2);
+
+    // A workload failure is a result, not a transient: it is never retried by default.
+    let (report, calls) = run_script(&policy, &[WorkloadFail, Pass]);
+    assert_eq!(
+        (report.status, report.attempts, calls),
+        (WorkloadFail, 1, 1)
+    );
+    assert!(report.retried.is_empty());
+
+    // The default policy runs once.
+    let (report, calls) = run_script(&RetryPolicy::default(), &[RunFailed, Pass]);
+    assert_eq!((report.status, report.attempts, calls), (RunFailed, 1, 1));
+}
+
+#[test]
+fn retry_policy_parses_and_rejects_meaningless_settings() {
+    let config = parse(
+        r#"
+[profiles.qemu]
+preset = "qemu-cortex-m3"
+
+[campaigns.flaky]
+profile = "qemu"
+retry = { attempts = 3, on = ["run-failed", "missing-terminal-record"] }
+cases = [{ name = "fixture", example = "fixture" }]
+
+[campaigns.plain]
+profile = "qemu"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    config.validate().unwrap();
+    assert_eq!(
+        config.campaigns["flaky"].retry,
+        RetryPolicy::new(
+            3,
+            vec![CaseStatus::RunFailed, CaseStatus::MissingTerminalRecord]
+        )
+    );
+    assert_eq!(config.campaigns["plain"].retry, RetryPolicy::default());
+
+    for (retry, message) in [
+        ("{ attempts = 0 }", "at least 1"),
+        (
+            "{ attempts = 2, on = [\"pass\"] }",
+            "cannot retry a passing case",
+        ),
+        ("{ attempts = 2, on = [] }", "retries no status"),
+    ] {
+        let config = parse(&format!(
+            r#"
+[profiles.qemu]
+preset = "qemu-cortex-m3"
+
+[campaigns.bad]
+profile = "qemu"
+retry = {retry}
+cases = [{{ name = "fixture", example = "fixture" }}]
+"#
+        ));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains(message), "{retry}: {error}");
+    }
+    assert!(
+        toml::from_str::<ToolkitConfig>(
+            r#"
+[profiles.qemu]
+preset = "qemu-cortex-m3"
+
+[campaigns.typo]
+profile = "qemu"
+retry = { attempt = 3 }
+cases = [{ name = "fixture", example = "fixture" }]
+"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn reports_written_before_retry_still_read() {
+    let mut report = scripted_report("fixture", CaseStatus::Pass, None);
+    let mut value = serde_json::to_value(&report).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("attempts");
+    object.remove("retried");
+    let read: CaseReport = serde_json::from_value(value).unwrap();
+    assert_eq!((read.attempts, read.retried.len()), (1, 0));
+
+    // A single attempt does not add `retried` to the JSON.
+    report.attempts = 1;
+    let encoded = serde_json::to_string(&report).unwrap();
+    assert!(encoded.contains("\"attempts\":1"));
+    assert!(!encoded.contains("retried"));
+}
+
+#[test]
+fn statuses_are_named_as_configured() {
+    use CaseStatus::*;
+    for status in [
+        Pass,
+        WorkloadFail,
+        MeasurementError,
+        BuildFailed,
+        RunFailed,
+        TimedOut,
+        ProtocolError,
+        MissingTerminalRecord,
+    ] {
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::Value::String(status.name().to_string())
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_flaky_runner_is_retried_end_to_end() {
+    let workspace = failure_workspace("retry-test", "fn main() {}\n");
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+executable = "sh"
+args = ["-c", "exit 7"]
+
+[campaigns.flaky]
+profile = "host"
+retry = { attempts = 2 }
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(&config, "flaky", &workspace, &CampaignSelection::default())
+        .unwrap();
+
+    let case = &report.cases[0];
+    assert_eq!((case.status, case.attempts), (CaseStatus::RunFailed, 2));
+    assert_eq!(case.retried.len(), 1);
+    let metadata =
+        std::fs::read_to_string(workspace.join("target/krabi-caliper/flaky/fixture/metadata.json"))
+            .unwrap();
+    assert!(metadata.contains("\"attempts\": 2"));
+    assert!(
+        workspace
+            .join("target/krabi-caliper/flaky/fixture/attempts/1/metadata.json")
+            .is_file()
+    );
     std::fs::remove_dir_all(workspace).unwrap();
 }
