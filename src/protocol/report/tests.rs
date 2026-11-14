@@ -321,4 +321,60 @@ mod tests {
             "CT_STACK suite:verify bytes:2048 available:8192 painted:7168 safe_zone:256 overflowed:0 source:cortex-m4"
         ));
     }
+
+    #[cfg(feature = "ufmt")]
+    struct UfmtString(String);
+
+    #[cfg(feature = "ufmt")]
+    impl ufmt::uWrite for UfmtString {
+        type Error = core::convert::Infallible;
+
+        fn write_str(&mut self, value: &str) -> Result<(), Self::Error> {
+            self.0.push_str(value);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "ufmt")]
+    #[test]
+    fn decimal_matches_the_standard_formatting() {
+        let mut values = std::vec![0, 1, 9, 10, 11, 99, 100, 101, 1_234_567_890_123, u64::MAX];
+        let mut power = 1_u64;
+        while let Some(next) = power.checked_mul(10) {
+            values.extend([power - 1, power, power + 1, next - 1]);
+            power = next;
+        }
+        for value in values {
+            let mut text = UfmtString(String::new());
+            ufmt::uwrite!(text, "{}", Decimal(value)).unwrap();
+            assert_eq!(text.0, std::format!("{value}"));
+        }
+    }
+
+    #[cfg(feature = "ufmt")]
+    #[test]
+    fn the_ufmt_reporter_writes_wide_values_as_the_text_reporter_does() {
+        let record = MeasurementRecord {
+            benchmark: "update",
+            measurement: Measurement::new(u64::MAX, Unit::TimerTicks)
+                .with_frequency(10_000_000_000),
+            counter: Some("timer1"),
+            fields: &[Field::u64("bytes", u64::MAX - 1)],
+        };
+        let metric = MetricRecord {
+            benchmark: "update",
+            name: "flash",
+            value: 18_446_744_073_709,
+            unit: Some("bytes"),
+            policy: MetricPolicy::Informational,
+            fields: &[],
+        };
+        let mut text = TextReporter::new(String::new());
+        text.indexed_measurement(&record, 7).unwrap();
+        text.metric(&metric).unwrap();
+        let mut compact = UfmtReporter::new(UfmtString(String::new()));
+        compact.indexed_measurement(&record, 7).unwrap();
+        compact.metric(&metric).unwrap();
+        assert_eq!(compact.into_inner().0, text.into_inner());
+    }
 }

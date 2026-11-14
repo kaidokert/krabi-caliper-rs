@@ -204,7 +204,7 @@ fn write_sample_ufmt<W: ufmt::uWrite + ?Sized>(
         record.fixture,
         record.side,
         record.index,
-        record.ticks,
+        Decimal(record.ticks),
         record.wrapped as u8,
     )
     .map_err(UfmtReportError::Writer)?;
@@ -239,11 +239,11 @@ fn write_comparison_ufmt<W: ufmt::uWrite + ?Sized>(
     ufmt::uwrite!(
         writer,
         " a_min:{} a_max:{} b_min:{} b_max:{} spread:{} overlap:{} wrapped:{} output_ok:{}",
-        record.a_min,
-        record.a_max,
-        record.b_min,
-        record.b_max,
-        record.spread,
+        Decimal(record.a_min),
+        Decimal(record.a_max),
+        Decimal(record.b_min),
+        Decimal(record.b_max),
+        Decimal(record.spread),
         record.overlap as u8,
         record.wrapped as u8,
         record.output_ok as u8,
@@ -327,14 +327,11 @@ fn write_measurement_ufmt_indexed<W: ufmt::uWrite + ?Sized>(
         "EM_MEASUREMENT schema:{} benchmark:{} ticks:{} unit:{} frequency_hz:",
         SCHEMA_VERSION,
         record.benchmark,
-        record.measurement.ticks,
+        Decimal(record.measurement.ticks),
         unit_name(record.measurement.unit),
     )
     .map_err(UfmtReportError::Writer)?;
-    match record.measurement.frequency_hz {
-        Some(value) => ufmt::uwrite!(writer, "{}", value).map_err(UfmtReportError::Writer)?,
-        None => ufmt::uWrite::write_str(writer, "none").map_err(UfmtReportError::Writer)?,
-    }
+    write_optional_u64_ufmt(writer, record.measurement.frequency_hz)?;
     ufmt::uwrite!(writer, " wrapped:{}", record.measurement.wrapped as u8)
         .map_err(UfmtReportError::Writer)?;
     if let Some(trial) = trial {
@@ -404,7 +401,7 @@ fn write_counter_snapshot_ufmt<W: ufmt::uWrite + ?Sized>(
         record.benchmark,
         record.trial,
         phase_name(record.phase),
-        record.ticks,
+        Decimal(record.ticks),
         record.width_bits,
         unit_name(record.unit),
     )
@@ -431,7 +428,7 @@ fn write_metric_ufmt<W: ufmt::uWrite + ?Sized>(
         SCHEMA_VERSION,
         record.benchmark,
         record.name,
-        record.value,
+        Decimal(record.value),
         record.unit.unwrap_or("none"),
         record.policy.as_str(),
     )
@@ -447,13 +444,69 @@ pub enum UfmtReportError<E> {
     InvalidToken,
 }
 
+/// A `u64` printed in decimal by repeated subtraction of powers of ten.
+///
+/// `ufmt`'s own `u64` formatting divides by ten in 64-bit arithmetic, which links the 64-bit
+/// division helpers (`__udivdi3`/`__umoddi3` on AVR, `__aeabi_uldivmod` on Armv6-M) into every
+/// image that reports a measurement. This needs only 64-bit compare and subtract, which those
+/// targets inline: at most 9 subtractions per digit, 20 digits.
+#[cfg(feature = "ufmt")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Decimal(pub u64);
+
+#[cfg(feature = "ufmt")]
+impl Decimal {
+    const POWERS: [u64; 20] = {
+        let mut powers = [1_u64; 20];
+        let mut index = 19;
+        while index > 0 {
+            powers[index - 1] = powers[index] * 10;
+            index -= 1;
+        }
+        powers
+    };
+
+    /// Writes the digits into `buffer` and returns them.
+    fn digits(self, buffer: &mut [u8; 20]) -> &str {
+        let mut rest = self.0;
+        let mut length = 0;
+        for power in Self::POWERS {
+            let mut digit = b'0';
+            while rest >= power {
+                rest -= power;
+                digit += 1;
+            }
+            if length != 0 || digit != b'0' || power == 1 {
+                if let Some(slot) = buffer.get_mut(length) {
+                    *slot = digit;
+                }
+                length += 1;
+            }
+        }
+        buffer
+            .get(..length)
+            .and_then(|digits| core::str::from_utf8(digits).ok())
+            .unwrap_or("0")
+    }
+}
+
+#[cfg(feature = "ufmt")]
+impl ufmt::uDisplay for Decimal {
+    fn fmt<W: ufmt::uWrite + ?Sized>(
+        &self,
+        formatter: &mut ufmt::Formatter<'_, W>,
+    ) -> Result<(), W::Error> {
+        formatter.write_str(self.digits(&mut [0; 20]))
+    }
+}
+
 #[cfg(feature = "ufmt")]
 fn write_optional_u64_ufmt<W: ufmt::uWrite + ?Sized>(
     writer: &mut W,
     value: Option<u64>,
 ) -> Result<(), UfmtReportError<W::Error>> {
     match value {
-        Some(value) => ufmt::uwrite!(writer, "{}", value).map_err(UfmtReportError::Writer),
+        Some(value) => ufmt::uwrite!(writer, "{}", Decimal(value)).map_err(UfmtReportError::Writer),
         None => ufmt::uWrite::write_str(writer, "none").map_err(UfmtReportError::Writer),
     }
 }
@@ -470,7 +523,7 @@ fn write_fields_ufmt<W: ufmt::uWrite + ?Sized>(
                 ufmt::uWrite::write_str(writer, value).map_err(UfmtReportError::Writer)?;
             }
             FieldValue::U64(value) => {
-                ufmt::uwrite!(writer, "{}", value).map_err(UfmtReportError::Writer)?;
+                ufmt::uwrite!(writer, "{}", Decimal(value)).map_err(UfmtReportError::Writer)?;
             }
             FieldValue::Bool(value) => {
                 ufmt::uWrite::write_str(writer, if value { "1" } else { "0" })
