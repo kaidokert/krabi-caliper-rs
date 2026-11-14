@@ -755,6 +755,36 @@ fn prepared_output_cannot_erase_workspace_content() {
 
 #[cfg(unix)]
 #[test]
+fn prepared_output_resolves_symlinked_ancestors() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "krabi-caliper-output-ancestor-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("outside")).unwrap();
+    symlink(root.join("outside"), root.join("outside-link")).unwrap();
+    symlink(&workspace, root.join("workspace-link")).unwrap();
+
+    for allowed in [
+        root.join("outside-link/prepared"),
+        root.join("workspace-link/target/prepared"),
+    ] {
+        assert_eq!(safe_prepared_output(&workspace, &allowed).unwrap(), allowed);
+    }
+    // The workspace checks see through the link.
+    let error =
+        safe_prepared_output(&workspace, &root.join("workspace-link/src/prepared")).unwrap_err();
+    assert!(error.to_string().contains("child of target/"), "{error}");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn prepared_output_rejects_symlinks_without_deleting_the_destination() {
     use std::os::unix::fs::symlink;
 
@@ -771,7 +801,7 @@ fn prepared_output_rejects_symlinks_without_deleting_the_destination() {
     symlink(&destination, workspace.join("target/prepared")).unwrap();
 
     let error = safe_prepared_output(&workspace, &workspace.join("target/prepared")).unwrap_err();
-    assert!(error.to_string().contains("must not contain symlinks"));
+    assert!(error.to_string().contains("must not be a symlink"));
     assert_eq!(
         std::fs::read_to_string(destination.join("keep")).unwrap(),
         "must survive"
