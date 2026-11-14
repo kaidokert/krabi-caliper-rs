@@ -315,7 +315,7 @@ mod section_tests {
             .iter()
             .map(|section| (section.name.as_str(), section.size))
             .collect::<Vec<_>>();
-        // `.datafoo` is outside the `.data` family; `.empty` and unallocated `.comment` are omitted.
+        // `.datafoo` is outside the `.data` family; `.empty` and unallocated `.comment` are not.
         assert_eq!(listed, [(".uninit", 20), (".got", 8), (".datafoo", 4)]);
         let uninit = 0x1000 + 8 + 16 + 4 + 4 + 12;
         let addresses = unclassified
