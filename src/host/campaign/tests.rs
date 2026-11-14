@@ -747,7 +747,7 @@ fn prepared_output_cannot_erase_workspace_content() {
     }
     assert_eq!(
         safe_prepared_output(&workspace, &workspace.join("target/prepared")).unwrap(),
-        workspace.join("target/prepared")
+        workspace.canonicalize().unwrap().join("target/prepared")
     );
 
     std::fs::remove_dir_all(workspace).unwrap();
@@ -769,16 +769,28 @@ fn prepared_output_resolves_symlinked_ancestors() {
     symlink(root.join("outside"), root.join("outside-link")).unwrap();
     symlink(&workspace, root.join("workspace-link")).unwrap();
 
-    for allowed in [
-        root.join("outside-link/prepared"),
-        root.join("workspace-link/target/prepared"),
+    // The returned path is the resolved one, so later steps use the checked location.
+    let real = root.canonicalize().unwrap();
+    for (requested, resolved) in [
+        ("outside-link/prepared", "outside/prepared"),
+        (
+            "workspace-link/target/prepared",
+            "workspace/target/prepared",
+        ),
     ] {
-        assert_eq!(safe_prepared_output(&workspace, &allowed).unwrap(), allowed);
+        assert_eq!(
+            safe_prepared_output(&workspace, &root.join(requested)).unwrap(),
+            real.join(resolved)
+        );
     }
     // The workspace checks see through the link.
     let error =
         safe_prepared_output(&workspace, &root.join("workspace-link/src/prepared")).unwrap_err();
     assert!(error.to_string().contains("child of target/"), "{error}");
+    // A dangling link could be created later inside the workspace, so it is refused.
+    symlink(workspace.join("src/later"), root.join("dangling")).unwrap();
+    let error = safe_prepared_output(&workspace, &root.join("dangling/prepared")).unwrap_err();
+    assert!(error.to_string().contains("dangling symlink"), "{error}");
 
     std::fs::remove_dir_all(root).unwrap();
 }
