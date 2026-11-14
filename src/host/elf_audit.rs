@@ -6,9 +6,11 @@
 //! appear.
 //!
 //! A rule is a substring. A symbol rule matches a symbol if any of three forms of its name contains
-//! the text: the demangled name with hashes and crate disambiguators (as `nm -C` prints Rust
-//! names), the demangled name without them (`core::panicking::panic` for legacy and v0 mangling
-//! alike), or the name as stored. Rust names are demangled; C++ names are matched as stored.
+//! the text: the demangled name with hashes and crate disambiguators (as `nm -C` prints legacy
+//! Rust names; it drops a v0 name's `[...]` disambiguators), the demangled name without them
+//! (`core::panicking::panic` for legacy and v0 mangling alike), or the name as stored. Rust names
+//! are demangled; C++ names are matched as stored. [`elf_symbols`] lists the same symbols in all
+//! three forms, for a check a substring cannot express.
 //! Only a defined symbol satisfies a required rule, while any mention, including an undefined
 //! reference, breaks a forbidden one. A string rule matches bytes within one scanned region; a
 //! string split across two sections is not found.
@@ -283,21 +285,7 @@ pub fn audit_elf_bytes(
         return Err(ElfAuditError::NotElf);
     }
 
-    let mut symbols = Vec::new();
-    for symbol in object.symbols().chain(object.dynamic_symbols()) {
-        if matches!(symbol.kind(), SymbolKind::File | SymbolKind::Section) {
-            continue;
-        }
-        let raw = symbol
-            .name_bytes()
-            .map_err(|error| ElfAuditError::Elf(ElfError::Object(error)))?;
-        if raw.is_empty() {
-            continue;
-        }
-        symbols.push(AuditedSymbol::new(raw, !symbol.is_undefined()));
-    }
-    symbols.sort();
-    symbols.dedup();
+    let symbols = collect_symbols(&object)?;
     let has_symbol_rules = !rules.require_symbols.is_empty() || !rules.forbid_symbols.is_empty();
     if has_symbol_rules && symbols.is_empty() {
         return Err(ElfAuditError::NothingToSearch("symbols"));
@@ -380,18 +368,21 @@ pub fn audit_elf_bytes(
 }
 
 /// One symbol name in every form a rule may be written against.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct AuditedSymbol {
-    /// Demangled with hashes and crate disambiguators, as `nm -C` prints Rust names.
-    demangled: String,
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ElfSymbol {
+    /// Demangled with hashes and crate disambiguators: `core[1234]::panicking::panic` for a v0
+    /// name, `core::panicking::panic::h0123456789abcdef` for a legacy one. A C name is as stored.
+    pub demangled: String,
     /// Demangled without them: `core::panicking::panic` for legacy and v0 names alike.
-    plain: String,
-    /// The name as stored, so a rule may also be written in mangled form.
-    raw: String,
-    defined: bool,
+    pub plain: String,
+    /// The name as stored.
+    pub raw: String,
+    /// False when the image only references the symbol.
+    pub defined: bool,
 }
 
-impl AuditedSymbol {
+impl ElfSymbol {
     fn new(raw: &[u8], defined: bool) -> Self {
         let raw = String::from_utf8_lossy(raw).into_owned();
         let demangled = rustc_demangle::demangle(&raw);
@@ -403,9 +394,49 @@ impl AuditedSymbol {
         }
     }
 
-    fn matches(&self, rule: &str) -> bool {
+    /// Whether any form of the name contains `rule`, as the audit's symbol rules match.
+    pub fn matches(&self, rule: &str) -> bool {
         self.demangled.contains(rule) || self.plain.contains(rule) || self.raw.contains(rule)
     }
+}
+
+/// The symbols an audit of the ELF image at `path` examines, for checks its substring rules
+/// cannot express (a pattern, or listing every match).
+///
+/// Defined and undefined symbols alike, file and section symbols excluded, sorted and listed once
+/// each. An image without symbols gives an empty list.
+pub fn elf_symbols(path: &Path) -> Result<Vec<ElfSymbol>, ElfAuditError> {
+    let bytes = fs::read(path).map_err(|error| ElfAuditError::Elf(ElfError::Io(error)))?;
+    elf_symbols_bytes(&bytes)
+}
+
+/// [`elf_symbols`] for an image held in memory.
+pub fn elf_symbols_bytes(bytes: &[u8]) -> Result<Vec<ElfSymbol>, ElfAuditError> {
+    let object =
+        object::File::parse(bytes).map_err(|error| ElfAuditError::Elf(ElfError::Object(error)))?;
+    if object.format() != BinaryFormat::Elf {
+        return Err(ElfAuditError::NotElf);
+    }
+    collect_symbols(&object)
+}
+
+fn collect_symbols(object: &object::File<'_>) -> Result<Vec<ElfSymbol>, ElfAuditError> {
+    let mut symbols = Vec::new();
+    for symbol in object.symbols().chain(object.dynamic_symbols()) {
+        if matches!(symbol.kind(), SymbolKind::File | SymbolKind::Section) {
+            continue;
+        }
+        let raw = symbol
+            .name_bytes()
+            .map_err(|error| ElfAuditError::Elf(ElfError::Object(error)))?;
+        if raw.is_empty() {
+            continue;
+        }
+        symbols.push(ElfSymbol::new(raw, !symbol.is_undefined()));
+    }
+    symbols.sort();
+    symbols.dedup();
+    Ok(symbols)
 }
 
 /// Whether a section occupies target memory with contents from the file.
@@ -575,6 +606,53 @@ mod tests {
                 ("__aeabi_dadd", Sym::Undefined),
             ],
         )
+    }
+
+    #[test]
+    fn symbols_are_listed_as_the_audit_sees_them() {
+        let bytes = sample();
+        let symbols = elf_symbols_bytes(&bytes).unwrap();
+        let report = audit_elf_bytes(&bytes, &ElfAuditRules::new()).unwrap();
+        assert_eq!(symbols.len(), report.symbols_examined);
+        assert!(symbols.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let panic = symbols
+            .iter()
+            .find(|symbol| symbol.plain == "core::panicking::panic")
+            .unwrap();
+        assert_eq!(panic.demangled, "core::panicking::panic::h0123456789abcdef");
+        assert_eq!(panic.raw, "_ZN4core9panicking5panic17h0123456789abcdefE");
+        assert!(panic.defined && panic.matches("core::panicking"));
+
+        let helper = symbols
+            .iter()
+            .find(|symbol| symbol.raw == "__aeabi_dadd")
+            .unwrap();
+        assert_eq!(
+            (
+                helper.demangled.as_str(),
+                helper.plain.as_str(),
+                helper.defined
+            ),
+            ("__aeabi_dadd", "__aeabi_dadd", false)
+        );
+
+        let v0 = image(
+            b"code",
+            b"x",
+            b"",
+            &[("_RNvNtCs1234_4core9panicking5panic", Sym::Defined)],
+        );
+        let [symbol] = &elf_symbols_bytes(&v0).unwrap()[..] else {
+            panic!("one symbol");
+        };
+        assert_eq!(symbol.plain, "core::panicking::panic");
+        assert_ne!(symbol.demangled, symbol.plain);
+
+        assert!(matches!(
+            elf_symbols_bytes(b"not an image"),
+            Err(ElfAuditError::Elf(_))
+        ));
     }
 
     #[test]
