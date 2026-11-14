@@ -35,6 +35,12 @@ jobs:
           cargo +stable check --no-default-features --features uart
           cargo +stable check --no-default-features --features uart,ufmt
 
+      - name: Check the ufmt encoder needs no 64-bit division on Armv6-M
+        run: |
+          rustup +stable target add thumbv6m-none-eabi
+          rustup +stable component add llvm-tools
+          RUSTUP_TOOLCHAIN=stable python3 ci/ufmt-u64-check/check.py
+
       - name: Run all tests
         run: cargo +stable test --all-features
 

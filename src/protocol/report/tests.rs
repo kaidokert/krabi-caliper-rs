@@ -321,4 +321,138 @@ mod tests {
             "CT_STACK suite:verify bytes:2048 available:8192 painted:7168 safe_zone:256 overflowed:0 source:cortex-m4"
         ));
     }
+
+    #[cfg(feature = "ufmt")]
+    struct UfmtString(String);
+
+    #[cfg(feature = "ufmt")]
+    impl ufmt::uWrite for UfmtString {
+        type Error = core::convert::Infallible;
+
+        fn write_str(&mut self, value: &str) -> Result<(), Self::Error> {
+            self.0.push_str(value);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "ufmt")]
+    #[test]
+    fn decimal_matches_the_standard_formatting() {
+        let mut values = std::vec![
+            0,
+            1,
+            9,
+            10,
+            11,
+            99,
+            100,
+            101,
+            1_234_567_890_123,
+            10_000_000_000_000_000_000,
+            10_000_000_000_000_000_001,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let mut power = 1_u64;
+        while let Some(next) = power.checked_mul(10) {
+            values.extend([power - 1, power, power + 1, next - 1]);
+            power = next;
+        }
+        for value in values {
+            let mut text = UfmtString(String::new());
+            ufmt::uwrite!(text, "{}", Decimal(value)).unwrap();
+            assert_eq!(text.0, std::format!("{value}"));
+        }
+    }
+
+    #[cfg(feature = "ufmt")]
+    #[test]
+    fn the_ufmt_reporter_writes_every_wide_value_as_the_text_reporter_does() {
+        // Every event that carries a `u64`, at the widths a host's own formatting would also get
+        // right, so a site left on ufmt's `u64` formatting would still pass; this checks the
+        // two encoders agree on every such site, and `Decimal` itself is checked above.
+        const WIDE: u64 = u64::MAX;
+        const TOP: u64 = 10_000_000_000_000_000_000;
+        let fields = &[Field::u64("bytes", TOP), Field::bool("cold", true)];
+        let begin = RunStart {
+            suite: "fixture",
+            target: "avr",
+            board: None,
+            unit: Unit::TimerTicks,
+            frequency_hz: Some(TOP + 1),
+            fields,
+        };
+        let sample = SampleRecord {
+            fixture: "timing",
+            side: 'B',
+            index: 3,
+            ticks: WIDE,
+            wrapped: true,
+            fields,
+        };
+        let comparison = ComparisonRecord {
+            fixture: "timing",
+            class: "positive",
+            policy: Some("max-spread"),
+            a_min: TOP - 1,
+            a_max: TOP,
+            b_min: TOP + 1,
+            b_max: WIDE - 1,
+            spread: WIDE,
+            overlap: false,
+            wrapped: false,
+            output_ok: true,
+            passed: Some(false),
+            fields,
+        };
+        let measurement = MeasurementRecord {
+            benchmark: "update",
+            measurement: Measurement::new(WIDE, Unit::TimerTicks).with_frequency(10_000_000_000),
+            counter: Some("timer1"),
+            fields,
+        };
+        let counter = CounterSnapshotRecord {
+            benchmark: "update",
+            trial: 7,
+            phase: BoundaryPhase::Begin,
+            ticks: TOP,
+            width_bits: 64,
+            unit: Unit::TimerTicks,
+            frequency_hz: Some(WIDE),
+            fields,
+        };
+        let metric = MetricRecord {
+            benchmark: "update",
+            name: "flash",
+            value: WIDE - 9,
+            unit: Some("bytes"),
+            policy: MetricPolicy::Informational,
+            fields,
+        };
+        let events = [
+            Event::Begin(&begin),
+            Event::Sample(&sample),
+            Event::Result(&comparison),
+            Event::Diagnostic(&comparison),
+            Event::Measurement {
+                record: &measurement,
+                trial: Some(7),
+            },
+            Event::Measurement {
+                record: &measurement,
+                trial: None,
+            },
+            Event::Counter(&counter),
+            Event::Metric(&metric),
+        ];
+        let mut text = TextReporter::new(String::new());
+        let mut compact = UfmtReporter::new(UfmtString(String::new()));
+        for event in events {
+            text.event(event).unwrap();
+            compact.event(event).unwrap();
+        }
+        let text = text.into_inner();
+        assert_eq!(text.lines().count(), events.len());
+        assert_eq!(compact.into_inner().0, text);
+    }
 }
