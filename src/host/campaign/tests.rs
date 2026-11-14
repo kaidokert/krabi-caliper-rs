@@ -747,10 +747,52 @@ fn prepared_output_cannot_erase_workspace_content() {
     }
     assert_eq!(
         safe_prepared_output(&workspace, &workspace.join("target/prepared")).unwrap(),
-        workspace.join("target/prepared")
+        workspace.canonicalize().unwrap().join("target/prepared")
     );
 
     std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn prepared_output_resolves_symlinked_ancestors() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "krabi-caliper-output-ancestor-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("outside")).unwrap();
+    symlink(root.join("outside"), root.join("outside-link")).unwrap();
+    symlink(&workspace, root.join("workspace-link")).unwrap();
+
+    // The returned path is the resolved one, so later steps use the checked location.
+    let real = root.canonicalize().unwrap();
+    for (requested, resolved) in [
+        ("outside-link/prepared", "outside/prepared"),
+        (
+            "workspace-link/target/prepared",
+            "workspace/target/prepared",
+        ),
+    ] {
+        assert_eq!(
+            safe_prepared_output(&workspace, &root.join(requested)).unwrap(),
+            real.join(resolved)
+        );
+    }
+    // The workspace checks see through the link.
+    let error =
+        safe_prepared_output(&workspace, &root.join("workspace-link/src/prepared")).unwrap_err();
+    assert!(error.to_string().contains("child of target/"), "{error}");
+    // A dangling link could be created later inside the workspace, so it is refused.
+    symlink(workspace.join("src/later"), root.join("dangling")).unwrap();
+    let error = safe_prepared_output(&workspace, &root.join("dangling/prepared")).unwrap_err();
+    assert!(error.to_string().contains("dangling symlink"), "{error}");
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -771,7 +813,7 @@ fn prepared_output_rejects_symlinks_without_deleting_the_destination() {
     symlink(&destination, workspace.join("target/prepared")).unwrap();
 
     let error = safe_prepared_output(&workspace, &workspace.join("target/prepared")).unwrap_err();
-    assert!(error.to_string().contains("must not contain symlinks"));
+    assert!(error.to_string().contains("must not be a symlink"));
     assert_eq!(
         std::fs::read_to_string(destination.join("keep")).unwrap(),
         "must survive"
@@ -1031,6 +1073,8 @@ cases = [{ name = "fixture", example = "fixture" }]
     );
 }
 
+/// A one-example workspace. Its campaigns set `target-dir`, so a `CARGO_TARGET_DIR` in the
+/// test environment cannot make fixtures share one `examples/fixture` binary.
 #[cfg(unix)]
 fn failure_workspace(name: &str, source: &str) -> PathBuf {
     let workspace =
@@ -1072,6 +1116,7 @@ fn build_failures_are_obvious_and_replace_stale_reports() {
 [profiles.host]
 runner = "command"
 target = "host"
+target-dir = "target"
 executable = "sh"
 args = ["-c", "exit 0"]
 
@@ -1111,6 +1156,7 @@ fn run_failures_show_the_command_reason_and_target_output() {
 [profiles.host]
 runner = "command"
 target = "host"
+target-dir = "target"
 executable = "sh"
 args = ["-c", "printf 'first target line\\n'; printf '%07000d\\n' 0; printf 'PANIC: reporter rejected reserved field\\n'; printf 'emulator warning\\n' >&2; exit 7"]
 
@@ -1151,6 +1197,7 @@ fn timeouts_report_the_command_and_elapsed_deadline() {
 [profiles.host]
 runner = "command"
 target = "host"
+target-dir = "target"
 executable = "sh"
 args = ["-c", "sleep 5"]
 timeout-seconds = 1
