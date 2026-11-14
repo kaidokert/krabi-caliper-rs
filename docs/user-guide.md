@@ -95,10 +95,10 @@ target = "thumbv7em-none-eabihf"
 venue = "bench"
 ```
 
-The run ends at the first `EM_OUTCOME` event. On Unix probe-rs then gets an
-interrupt so it detaches cleanly; on Windows, and on a timeout, it is killed
-after a three-second grace period, which still releases the probe. The chip is
-recorded as the MCU; the probe selector is recorded among the resolved
+The run ends at the first `EM_OUTCOME` event. On Unix probe-rs then gets
+SIGINT so it can detach from the target, and is killed if it has not exited
+within three seconds; on Windows it is killed after those three seconds. A
+timeout kills it at once. The chip is recorded as the MCU; the probe selector is recorded among the resolved
 bindings but not in the configuration identity, so replacing a probe does not
 block comparisons. `mcu` and `probe` in a profile are recorded metadata only,
 and `args` replaces the whole command line.

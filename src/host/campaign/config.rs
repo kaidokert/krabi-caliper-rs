@@ -968,8 +968,7 @@ fn preset_values(preset: RunnerPreset) -> PresetValues {
                 "{artifact}",
             ],
             completion_marker: Some("EM_OUTCOME"),
-            // An interrupt lets probe-rs detach from the target instead of leaving the probe
-            // claimed.
+            // SIGINT lets probe-rs detach from the target before it exits.
             completion_action: CompletionAction::Interrupt,
             artifact_extension: "",
             board: None,
