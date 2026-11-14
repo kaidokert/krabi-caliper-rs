@@ -114,8 +114,9 @@ evidence.
 - Architectures: `cortex-m`, `cortex-m-dwt`, `risc-v`, `avr`,
   `avr-atmega2560`
 - Target transports: `rtt`, `semihosting`, `uart`, `ufmt`
-  (with `uart` and `ufmt` together, `uart::ufmt_reporter` reports through any
-  `WriteByte` transmitter without linking `core::fmt`)
+  (with `uart` and `ufmt` together, `protocol::uart::ufmt_reporter` reports
+  through any `protocol::uart::WriteByte` transmitter without requiring
+  `core::fmt`)
 - Host analysis: `host`, `campaign`, `ctgrind`
 - Cargo subcommand: `cli` plus `campaign`
 

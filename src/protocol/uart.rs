@@ -1,7 +1,8 @@
 //! Generic byte-oriented UART transport.
 //!
 //! Applications retain ownership of device initialization and MMIO while the
-//! adapter supplies the same `fmt::Write` interface used by other reporters.
+//! adapter supplies `fmt::Write` and, with the `ufmt` feature, `ufmt::uWrite`,
+//! so it carries both `TextReporter` and `UfmtReporter` output.
 
 use core::fmt;
 
@@ -31,8 +32,8 @@ impl<T> UartWriter<T> {
     }
 }
 
-/// A [`UfmtReporter`](crate::report::UfmtReporter) over a byte transmitter, for targets that
-/// keep `core::fmt` out of the image.
+/// A [`UfmtReporter`](crate::report::UfmtReporter) over a byte transmitter, which reports
+/// without requiring `core::fmt`.
 #[cfg(feature = "ufmt")]
 pub type UfmtUartReporter<T> = crate::report::UfmtReporter<UartWriter<T>>;
 
@@ -71,26 +72,44 @@ mod tests {
     struct Buffer<'a> {
         bytes: &'a mut [u8],
         used: usize,
+        overflowed: bool,
+    }
+
+    impl<'a> Buffer<'a> {
+        fn new(bytes: &'a mut [u8]) -> Self {
+            Self {
+                bytes,
+                used: 0,
+                overflowed: false,
+            }
+        }
+
+        fn written(&self) -> &[u8] {
+            assert!(!self.overflowed, "the test buffer is too small");
+            &self.bytes[..self.used]
+        }
     }
 
     impl WriteByte for Buffer<'_> {
         fn write_byte(&mut self, byte: u8) {
-            self.bytes[self.used] = byte;
-            self.used += 1;
+            match self.bytes.get_mut(self.used) {
+                Some(slot) => {
+                    *slot = byte;
+                    self.used += 1;
+                }
+                None => self.overflowed = true,
+            }
         }
     }
 
     #[test]
     fn adapts_byte_transmitters_to_fmt_write() {
         let mut bytes = [0_u8; 8];
-        let mut writer = reporter(Buffer {
-            bytes: &mut bytes,
-            used: 0,
-        });
+        let mut writer = reporter(Buffer::new(&mut bytes));
 
         write!(writer, "EM_TEST").unwrap();
         let buffer = writer.into_inner().into_inner();
-        assert_eq!(&buffer.bytes[..buffer.used], b"EM_TEST");
+        assert_eq!(buffer.written(), b"EM_TEST");
     }
 
     #[cfg(feature = "ufmt")]
@@ -99,31 +118,37 @@ mod tests {
         use crate::report::{Field, MeasurementRecord, Reporter};
         use crate::{Measurement, Unit};
 
-        let record = MeasurementRecord {
-            benchmark: "update",
-            measurement: Measurement::new(130, Unit::TimerTicks),
-            counter: Some("timer1"),
-            fields: &[Field::token("word", "i8")],
-        };
-        let mut text = [0_u8; 160];
-        let mut expected = reporter(Buffer {
-            bytes: &mut text,
-            used: 0,
-        });
-        expected.indexed_measurement(&record, 3).unwrap();
-        let expected = expected.into_inner().into_inner();
+        let records = [
+            MeasurementRecord {
+                benchmark: "update",
+                measurement: Measurement::new(130, Unit::TimerTicks),
+                counter: Some("timer1"),
+                fields: &[Field::token("word", "i8")],
+            },
+            MeasurementRecord {
+                benchmark: "update",
+                measurement: Measurement::new(u64::MAX - 7, Unit::CoreCycles)
+                    .with_frequency(16_000_000)
+                    .with_wrapped(true),
+                counter: None,
+                fields: &[
+                    Field::u64("bytes", 4_294_967_296),
+                    Field::bool("cold", true),
+                ],
+            },
+        ];
+        for record in &records {
+            let mut text = [0_u8; 256];
+            let mut expected = reporter(Buffer::new(&mut text));
+            expected.indexed_measurement(record, 3).unwrap();
+            let expected = expected.into_inner().into_inner();
 
-        let mut bytes = [0_u8; 160];
-        let mut writer = ufmt_reporter(Buffer {
-            bytes: &mut bytes,
-            used: 0,
-        });
-        writer.indexed_measurement(&record, 3).unwrap();
-        let buffer = writer.into_inner().into_inner();
-        assert_eq!(
-            &buffer.bytes[..buffer.used],
-            &expected.bytes[..expected.used]
-        );
-        assert!(buffer.bytes[..buffer.used].starts_with(b"EM_MEASUREMENT "));
+            let mut bytes = [0_u8; 256];
+            let mut writer = ufmt_reporter(Buffer::new(&mut bytes));
+            writer.indexed_measurement(record, 3).unwrap();
+            let buffer = writer.into_inner().into_inner();
+            assert_eq!(buffer.written(), expected.written());
+            assert!(buffer.written().starts_with(b"EM_MEASUREMENT "));
+        }
     }
 }
