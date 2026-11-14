@@ -15,6 +15,63 @@ pub const fn extend_timer16(wraps: u32, counter: u16, overflow_pending: bool) ->
     (wraps.wrapping_add(pending_wrap as u32) as u64) << 16 | counter as u64
 }
 
+/// Ticks between two [`extend_timer16`] readings, modulo 2^48, and whether the extended count
+/// wrapped between them.
+///
+/// Correct for any interval shorter than 2^48 ticks, including one that spans the rollover of
+/// the 32-bit overflow count.
+pub const fn elapsed_timer48(start: u64, end: u64) -> (u64, bool) {
+    const PERIOD_MASK: u64 = (1 << 48) - 1;
+    (end.wrapping_sub(start) & PERIOD_MASK, end < start)
+}
+
+/// Internal clock source for 16-bit Timer/Counter1: the CPU clock divided by a prescaler.
+///
+/// A smaller divisor gives finer ticks but wraps sooner. Software wrap extension needs the
+/// overflow ISR to run within 0x8000 ticks of each wrap: about 2.1 s at `/1024` on a 16 MHz part,
+/// but only 32,768 CPU cycles at `/1`. Interrupts disabled for longer than that, or a long ISR
+/// elsewhere (AVR ISRs don't nest), make a measurement silently short by 65,536 ticks per late
+/// wrap. Choose the largest divisor that still resolves the operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Timer1Prescale {
+    /// The CPU clock itself: one tick per CPU cycle.
+    Div1,
+    /// The CPU clock divided by 8.
+    Div8,
+    /// The CPU clock divided by 64.
+    Div64,
+    /// The CPU clock divided by 256.
+    Div256,
+    /// The CPU clock divided by 1024.
+    Div1024,
+}
+
+impl Timer1Prescale {
+    /// The clock divisor.
+    pub const fn divisor(self) -> u32 {
+        match self {
+            Self::Div1 => 1,
+            Self::Div8 => 8,
+            Self::Div64 => 64,
+            Self::Div256 => 256,
+            Self::Div1024 => 1024,
+        }
+    }
+
+    /// The exact timer tick frequency for a CPU clock.
+    ///
+    /// `None` if the clock is unknown, or if the divisor does not divide it exactly (20 MHz / 1024
+    /// is 19,531.25 Hz), since measurement metadata would otherwise carry a rounded frequency.
+    pub const fn tick_frequency_hz(self, cpu_hz: Option<u64>) -> Option<u64> {
+        let divisor = self.divisor() as u64;
+        match cpu_hz {
+            Some(hz) if hz != 0 && hz % divisor == 0 => Some(hz / divisor),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(any(test, all(feature = "avr-atmega2560", target_arch = "avr")))]
 fn timer_measurement(ticks: u64, frequency_hz: Option<u64>, wrapped: bool) -> Measurement {
     let mut measurement = Measurement::new(ticks, Unit::TimerTicks).with_wrapped(wrapped);
@@ -29,7 +86,7 @@ mod atmega2560 {
     use avr_device::atmega2560::{CPU, TC1};
     use avr_device::interrupt::Mutex;
 
-    use super::{extend_timer16, timer_measurement};
+    use super::{Timer1Prescale, elapsed_timer48, extend_timer16, timer_measurement};
     #[cfg(feature = "stack")]
     use crate::FootprintError;
     #[cfg(feature = "stack")]
@@ -65,13 +122,14 @@ mod atmega2560 {
         })
     }
 
-    /// Wrap-extended ATmega2560 Timer/Counter1 using the `/1024` prescaler.
+    /// Wrap-extended ATmega2560 Timer/Counter1 at a caller-chosen prescaler.
     ///
-    /// The application owns the CPU clock and supplies the resulting timer
-    /// tick frequency. It must install an overflow ISR that calls
+    /// The application owns the CPU clock and supplies either it or the
+    /// resulting timer tick frequency. It must install an overflow ISR that calls
     /// [`timer1_overflow`] and enable global interrupts before relying on
-    /// software wrap extension. This adapter never changes global interrupt
-    /// state.
+    /// software wrap extension, and that ISR must run within 0x8000 ticks of
+    /// each wrap (see [`Timer1Prescale`]). This adapter never changes global
+    /// interrupt state.
     pub struct Timer1Counter<'timer> {
         timer: &'timer mut TC1,
         frequency_hz: Option<u64>,
@@ -79,15 +137,49 @@ mod atmega2560 {
     }
 
     impl<'timer> Timer1Counter<'timer> {
-        /// Stops and configures Timer1, clears stale overflow state, enables
-        /// its overflow interrupt, then starts it with the `/1024` prescaler.
+        /// [`start`](Self::start) with the `/1024` prescaler.
         pub fn start_prescale_1024(timer: &'timer mut TC1, frequency_hz: Option<u64>) -> Self {
+            Self::start(timer, Timer1Prescale::Div1024, frequency_hz)
+        }
+
+        /// Stops and configures Timer1 at `prescale`, deriving the tick
+        /// frequency from the CPU clock with [`Timer1Prescale::tick_frequency_hz`].
+        pub fn start_with_cpu_clock(
+            timer: &'timer mut TC1,
+            prescale: Timer1Prescale,
+            cpu_hz: Option<u64>,
+        ) -> Self {
+            Self::start(timer, prescale, prescale.tick_frequency_hz(cpu_hz))
+        }
+
+        /// Stops and configures Timer1, zeroes it, clears stale overflow
+        /// state, enables its overflow interrupt, then starts it with
+        /// `prescale`.
+        ///
+        /// `frequency_hz` labels every measurement, so it must be the tick
+        /// frequency at `prescale`: `prescale.tick_frequency_hz(cpu_hz)`, or
+        /// `None` if unknown. Prefer [`start_with_cpu_clock`](Self::start_with_cpu_clock),
+        /// which derives it.
+        pub fn start(
+            timer: &'timer mut TC1,
+            prescale: Timer1Prescale,
+            frequency_hz: Option<u64>,
+        ) -> Self {
             timer.tccr1b.write(|writer| writer.cs1().no_clock());
             timer.tccr1a.reset();
+            // A stale count near 0xffff would wrap almost at once, which at `/1` leaves the
+            // overflow ISR almost no margin.
+            timer.tcnt1.write(|writer| writer.bits(0));
             avr_device::interrupt::free(|cs| TIMER1_WRAPS.borrow(cs).set(0));
             timer.tifr1.write(|writer| writer.tov1().set_bit());
             timer.timsk1.write(|writer| writer.toie1().set_bit());
-            timer.tccr1b.write(|writer| writer.cs1().prescale_1024());
+            timer.tccr1b.write(|writer| match prescale {
+                Timer1Prescale::Div1 => writer.cs1().direct(),
+                Timer1Prescale::Div8 => writer.cs1().prescale_8(),
+                Timer1Prescale::Div64 => writer.cs1().prescale_64(),
+                Timer1Prescale::Div256 => writer.cs1().prescale_256(),
+                Timer1Prescale::Div1024 => writer.cs1().prescale_1024(),
+            });
             let start_total = read_timer1(timer);
             Self {
                 timer,
@@ -97,7 +189,7 @@ mod atmega2560 {
         }
 
         pub fn elapsed_ticks_since_start(&self) -> u64 {
-            read_timer1(self.timer).wrapping_sub(self.start_total)
+            elapsed_timer48(self.start_total, read_timer1(self.timer)).0
         }
     }
 
@@ -111,8 +203,8 @@ mod atmega2560 {
 
         #[inline(always)]
         fn elapsed(&mut self, start: Self::Instant) -> Measurement {
-            let end = read_timer1(self.timer);
-            timer_measurement(end.wrapping_sub(start), self.frequency_hz, end < start)
+            let (ticks, wrapped) = elapsed_timer48(start, read_timer1(self.timer));
+            timer_measurement(ticks, self.frequency_hz, wrapped)
         }
     }
 
@@ -222,7 +314,38 @@ mod atmega2560 {
         stack_config: StackConfig,
         operation: impl FnMut() -> bool,
     ) -> Result<BenchmarkResult<N>, BenchmarkError<R::Error>> {
-        let counter = Timer1Counter::start_prescale_1024(timer, frequency_hz);
+        unsafe {
+            run_benchmark_with_prescale(
+                timer,
+                Timer1Prescale::Div1024,
+                frequency_hz,
+                reporter,
+                benchmark,
+                stack,
+                stack_config,
+                operation,
+            )
+        }
+    }
+
+    /// [`run_benchmark`] with a caller-chosen Timer1 prescaler.
+    ///
+    /// # Safety
+    /// The caller must uphold [`Benchmark::run_with_stack`]'s exclusive stack
+    /// access contract for the supplied allocation.
+    #[cfg(feature = "stack")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn run_benchmark_with_prescale<const N: usize, R: BenchmarkReporter>(
+        timer: &mut TC1,
+        prescale: Timer1Prescale,
+        frequency_hz: Option<u64>,
+        reporter: &mut R,
+        benchmark: &Benchmark<'_, N>,
+        stack: &impl DescendingStack,
+        stack_config: StackConfig,
+        operation: impl FnMut() -> bool,
+    ) -> Result<BenchmarkResult<N>, BenchmarkError<R::Error>> {
+        let counter = Timer1Counter::start(timer, prescale, frequency_hz);
         let mut platform = CounterPlatform::new(counter);
         unsafe { benchmark.run_with_stack(&mut platform, reporter, stack, stack_config, operation) }
     }
@@ -240,6 +363,8 @@ mod atmega2560 {
 #[cfg(all(feature = "avr-atmega2560", target_arch = "avr", feature = "stack"))]
 pub use atmega2560::run_benchmark as run_atmega2560_benchmark;
 #[cfg(all(feature = "avr-atmega2560", target_arch = "avr", feature = "stack"))]
+pub use atmega2560::run_benchmark_with_prescale as run_atmega2560_benchmark_with_prescale;
+#[cfg(all(feature = "avr-atmega2560", target_arch = "avr", feature = "stack"))]
 pub use atmega2560::{FootprintConfig, run_footprint as run_atmega2560_footprint};
 #[cfg(all(feature = "avr-atmega2560", target_arch = "avr"))]
 pub use atmega2560::{Timer1Counter as Atmega2560Timer1Counter, park_simavr, timer1_overflow};
@@ -253,6 +378,45 @@ mod tests {
         assert_eq!(extend_timer16(4, 7, true), (5 << 16) + 7);
         assert_eq!(extend_timer16(5, 7, false), (5 << 16) + 7);
         assert_eq!(extend_timer16(4, 0xf000, true), (4 << 16) + 0xf000);
+    }
+
+    #[test]
+    fn elapsed_ticks_survive_the_overflow_count_rollover() {
+        // Two ticks before and three after the overflow count wraps from u32::MAX to 0.
+        let start = extend_timer16(u32::MAX, 0xfffe, false);
+        let end = extend_timer16(0, 0x0003, false);
+        assert_eq!(elapsed_timer48(start, end), (5, true));
+        let start = extend_timer16(7, 0x1000, false);
+        let end = extend_timer16(9, 0x0800, false);
+        assert_eq!(elapsed_timer48(start, end), ((2 << 16) - 0x800, false));
+        assert_eq!(elapsed_timer48(start, start), (0, false));
+    }
+
+    #[test]
+    fn prescalers_divide_the_cpu_clock() {
+        let cases = [
+            (Timer1Prescale::Div1, 1, 16_000_000),
+            (Timer1Prescale::Div8, 8, 2_000_000),
+            (Timer1Prescale::Div64, 64, 250_000),
+            (Timer1Prescale::Div256, 256, 62_500),
+            (Timer1Prescale::Div1024, 1024, 15_625),
+        ];
+        for (prescale, divisor, hz) in cases {
+            assert_eq!(prescale.divisor(), divisor);
+            assert_eq!(prescale.tick_frequency_hz(Some(16_000_000)), Some(hz));
+            assert_eq!(prescale.tick_frequency_hz(None), None);
+            assert_eq!(prescale.tick_frequency_hz(Some(0)), None);
+        }
+        // A clock the divisor doesn't divide exactly has no exact tick frequency.
+        assert_eq!(
+            Timer1Prescale::Div1024.tick_frequency_hz(Some(20_000_000)),
+            None
+        );
+        assert_eq!(
+            Timer1Prescale::Div8.tick_frequency_hz(Some(20_000_000)),
+            Some(2_500_000)
+        );
+        assert_eq!(Timer1Prescale::Div256.tick_frequency_hz(Some(100)), None);
     }
 
     #[test]
