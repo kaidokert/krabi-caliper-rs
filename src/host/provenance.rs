@@ -47,6 +47,8 @@ pub enum ProvenanceError {
     InvalidExtension(String),
     /// The selection matched no files, so its digest would describe nothing.
     EmptySelection,
+    /// A directory below a listed directory links back to itself or an enclosing directory.
+    SymlinkCycle(PathBuf),
 }
 
 impl fmt::Display for ProvenanceError {
@@ -69,6 +71,11 @@ impl fmt::Display for ProvenanceError {
             Self::EmptySelection => {
                 formatter.write_str("the source tree selection matched no files")
             }
+            Self::SymlinkCycle(path) => write!(
+                formatter,
+                "{} links back to an enclosing directory",
+                path.display()
+            ),
         }
     }
 }
@@ -247,7 +254,7 @@ impl SourceTree {
         }
         for directory in &self.directories {
             let relative = checked_relative(directory)?;
-            self.walk(&relative, &mut selected)?;
+            self.walk(&relative, &mut Vec::new(), &mut selected)?;
         }
         if selected.is_empty() {
             return Err(ProvenanceError::EmptySelection);
@@ -255,12 +262,21 @@ impl SourceTree {
         Ok(selected.into_iter().collect())
     }
 
+    /// `enclosing` holds the canonical paths of the directories being walked, so a symbolic
+    /// link back into one of them is an error; without it the walk would select the same files
+    /// under ever longer names until the platform's path limits stop it.
     fn walk(
         &self,
         relative: &Path,
+        enclosing: &mut Vec<PathBuf>,
         selected: &mut BTreeSet<PathBuf>,
     ) -> Result<(), ProvenanceError> {
         let directory = self.root.join(relative);
+        let canonical = fs::canonicalize(&directory).map_err(io_error(&directory))?;
+        if enclosing.contains(&canonical) {
+            return Err(ProvenanceError::SymlinkCycle(directory));
+        }
+        enclosing.push(canonical);
         for entry in fs::read_dir(&directory).map_err(io_error(&directory))? {
             let entry = entry.map_err(io_error(&directory))?;
             let name = entry.file_name();
@@ -273,7 +289,7 @@ impl SourceTree {
                     .to_str()
                     .is_some_and(|name| self.skip_directories.iter().any(|skip| skip == name));
                 if !skipped {
-                    self.walk(&child, selected)?;
+                    self.walk(&child, enclosing, selected)?;
                 }
             } else if metadata.is_file()
                 && Path::new(&name)
@@ -286,6 +302,7 @@ impl SourceTree {
                 selected.insert(checked_relative(&child)?);
             }
         }
+        enclosing.pop();
         Ok(())
     }
 
@@ -670,6 +687,30 @@ mod tests {
                 .extension(".rs")
                 .select(),
             Err(ProvenanceError::InvalidExtension(extension)) if extension == ".rs"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_links_back_into_the_walk_are_errors() {
+        let scratch = Scratch::new("cycle");
+        scratch.write("d/a.rs", "1");
+        scratch.write("shared/b.rs", "2");
+        std::os::unix::fs::symlink("../shared", scratch.0.join("d/linked")).unwrap();
+        let tree = SourceTree::new(&scratch.0).directory("d").extension("rs");
+        // A link to a directory outside the walk is followed.
+        assert_eq!(
+            tree.select().unwrap(),
+            [
+                Path::new("d").join("a.rs"),
+                Path::new("d").join("linked").join("b.rs"),
+            ]
+        );
+        // `up` leads to the root, which is not walked; the cycle closes at `up/d`.
+        std::os::unix::fs::symlink("..", scratch.0.join("d/up")).unwrap();
+        assert!(matches!(
+            tree.select(),
+            Err(ProvenanceError::SymlinkCycle(path)) if path.ends_with("d/up/d")
         ));
     }
 
