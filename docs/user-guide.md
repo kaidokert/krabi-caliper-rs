@@ -104,10 +104,12 @@ venue = "bench"
 The run ends at the first `EM_OUTCOME` event. On Unix probe-rs then gets
 SIGINT so it can detach from the target, and is killed if it has not exited
 within three seconds; on Windows it is killed after those three seconds. A
-timeout kills it at once. The chip is recorded as the MCU; the probe selector is recorded among the resolved
-bindings but not in the configuration identity, so replacing a probe does not
-block comparisons. `mcu` and `probe` in a profile are recorded metadata only,
-and `args` replaces the whole command line.
+timeout kills it at once.
+
+The chip is recorded as the MCU. The probe selector is recorded among the
+resolved bindings but not in the configuration identity, so replacing a probe
+does not block comparisons. `mcu` and `probe` in a profile are recorded
+metadata only, and `args` replaces the whole command line.
 
 `build --output` needs neither binding, so firmware can be built where no
 probe is attached. `validate` and `run` resolve every profile in the file, so
