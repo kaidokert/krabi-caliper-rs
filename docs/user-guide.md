@@ -169,9 +169,9 @@ skips, such as a linker-script `.uninit` region or `.got`, so a size gate can
 require the list to be empty. Runtime reservations such as `riscv-rt`'s
 `.stack` and `.heap` are listed too; a gate allows those by name.
 
-To prove that a feature compiled out, or that a facility such as an
-allocator, formatting or soft float never reached an image, audit the built
-ELF:
+`cargo krabi-caliper audit-elf` checks a built image for symbols and strings
+that must or must not be there, for example that a feature compiled out or that
+an allocator, formatting or soft float never reached the image:
 
 ```sh
 cargo krabi-caliper audit-elf target/thumbv7m-none-eabi/release/app \
@@ -179,19 +179,25 @@ cargo krabi-caliper audit-elf target/thumbv7m-none-eabi/release/app \
   --forbid-string "panicked at" --require-symbol app::feature::enable
 ```
 
-Symbol rules match substrings of a symbol's name as stored or demangled, with
-or without hashes and crate disambiguators, so `core::panicking` matches both
-legacy and v0 mangling. Only a defined symbol satisfies a required rule; any
-mention, an undefined reference included, breaks a forbidden one. String rules
-search the contents of allocated sections by default, which is what reaches
-the target; `--string-scope whole-file` also searches debug information and
-symbol tables. Every broken rule is reported, and the command fails if any
-image breaks one. The audit fails closed: a non-ELF file, an unreadable
-section, or rules with nothing to search (symbol rules on a stripped image) are
-errors. `--rules` reads the same rules from TOML, and `host::elf_audit` offers
-them as a library, with `elf_symbols` listing the symbols the audit examines, in
-each form a rule matches, for checks a substring cannot express (an anchored
-pattern, or every match). Like the audit, it fails on an image with no symbols.
+- Symbol rules are substrings of a symbol's name, as stored or demangled, with
+  or without hashes and crate disambiguators. `core::panicking` matches legacy
+  and v0 mangling.
+- Only a defined symbol satisfies a required rule. Any mention, including an
+  undefined reference, breaks a forbidden one.
+- String rules search the contents of allocated sections, which is what reaches
+  the target. `--string-scope whole-file` also searches debug information and
+  symbol tables.
+- `--rules` reads the same rules from a TOML file, and `--json` writes every
+  image's report.
+
+The command reports every broken rule and fails if any image breaks one. A
+non-ELF file, an unreadable section, and rules with nothing to search (symbol
+rules on a stripped image) are errors.
+
+The library is `host::elf_audit`. Its `elf_symbols` lists the symbols the audit
+examines in each form a rule matches, for checks a substring cannot express,
+such as an anchored pattern or every match. It also fails on an image with no
+symbols.
 
 ## Counting instructions from QEMU execution traces
 

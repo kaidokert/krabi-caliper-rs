@@ -1,24 +1,30 @@
 //! Require/forbid audit of the symbols and strings in a built ELF image.
 //!
-//! A build can prove that a feature compiled out, or that a forbidden facility (an
-//! allocator, formatting, a soft-float helper, a panic message) never reached the image, only by
-//! looking at the image. These rules say which symbol names and byte strings must or must not
-//! appear.
+//! Whether a feature compiled out, or whether an allocator, formatting, a soft-float helper or
+//! a panic message reached the image, can only be checked on the image itself. These rules say
+//! which symbol names and byte strings must or must not appear.
 //!
-//! A rule is a substring. A symbol rule matches a symbol if any of three forms of its name contains
-//! the text: the demangled name with hashes and crate disambiguators (`rustc-demangle`'s default
-//! output), the demangled name without them (its alternate output: `core::panicking::panic` for
-//! legacy and v0 mangling alike), or the name as stored. Tools differ in which form they print:
-//! `llvm-nm -C` keeps a legacy name's `::h<hash>` and GNU `nm -C` drops it, and both drop a v0
-//! name's `[<hex>]` crate disambiguators. Rust names
-//! are demangled; C++ names are matched as stored. [`elf_symbols`] lists the same symbols in all
-//! three forms, for a check a substring cannot express.
-//! Only a defined symbol satisfies a required rule, while any mention, including an undefined
-//! reference, breaks a forbidden one. A string rule matches bytes within one scanned region; a
-//! string split across two sections is not found.
+//! A rule is a substring. A symbol rule matches a symbol if any of three forms of its name
+//! contains it:
 //!
-//! The audit fails closed: a non-ELF file, a section it cannot read, and rules that would have
-//! nothing to search (symbol rules on a stripped image) are errors rather than passes.
+//! - the demangled name with hashes and crate disambiguators (`rustc-demangle`'s default
+//!   output);
+//! - the demangled name without them (its alternate output), which is
+//!   `core::panicking::panic` for legacy and v0 mangling alike;
+//! - the name as stored.
+//!
+//! Tools print different forms: `llvm-nm -C` keeps a legacy name's `::h<hash>` and GNU `nm -C`
+//! drops it, and both drop a v0 name's `[<hex>]` crate disambiguators. Rust names are
+//! demangled; C++ names are matched as stored. [`elf_symbols`] lists the symbols in all three
+//! forms, for checks a substring cannot express.
+//!
+//! Only a defined symbol satisfies a required rule. Any mention, including an undefined
+//! reference, breaks a forbidden one. A string rule matches bytes within one scanned region, so
+//! a string split across two sections is not found.
+//!
+//! A non-ELF file, a section the audit cannot read, and rules with nothing to search (symbol
+//! rules on a stripped image) are errors, so an audit cannot pass on an image it did not
+//! examine.
 
 use std::fmt;
 use std::format;
@@ -53,10 +59,10 @@ pub enum StringScope {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ElfAuditRules {
-    /// Each must be a substring of at least one demangled symbol name.
+    /// Each must match a defined symbol, in any of the forms the module docs list.
     #[serde(default)]
     pub require_symbols: Vec<String>,
-    /// None may be a substring of any demangled symbol name.
+    /// None may match any symbol, defined or referenced, in any form.
     #[serde(default)]
     pub forbid_symbols: Vec<String>,
     /// Each must occur in the scanned bytes.
@@ -153,8 +159,8 @@ pub enum ElfAuditViolation {
     },
     /// The scanned bytes do not contain the required string.
     MissingString { rule: String },
-    /// The scanned bytes contain a forbidden string. `section` names the first section it was
-    /// found in, or is `None` for a whole-file match outside any section.
+    /// The scanned bytes contain a forbidden string. `section` is the section of the first
+    /// match, or `None` for a whole-file match outside any section.
     ForbiddenString {
         rule: String,
         section: Option<String>,
@@ -218,9 +224,11 @@ impl ElfAuditReport {
     }
 }
 
+/// A failure to audit an image or list its symbols.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ElfAuditError {
+    /// Reading or parsing the file failed.
     Elf(ElfError),
     /// A rule is empty, so it would match every image.
     EmptyRule,
@@ -412,9 +420,8 @@ impl ElfSymbol {
 /// Defined and undefined symbols alike, file and section symbols excluded, sorted, and listed
 /// once per name and definedness: a name both defined and referenced appears twice.
 ///
-/// Fails closed like the audit: an image with no symbols (a stripped image) is
-/// [`ElfAuditError::NothingToSearch`], so a forbid-style check over the list cannot pass on an
-/// image it could not examine.
+/// An image with no symbols (a stripped image) is [`ElfAuditError::NothingToSearch`], so a
+/// forbid-style check over the list cannot pass on an image it could not examine.
 pub fn elf_symbols(path: &Path) -> Result<Vec<ElfSymbol>, ElfAuditError> {
     let bytes = fs::read(path).map_err(|error| ElfAuditError::Elf(ElfError::Io(error)))?;
     elf_symbols_bytes(&bytes)
@@ -778,7 +785,7 @@ mod tests {
         // The file symbol is not counted.
         assert_eq!(report.symbols_examined, 4);
 
-        // The demangled form, including the hash, is what a rule sees.
+        // A rule can match the legacy hash, which only the hashed demangled form keeps.
         let rules = ElfAuditRules::new()
             .forbid_symbol("core::panicking")
             .require_symbol("panic::h0123456789abcdef")
