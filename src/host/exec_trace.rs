@@ -292,7 +292,7 @@ impl ExecTracePcs<BufReader<File>> {
 }
 
 impl<R: BufRead> ExecTracePcs<R> {
-    /// Reads from `reader`; `path` names it in errors.
+    /// Reads from `reader`; errors report `path` as its location.
     pub fn new(reader: R, path: impl Into<PathBuf>) -> Self {
         Self {
             reader,
