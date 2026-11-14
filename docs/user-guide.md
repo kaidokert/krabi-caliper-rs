@@ -200,15 +200,22 @@ kills a run at the timeout, which also bounds the trace size, and retries
 failed runs. A relative trace path is resolved against `cwd`. The image must
 exit on its own, for example through semihosting.
 
-An interval opens on a PC in `begin` and skips PCs that stay in `begin` right
-after it. It then holds every later PC up to (not including) the first PC in
-`end`, including callees, returns into `begin` and interrupt handlers.
-`TraceMarker::Address` marks a single address instead of a function. Pass a
-limit to stop after that many intervals. A trace that ends inside an interval,
-or never reaches `begin`, is an error, as is a `Trace` line without a readable
-PC. Each interval keeps its PCs, so callers can attribute them to functions
-(for example with a disassembly) before counting. PCs and markers are compared
-with bit 0 cleared (Thumb), and the CPU index is ignored, so trace single-core
+`marker_intervals` cuts the trace into intervals:
+
+- An interval opens on a PC in `begin`. PCs that stay in `begin` right after it
+  are skipped.
+- It then holds every PC up to, but not including, the first PC in `end`:
+  callees, returns into `begin` and interrupt handlers are all counted.
+- `TraceMarker::function` marks a function's range; `TraceMarker::Address`
+  marks a single address.
+- A limit stops reading after that many intervals.
+
+A trace that ends inside an interval or never reaches `begin` is an error, as
+is a `Trace` line without a readable PC.
+
+Each interval keeps its PCs, so callers can attribute them to functions (for
+example with a disassembly) before counting. PCs and markers are compared with
+bit 0 cleared, for Thumb. The CPU index is ignored, so trace single-core
 machines.
 
 These are instruction counts from an emulator, not cycles: QEMU models no
