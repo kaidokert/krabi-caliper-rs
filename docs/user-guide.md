@@ -75,47 +75,6 @@ profile = "qemu-m3"
 case-set = "smoke"
 ```
 
-Presets are `qemu-cortex-m0`, `qemu-cortex-m3`, `qemu-cortex-m4`,
-`qemu-riscv32-sifive-e`, `simavr-atmega2560` and `probe-rs-rtt`. A profile
-field overrides the preset's value.
-
-`probe-rs-rtt` runs an image on physical hardware with `probe-rs run` and reads
-the event protocol over RTT, so the firmware must report through the `rtt`
-transport. With `cortex_m_reporter!`, list the application feature that selects
-RTT in the profile's `build-features`; otherwise the image reports over
-semihosting and the run times out.
-
-The chip and probe come from the `PROBE_RS_CHIP` and `PROBE_RS_PROBE` bindings
-(a venue's `bindings`, or the environment), and both are required. Give the
-probe as `VID:PID:Serial` when several probes of one model are attached, since
-`VID:PID` alone matches each of them. The target triple depends on the chip, so
-the profile sets it:
-
-```toml
-[venues.bench]
-bindings = { PROBE_RS_CHIP = "STM32L431KCUx", PROBE_RS_PROBE = "0483:374f:000000000000" }
-
-[profiles.l431]
-preset = "probe-rs-rtt"
-target = "thumbv7em-none-eabihf"
-venue = "bench"
-```
-
-The run ends at the first `EM_OUTCOME` event. On Unix probe-rs then gets
-SIGINT so it can detach from the target, and is killed if it has not exited
-within three seconds; on Windows it is killed after those three seconds. A
-timeout kills it at once.
-
-The chip is recorded as the MCU. The probe selector is recorded among the
-resolved bindings but not in the configuration identity, so replacing a probe
-does not block comparisons. `mcu` and `probe` in a profile are recorded
-metadata only, and `args` replaces the whole command line.
-
-`build --output` needs neither binding, so firmware can be built where no
-probe is attached. `validate` and `run` resolve every profile in the file, so
-set the bindings wherever those commands run, or keep hardware profiles in a
-separate configuration file.
-
 Then validate or run it:
 
 ```sh
@@ -143,6 +102,58 @@ commit, verifies the selected cases and every firmware SHA-256 digest, and
 resolves runner-only bindings such as probe selectors only in the execution
 job. CI remains responsible for artifact transfer and for acquiring any
 hardware lock after the bundle has been downloaded.
+
+### Runner presets
+
+A profile's `preset` supplies the runner command, the target and the recorded
+board, MCU and transport. A field set in the profile overrides the preset's
+value.
+
+- `qemu-cortex-m0`, `qemu-cortex-m3`, `qemu-cortex-m4`: QEMU, reporting over
+  semihosting.
+- `qemu-riscv32-sifive-e`: QEMU, reporting over UART.
+- `simavr-atmega2560`: simavr, reporting over UART.
+- `probe-rs-rtt`: physical hardware through `probe-rs run`, reporting over RTT.
+
+### `probe-rs-rtt`
+
+```toml
+[venues.bench]
+bindings = { PROBE_RS_CHIP = "STM32L431KCUx", PROBE_RS_PROBE = "0483:374f:000000000000" }
+
+[profiles.l431]
+preset = "probe-rs-rtt"
+target = "thumbv7em-none-eabihf"
+venue = "bench"
+```
+
+The preset needs two bindings, from a venue's `bindings` or the environment:
+
+- `PROBE_RS_CHIP`: the probe-rs chip name, recorded as the MCU.
+- `PROBE_RS_PROBE`: the probe selector. Use `VID:PID:Serial` when several
+  probes of one model are attached; `VID:PID` matches each of them. The
+  selector is not part of the configuration identity, so replacing a probe
+  does not block comparisons.
+
+The profile sets `target`, because the target triple depends on the chip.
+
+The firmware must report over RTT (the `rtt` feature). With
+`cortex_m_reporter!("<feature>")`, list that feature in the profile's
+`build-features`; without it the firmware reports over semihosting and the run
+times out.
+
+The run ends at the first `EM_OUTCOME` event. On Unix probe-rs then gets SIGINT
+so it can detach from the target, and is killed if it has not exited within
+three seconds. On Windows it is killed after those three seconds. A timeout
+kills it at once.
+
+`build --output` needs neither binding, so firmware can be built where no probe
+is attached. `validate` and `run` resolve every profile in the file, so set the
+bindings wherever those commands run, or keep hardware profiles in a separate
+configuration file.
+
+`mcu` and `probe` set in a profile are recorded metadata only. `args` replaces
+the whole command line, including the chip and probe selectors.
 
 Host facilities include Cargo artifact discovery, timeouts, retained logs, ELF
 footprint extraction, comparisons, JSON/CSV/Markdown reports, CT-grind
