@@ -853,7 +853,7 @@ fn safe_prepared_output(workspace: &Path, output: &Path) -> Result<PathBuf, Camp
     })?;
     let output = normalized_absolute(output)?;
     reject_symlinked_output(&output)?;
-    let resolved_output = output.canonicalize().unwrap_or_else(|_| output.clone());
+    let resolved_output = resolve_existing_prefix(&output)?;
 
     if workspace.starts_with(&resolved_output) {
         return Err(CampaignError::InvalidConfig(
@@ -868,31 +868,59 @@ fn safe_prepared_output(workspace: &Path, output: &Path) -> Result<PathBuf, Camp
             "prepared output inside the workspace must be a child of target/".to_string(),
         ));
     }
-    Ok(output)
+    // Later steps use the checked location, not a spelling through links.
+    Ok(resolved_output)
 }
 
+/// The output is emptied before use, so it must be a real directory. Symlinks above it are
+/// resolved by [`resolve_existing_prefix`], and the resolved path is checked and used.
 fn reject_symlinked_output(output: &Path) -> Result<(), CampaignError> {
-    let mut current = PathBuf::new();
-    for component in output.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(CampaignError::InvalidConfig(format!(
-                    "prepared output path must not contain symlinks: {}",
-                    current.display()
-                )));
+    match fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CampaignError::InvalidConfig(
+            format!("prepared output must not be a symlink: {}", output.display()),
+        )),
+        Err(source) if source.kind() != std::io::ErrorKind::NotFound => Err(CampaignError::Io {
+            path: output.to_path_buf(),
+            source,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// `path` with its longest existing prefix canonicalized, so a symlinked ancestor (such as
+/// macOS's `/tmp` or `/var`) resolves to where the output really is. A dangling symlink is an
+/// error: its target is created later, possibly inside the workspace, so the path cannot be
+/// checked now.
+fn resolve_existing_prefix(path: &Path) -> Result<PathBuf, CampaignError> {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        match existing.canonicalize() {
+            Ok(mut resolved) => {
+                resolved.extend(rest.iter().rev());
+                return Ok(resolved);
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
+            Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
                 return Err(CampaignError::Io {
-                    path: current,
+                    path: existing.to_path_buf(),
                     source,
                 });
             }
+            Err(_) if fs::symlink_metadata(existing).is_ok() => {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "prepared output path contains a dangling symlink: {}",
+                    existing.display()
+                )));
+            }
+            Err(_) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name);
+                    existing = parent;
+                }
+                _ => return Ok(path.to_path_buf()),
+            },
         }
     }
-    Ok(())
 }
 
 fn reset_prepared_output(output: &Path) -> Result<(), CampaignError> {
