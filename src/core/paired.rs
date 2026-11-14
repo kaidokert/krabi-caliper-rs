@@ -52,6 +52,8 @@ pub enum RunError {
     OddSampleCapacity,
     BlockCountOverflow,
     CapacityExceeded,
+    /// A measurement's unit or frequency differs from the earlier ones on its side.
+    MixedSamples,
 }
 
 /// Raw paired evidence plus application-output validation.
@@ -134,7 +136,11 @@ impl<const N: usize> PairedRunner<N> {
                     outputs_ok &= ok;
                     samples
                         .push(side, measurement)
-                        .map_err(|_| RunError::CapacityExceeded)?;
+                        .map_err(|error| match error {
+                            crate::PushError::Full(_) => RunError::CapacityExceeded,
+                            crate::PushError::UnitMismatch(_)
+                            | crate::PushError::FrequencyMismatch(_) => RunError::MixedSamples,
+                        })?;
                 }
             }
             block += 1;
@@ -235,7 +241,7 @@ impl<const N: usize> PairedSamples<N> {
         }
     }
 
-    pub fn push(&mut self, side: Side, measurement: Measurement) -> Result<(), Measurement> {
+    pub fn push(&mut self, side: Side, measurement: Measurement) -> Result<(), crate::PushError> {
         match side {
             Side::A => self.a.push(measurement),
             Side::B => self.b.push(measurement),
