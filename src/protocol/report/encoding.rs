@@ -446,13 +446,14 @@ pub enum UfmtReportError<E> {
 
 /// A `u64` printed in decimal by repeated subtraction of powers of ten.
 ///
-/// `ufmt`'s own `u64` formatting divides by ten in 64-bit arithmetic, which links the 64-bit
-/// division helpers (`__udivdi3`/`__umoddi3` on AVR, `__aeabi_uldivmod` on Armv6-M) into every
-/// image that reports a measurement. This needs only 64-bit compare and subtract, which those
-/// targets inline: at most 9 subtractions per digit, 20 digits.
+/// `ufmt`'s own `u64` formatting divides by ten in 64-bit arithmetic, which on a target without a
+/// 64-bit divider links the 64-bit division helpers (`__udivdi3`/`__umoddi3` on AVR,
+/// `__aeabi_uldivmod` on Armv6-M) into every image that reports a measurement. This needs only
+/// 64-bit compare and subtract, which those targets inline: at most nine subtractions per digit,
+/// 20 digits. CI checks the Armv6-M build of this module for a 64-bit division call.
 #[cfg(feature = "ufmt")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Decimal(pub u64);
+pub(crate) struct Decimal(pub(crate) u64);
 
 #[cfg(feature = "ufmt")]
 impl Decimal {
@@ -465,29 +466,7 @@ impl Decimal {
         }
         powers
     };
-
-    /// Writes the digits into `buffer` and returns them.
-    fn digits(self, buffer: &mut [u8; 20]) -> &str {
-        let mut rest = self.0;
-        let mut length = 0;
-        for power in Self::POWERS {
-            let mut digit = b'0';
-            while rest >= power {
-                rest -= power;
-                digit += 1;
-            }
-            if length != 0 || digit != b'0' || power == 1 {
-                if let Some(slot) = buffer.get_mut(length) {
-                    *slot = digit;
-                }
-                length += 1;
-            }
-        }
-        buffer
-            .get(..length)
-            .and_then(|digits| core::str::from_utf8(digits).ok())
-            .unwrap_or("0")
-    }
+    const DIGITS: &'static str = "0123456789";
 }
 
 #[cfg(feature = "ufmt")]
@@ -496,7 +475,22 @@ impl ufmt::uDisplay for Decimal {
         &self,
         formatter: &mut ufmt::Formatter<'_, W>,
     ) -> Result<(), W::Error> {
-        formatter.write_str(self.digits(&mut [0; 20]))
+        let mut rest = self.0;
+        let mut leading = true;
+        for power in Self::POWERS {
+            let mut digit = 0_usize;
+            while rest >= power {
+                rest -= power;
+                // At most 9, and 1 for the top power: `u64::MAX` is below 2 * 10^19.
+                digit = digit.wrapping_add(1);
+            }
+            leading &= digit == 0 && power != 1;
+            if !leading {
+                // Slicing a one-byte ASCII digit: never fails, and needs no UTF-8 validation.
+                formatter.write_str(Self::DIGITS.get(digit..=digit).unwrap_or("?"))?;
+            }
+        }
+        Ok(())
     }
 }
 

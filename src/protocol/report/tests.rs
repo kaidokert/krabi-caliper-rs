@@ -338,7 +338,21 @@ mod tests {
     #[cfg(feature = "ufmt")]
     #[test]
     fn decimal_matches_the_standard_formatting() {
-        let mut values = std::vec![0, 1, 9, 10, 11, 99, 100, 101, 1_234_567_890_123, u64::MAX];
+        let mut values = std::vec![
+            0,
+            1,
+            9,
+            10,
+            11,
+            99,
+            100,
+            101,
+            1_234_567_890_123,
+            10_000_000_000_000_000_000,
+            10_000_000_000_000_000_001,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
         let mut power = 1_u64;
         while let Some(next) = power.checked_mul(10) {
             values.extend([power - 1, power, power + 1, next - 1]);
@@ -353,28 +367,92 @@ mod tests {
 
     #[cfg(feature = "ufmt")]
     #[test]
-    fn the_ufmt_reporter_writes_wide_values_as_the_text_reporter_does() {
-        let record = MeasurementRecord {
+    fn the_ufmt_reporter_writes_every_wide_value_as_the_text_reporter_does() {
+        // Every event that carries a `u64`, at the widths a host's own formatting would also get
+        // right, so a site left on ufmt's `u64` formatting would still pass; this checks the
+        // two encoders agree on every such site, and `Decimal` itself is checked above.
+        const WIDE: u64 = u64::MAX;
+        const TOP: u64 = 10_000_000_000_000_000_000;
+        let fields = &[Field::u64("bytes", TOP), Field::bool("cold", true)];
+        let begin = RunStart {
+            suite: "fixture",
+            target: "avr",
+            board: None,
+            unit: Unit::TimerTicks,
+            frequency_hz: Some(TOP + 1),
+            fields,
+        };
+        let sample = SampleRecord {
+            fixture: "timing",
+            side: 'B',
+            index: 3,
+            ticks: WIDE,
+            wrapped: true,
+            fields,
+        };
+        let comparison = ComparisonRecord {
+            fixture: "timing",
+            class: "positive",
+            policy: Some("max-spread"),
+            a_min: TOP - 1,
+            a_max: TOP,
+            b_min: TOP + 1,
+            b_max: WIDE - 1,
+            spread: WIDE,
+            overlap: false,
+            wrapped: false,
+            output_ok: true,
+            passed: Some(false),
+            fields,
+        };
+        let measurement = MeasurementRecord {
             benchmark: "update",
-            measurement: Measurement::new(u64::MAX, Unit::TimerTicks)
-                .with_frequency(10_000_000_000),
+            measurement: Measurement::new(WIDE, Unit::TimerTicks).with_frequency(10_000_000_000),
             counter: Some("timer1"),
-            fields: &[Field::u64("bytes", u64::MAX - 1)],
+            fields,
+        };
+        let counter = CounterSnapshotRecord {
+            benchmark: "update",
+            trial: 7,
+            phase: BoundaryPhase::Begin,
+            ticks: TOP,
+            width_bits: 64,
+            unit: Unit::TimerTicks,
+            frequency_hz: Some(WIDE),
+            fields,
         };
         let metric = MetricRecord {
             benchmark: "update",
             name: "flash",
-            value: 18_446_744_073_709,
+            value: WIDE - 9,
             unit: Some("bytes"),
             policy: MetricPolicy::Informational,
-            fields: &[],
+            fields,
         };
+        let events = [
+            Event::Begin(&begin),
+            Event::Sample(&sample),
+            Event::Result(&comparison),
+            Event::Diagnostic(&comparison),
+            Event::Measurement {
+                record: &measurement,
+                trial: Some(7),
+            },
+            Event::Measurement {
+                record: &measurement,
+                trial: None,
+            },
+            Event::Counter(&counter),
+            Event::Metric(&metric),
+        ];
         let mut text = TextReporter::new(String::new());
-        text.indexed_measurement(&record, 7).unwrap();
-        text.metric(&metric).unwrap();
         let mut compact = UfmtReporter::new(UfmtString(String::new()));
-        compact.indexed_measurement(&record, 7).unwrap();
-        compact.metric(&metric).unwrap();
-        assert_eq!(compact.into_inner().0, text.into_inner());
+        for event in events {
+            text.event(event).unwrap();
+            compact.event(event).unwrap();
+        }
+        let text = text.into_inner();
+        assert_eq!(text.lines().count(), events.len());
+        assert_eq!(compact.into_inner().0, text);
     }
 }
