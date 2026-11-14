@@ -58,9 +58,18 @@ impl ToolkitConfig {
             .as_deref()
             .map(&mut expand)
             .transpose()?
-            .or_else(|| preset.as_ref().map(|value| value.target.to_string()))
+            .or_else(|| {
+                preset
+                    .as_ref()
+                    .and_then(|value| value.target.map(str::to_string))
+            })
             .ok_or_else(|| {
-                CampaignError::InvalidConfig("runner profile requires target or preset".to_string())
+                CampaignError::InvalidConfig(match profile.preset {
+                    Some(_) => format!(
+                        "runner profile {name:?} requires target: its preset spans several targets"
+                    ),
+                    None => "runner profile requires target or preset".to_string(),
+                })
             })?;
         let toolchain = profile
             .toolchain
