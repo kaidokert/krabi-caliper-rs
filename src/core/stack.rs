@@ -408,16 +408,21 @@ impl StackPointer for RiscV {
     any(target_arch = "riscv32", target_arch = "riscv64")
 ))]
 impl LinkerStack<RiscV> {
+    /// Spans `riscv-rt`'s `.stack` region, `__estack.._stack_start`.
+    ///
+    /// `riscv-rt` 0.13 names the stack floor `_estack`; with that version add
+    /// `PROVIDE(__estack = _estack);` to `memory.x`.
+    ///
     /// # Safety
-    /// `_sheap.._stack_start` must be writable and reserved for stack probing.
+    /// `__estack.._stack_start` must be writable and reserved for stack probing.
     pub unsafe fn riscv_runtime() -> Self {
         unsafe extern "C" {
-            static _sheap: u8;
+            static __estack: u8;
             static _stack_start: u8;
         }
         unsafe {
             Self::new(
-                core::ptr::addr_of!(_sheap).cast_mut(),
+                core::ptr::addr_of!(__estack).cast_mut(),
                 core::ptr::addr_of!(_stack_start).cast_mut(),
                 RiscV,
             )
@@ -429,7 +434,8 @@ impl LinkerStack<RiscV> {
     feature = "risc-v",
     any(target_arch = "riscv32", target_arch = "riscv64")
 ))]
-/// Paints the conventional `riscv-rt` stack allocation.
+/// Paints the conventional `riscv-rt` stack allocation; see
+/// [`LinkerStack::riscv_runtime`] for the bounds and `riscv-rt` 0.13.
 ///
 /// # Safety
 /// The linker-provided stack range must be exclusively owned while the probe is active.
