@@ -5,6 +5,10 @@ use crate::{Measurement, Unit};
 /// Every sample in a set shares the unit and frequency of the first one; [`push`](Self::push)
 /// rejects a sample that does not. So the set stores, per sample, only its tick count and whether
 /// it wrapped: `9 * N` bytes plus a few words, rather than a whole [`Measurement`] each.
+//
+// The derived equality relies on two invariants: slots at and past `len` are never written, so
+// they stay 0 and false, and an empty set keeps `CoreCycles` and `None`. Anything that removes
+// samples must restore both, or compare only the pushed samples by hand.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleSet<const N: usize> {
     ticks: [u64; N],
@@ -58,8 +62,13 @@ impl<const N: usize> SampleSet<N> {
     }
 
     /// Appends a measurement. The first sample sets the unit and frequency; a later one must
-    /// match them. On error the set is unchanged.
+    /// match them. A full set reports `Full` before any mismatch. On error the set is unchanged.
     pub fn push(&mut self, measurement: Measurement) -> Result<(), PushError> {
+        let (Some(ticks), Some(wrapped)) =
+            (self.ticks.get_mut(self.len), self.wrapped.get_mut(self.len))
+        else {
+            return Err(PushError::Full(measurement));
+        };
         if self.len > 0 {
             if measurement.unit != self.unit {
                 return Err(PushError::UnitMismatch(measurement));
@@ -68,11 +77,6 @@ impl<const N: usize> SampleSet<N> {
                 return Err(PushError::FrequencyMismatch(measurement));
             }
         }
-        let (Some(ticks), Some(wrapped)) =
-            (self.ticks.get_mut(self.len), self.wrapped.get_mut(self.len))
-        else {
-            return Err(PushError::Full(measurement));
-        };
         *ticks = measurement.ticks;
         *wrapped = measurement.wrapped;
         if self.len == 0 {
@@ -84,11 +88,10 @@ impl<const N: usize> SampleSet<N> {
     }
 
     /// The samples, in the order they were pushed.
-    pub fn iter(&self) -> impl Iterator<Item = Measurement> + '_ {
-        self.ticks
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Measurement> + DoubleEndedIterator + '_ {
+        self.ticks()
             .iter()
-            .zip(&self.wrapped)
-            .take(self.len)
+            .zip(self.wrapped.get(..self.len).unwrap_or(&[]))
             .map(|(&ticks, &wrapped)| Measurement {
                 ticks,
                 unit: self.unit,
@@ -241,8 +244,16 @@ impl<'de, const N: usize> serde::Deserialize<'de> for SampleSet<N> {
             ) -> Result<Self::Value, A::Error> {
                 let mut samples = SampleSet::new();
                 while let Some(sample) = sequence.next_element()? {
-                    samples.push(sample).map_err(|_| {
-                        serde::de::Error::invalid_length(N + 1, &SampleSetVisitor::<N>)
+                    samples.push(sample).map_err(|error| match error {
+                        PushError::Full(_) => {
+                            serde::de::Error::invalid_length(N + 1, &SampleSetVisitor::<N>)
+                        }
+                        PushError::UnitMismatch(_) => serde::de::Error::custom(
+                            "a sample's unit differs from the first sample's",
+                        ),
+                        PushError::FrequencyMismatch(_) => serde::de::Error::custom(
+                            "a sample's frequency differs from the first sample's",
+                        ),
                     })?;
                 }
                 Ok(samples)
@@ -321,6 +332,8 @@ mod tests {
         let before = full;
         let extra = Measurement::new(2, Unit::CoreCycles);
         assert_eq!(full.push(extra), Err(PushError::Full(extra)));
+        let timer = Measurement::new(2, Unit::TimerTicks);
+        assert_eq!(full.push(timer), Err(PushError::Full(timer)));
         assert_eq!(full, before);
 
         let mut set = SampleSet::<3>::new();
@@ -355,6 +368,8 @@ mod tests {
             samples.push(sample).unwrap();
         }
         assert!(samples.iter().eq(pushed));
+        assert_eq!(samples.iter().len(), 3);
+        assert!(samples.iter().rev().eq(pushed.into_iter().rev()));
         assert_eq!(samples.ticks(), &[9, 3, u64::MAX]);
         let mut none = SampleSet::<0>::new();
         assert_eq!(none.iter().count(), 0);
@@ -364,9 +379,11 @@ mod tests {
 
     #[test]
     fn stores_ticks_and_wrap_flags_rather_than_whole_measurements() {
-        // Per sample, a u64 and a bool; the rest is one shared qualification and the length.
-        let shared = core::mem::size_of::<Measurement>() + 2 * core::mem::size_of::<usize>();
-        assert!(core::mem::size_of::<SampleSet<31>>() <= 31 * 9 + shared);
+        // Per sample, a u64 and a bool; then the length, the shared unit and frequency, and at
+        // most 7 bytes of padding after the flags.
+        use core::mem::size_of;
+        let shared = size_of::<usize>() + size_of::<Option<u64>>() + size_of::<Unit>() + 7;
+        assert!(size_of::<SampleSet<31>>() <= 31 * 9 + shared);
     }
 
     fn cycles<const N: usize>(ticks: &[u64]) -> SampleSet<N> {
@@ -481,6 +498,16 @@ mod tests {
         let decoded: SampleSet<37> = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, samples);
         assert!(serde_json::from_str::<SampleSet<1>>(&encoded).is_err());
+
+        // A mixed set, which the earlier layout could hold, is refused with the reason.
+        let mut mixed: std::vec::Vec<_> = samples.iter().collect();
+        mixed.push(Measurement::new(5, Unit::TimerTicks).with_frequency(48_000_000));
+        let encoded = serde_json::to_string(&mixed).unwrap();
+        let error = std::format!(
+            "{}",
+            serde_json::from_str::<SampleSet<37>>(&encoded).unwrap_err()
+        );
+        assert!(error.contains("unit differs"), "{error}");
 
         let summary = samples.summary().unwrap();
         let encoded = serde_json::to_string(&summary).unwrap();

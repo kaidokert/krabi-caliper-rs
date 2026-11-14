@@ -97,6 +97,7 @@ pub struct ExternalBenchmarkResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum BenchmarkError<E> {
     Reporter(E),
     /// The platform returned a measurement the sample set rejected: more than `N`, or one

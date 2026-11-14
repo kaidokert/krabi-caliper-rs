@@ -138,7 +138,8 @@ impl<const N: usize> PairedRunner<N> {
                         .push(side, measurement)
                         .map_err(|error| match error {
                             crate::PushError::Full(_) => RunError::CapacityExceeded,
-                            _ => RunError::MixedSamples,
+                            crate::PushError::UnitMismatch(_)
+                            | crate::PushError::FrequencyMismatch(_) => RunError::MixedSamples,
                         })?;
                 }
             }
