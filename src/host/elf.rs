@@ -57,7 +57,9 @@ pub fn read_elf_footprint(path: &Path) -> Result<ElfFootprint, ElfError> {
 ///
 /// The footprint classifies sections by name and then by kind, and skips the rest. A size gate
 /// that must not miss memory can require this list to be empty, so that a new section fails
-/// the gate instead of going uncounted.
+/// the gate instead of going uncounted. Runtime reservations are allocated too and appear
+/// here, such as `riscv-rt`'s `.stack` and, when a heap is configured, `.heap`; a gate on such
+/// an image allows those by name.
 pub fn read_elf_unclassified_sections(path: &Path) -> Result<Vec<ElfSection>, ElfError> {
     let bytes = fs::read(path).map_err(ElfError::Io)?;
     unclassified_from_bytes(&bytes).map_err(ElfError::Object)
@@ -346,6 +348,29 @@ mod section_tests {
         let unclassified = unclassified_from_bytes(&image).unwrap();
         assert_eq!(unclassified.len(), 1);
         assert_eq!(unclassified[0].name, ".\u{fffd}dd");
+    }
+
+    #[test]
+    fn reads_unclassified_sections_from_a_file() {
+        let image = elf32(&[
+            (".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, 16),
+            (".uninit", SHT_NOBITS, SHF_ALLOC | SHF_WRITE, 20),
+        ]);
+        let path = std::env::temp_dir().join(std::format!(
+            "krabi-caliper-unclassified-{}.elf",
+            std::process::id()
+        ));
+        std::fs::write(&path, &image).unwrap();
+        let unclassified = read_elf_unclassified_sections(&path);
+        std::fs::remove_file(&path).unwrap();
+        let unclassified = unclassified.unwrap();
+        assert_eq!(unclassified.len(), 1);
+        assert_eq!(unclassified[0].name, ".uninit");
+        assert_eq!(unclassified[0].size, 20);
+        assert!(matches!(
+            read_elf_unclassified_sections(&path),
+            Err(ElfError::Io(_))
+        ));
     }
 
     #[test]

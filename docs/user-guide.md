@@ -113,7 +113,9 @@ name, then by section kind, and skips any section that fits none of them.
 `read_elf_unclassified_sections` lists the allocated, non-empty sections it
 skipped, such as a linker-script `.uninit` region or `.got`. A size gate can
 require that list to be empty, so that a new section fails the gate rather
-than going uncounted.
+than going uncounted. Runtime reservations such as `riscv-rt`'s `.stack`, and
+`.heap` when a heap is configured, are listed as well; a gate on such an image
+allows them by name.
 
 ## Feature groups
 
