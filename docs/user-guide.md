@@ -199,6 +199,84 @@ examines in each form a rule matches, for checks a substring cannot express,
 such as an anchored pattern or every match. It also fails on an image with no
 symbols.
 
+## Disassembly and static stack bounds
+
+`host::disasm` (with `host`) reads a linked Arm Thumb image through LLVM's
+`nm -S -n -C` and `objdump -d --demangle --no-show-raw-insn`:
+
+```rust,ignore
+use krabi_caliper::host::disasm::{Disassembly, DisasmTools, UnresolvedCallPolicy};
+
+fn stack_of(elf: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let image = Disassembly::from_elf(elf, &DisasmTools::cargo_binutils())?;
+    let root = image.find_unique("app::measured::")?.address;
+    let _reachable = image.reachable_from(root, UnresolvedCallPolicy::Reject)?;
+    let stack = image.composed_stack_upper(root)?;
+    if !stack.bounded {
+        return Err("the analysis skipped something below the root".into());
+    }
+    Ok(stack.bytes)
+}
+```
+
+Each function carries its `nm` size, instructions, static call edges (calls,
+tail calls and conditional branches into another function) and a frame
+estimate: four bytes per pushed register plus every `sub sp, #0x..`.
+`composed_stack_upper` sums frames along the deepest static chain and rejects
+recursion; `composed_stack_upper_with(root, RecursionPolicy::CountOnce)` instead
+counts each recursive frame once and clears `bounded`, for recursion that is
+bounded in practice (library sorts, for example). It is a heuristic, not a proof: indirect calls, indirect branches,
+table branches (`tbb`/`tbh`), branches to addresses that start no function, and
+stack adjustments it does not count (`subw`, `vpush`, register adjustments,
+`mov sp, rN` other than directly before a `pop`, decimal immediates) are listed
+per function and clear `bounded`. Exception entry and interrupt handlers are never
+included. Literal-pool words that objdump decodes as branches also show up as
+uncounted, so a cleared `bounded` needs a look at the listed lines rather than
+being an error by itself. Read the listing with current LLVM tools: GNU objdump's decimal
+immediates and bare targets are not parsed (they show up as uncounted). Names
+are the LLVM tools' demangled names, hashes included, so record those tools'
+versions with the measurement.
+
+For objdump listings, `function_body` extracts one function,
+`line_attributed_instructions` counts instructions that `objdump -d -l`
+attributes to a source line range, `first_stack_allocation` reads explicit
+frame allocations, and `ChainBudget` checks a chain of known frames against
+per-frame and total ceilings.
+
+### Analytical Cortex-M cycle model
+
+`host::disasm::cycles` costs an executed instruction sequence (for example the
+PCs of a QEMU execution trace) with Cortex-M0, Cortex-M3 or Cortex-M4
+instruction timings:
+
+```rust,ignore
+use krabi_caliper::host::disasm::cycles::{CortexMCore, estimate_cycles};
+
+let estimate = estimate_cycles(CortexMCore::M4, &image, &pcs)?;
+println!("{}..{} cycles", estimate.minimum, estimate.maximum);
+```
+
+The PCs must list every executed instruction: trace with `-d exec,nochain` and
+`one-insn-per-tb=on` (see `host::exec_trace`), since plain `-d exec` logs only
+block starts. The timings assume zero-wait-state memory, no bus contention and
+no interrupts. A range covers what a listing cannot decide: pipeline refill
+after a branch, the Cortex-M0 multiplier option, and early-terminating divides.
+`M0` means Cortex-M0, not M0+, whose timings differ. A conditional branch's
+direction comes from the next PC; a successor that is neither its target nor
+the next instruction (an exception, say) is an error. Floating point, DSP,
+non-branch writes to `pc` and Armv7-M instructions on `M0` are errors rather
+than guesses.
+
+The figures follow the Technical Reference Manuals with documented deviations,
+so they are a model estimate rather than a guaranteed bracket. On M3/M4,
+pipelined adjacent loads can cost less than the per-load minimum, and the M3
+table-branch and long multiply-accumulate ranges are the model's own.
+Condition-failed instructions inside IT blocks are charged as executed.
+Exclusive loads and stores are costed as ordinary ones. The module
+documentation lists the deviations in full. The result also gives per-address cycles and timing
+classes, branch-direction counts and a mnemonic histogram. Parts with flash
+wait states, caches or accelerators run differently, so measure on them.
+
 ## Counting instructions from QEMU execution traces
 
 `host::exec_trace` (feature `host`) counts the instructions an image executes
