@@ -1268,6 +1268,68 @@ cases = [{ name = "fixture", example = "fixture" }]
     std::fs::remove_dir_all(workspace).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn an_idle_runner_times_out_and_leaves_its_output_on_disk() {
+    let workspace = failure_workspace("idle-test", "fn main() {}\n");
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+target-dir = "target"
+executable = "sh"
+args = ["-c", "echo 'attached, waiting for RTT'; exec sleep 30"]
+timeout-seconds = 60
+idle-timeout-seconds = 1
+
+[campaigns.idle]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(&config, "idle", &workspace, &CampaignSelection::default())
+        .unwrap();
+
+    let case = &report.cases[0];
+    assert_eq!(case.status, CaseStatus::TimedOut);
+    let error = case.error.as_deref().unwrap();
+    assert!(error.contains("wrote no output for 1 s"), "{error}");
+    let case_dir = workspace.join("target/krabi-caliper/idle/fixture");
+    assert_eq!(
+        std::fs::read_to_string(case_dir.join("raw-stdout.log")).unwrap(),
+        "attached, waiting for RTT\n"
+    );
+    let summary =
+        std::fs::read_to_string(workspace.join("target/krabi-caliper/idle/results.json")).unwrap();
+    assert!(summary.contains("\"timed-out\""), "{summary}");
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn idle_timeout_must_be_positive() {
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+executable = "true"
+idle-timeout-seconds = 0
+
+[campaigns.idle]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    let error = config.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("idle-timeout-seconds must be at least 1"),
+        "{error}"
+    );
+}
+
 fn scripted_report(id: &str, status: CaseStatus, error: Option<&str>) -> CaseReport {
     CaseReport {
         id: id.to_string(),

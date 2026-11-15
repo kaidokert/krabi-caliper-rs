@@ -1,7 +1,8 @@
 use std::eprintln;
 use std::ffi::{OsStr, OsString};
 use std::format;
-use std::io::{self, Read};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::string::String;
@@ -155,6 +156,54 @@ impl CommandOutput {
     }
 }
 
+/// How [`CommandRunner::run_with`] observes a command while it runs.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct RunOptions {
+    /// Copy each complete line of the command's stdout and stderr to this process's stderr as it
+    /// arrives, after this prefix.
+    pub echo_prefix: Option<String>,
+    /// End the command once it has written nothing to stdout or stderr for this long.
+    pub idle_timeout: Option<Duration>,
+    /// Append the command's stdout to this file as it arrives.
+    pub stdout_log: Option<PathBuf>,
+    /// Append the command's stderr to this file as it arrives.
+    pub stderr_log: Option<PathBuf>,
+}
+
+impl RunOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn echo_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.echo_prefix = Some(prefix.into());
+        self
+    }
+
+    pub const fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    /// Writes stdout and stderr to these files while the command runs. The files are created or
+    /// truncated when the command starts.
+    pub fn logs(mut self, stdout: impl Into<PathBuf>, stderr: impl Into<PathBuf>) -> Self {
+        self.stdout_log = Some(stdout.into());
+        self.stderr_log = Some(stderr.into());
+        self
+    }
+}
+
+/// A command's output from [`CommandRunner::run_with`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ObservedOutput {
+    pub output: CommandOutput,
+    /// The command was ended by [`RunOptions::idle_timeout`]; `output.timed_out` is also set.
+    pub idle_timed_out: bool,
+}
+
 #[derive(Debug)]
 pub enum CommandError {
     Spawn {
@@ -286,6 +335,18 @@ impl CommandRunner {
     }
 
     pub fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, CommandError> {
+        Ok(self.run_with(spec, &RunOptions::default())?.output)
+    }
+
+    /// Runs a command like [`run`](Self::run), and also echoes, logs or idle-limits it as
+    /// `options` asks.
+    pub fn run_with(
+        &self,
+        spec: &CommandSpec,
+        options: &RunOptions,
+    ) -> Result<ObservedOutput, CommandError> {
+        let stdout_log = open_log(options.stdout_log.as_deref(), "stdout")?;
+        let stderr_log = open_log(options.stderr_log.as_deref(), "stderr")?;
         let started = Instant::now();
         let mut child = self.spawn(spec, Stdio::piped(), Stdio::piped())?;
         let display = String::from(child.display());
@@ -301,23 +362,37 @@ impl CommandRunner {
             .expect("piped stderr must exist");
         let stdout_capture = Arc::new(Mutex::new(Vec::new()));
         let stderr_capture = Arc::new(Mutex::new(Vec::new()));
-        let stdout_thread = spawn_reader(stdout, Arc::clone(&stdout_capture));
-        let stderr_thread = spawn_reader(stderr, Arc::clone(&stderr_capture));
+        let last_output = Arc::new(Mutex::new(started));
+        let stdout_thread = spawn_reader(
+            stdout,
+            Arc::clone(&stdout_capture),
+            Observer::new(options, stdout_log, &last_output),
+        );
+        let stderr_thread = spawn_reader(
+            stderr,
+            Arc::clone(&stderr_capture),
+            Observer::new(options, stderr_log, &last_output),
+        );
+        let idle = |limit: Duration| last_output.lock().unwrap().elapsed() >= limit;
 
-        let (status, timed_out, mut completion_marker_hit) = loop {
+        let (status, timed_out, mut completion_marker_hit, idle_timed_out) = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break (Some(status), false, false),
+                Ok(Some(status)) => break (Some(status), false, false, false),
                 Ok(None) if marker_seen(spec, &stdout_capture, &stderr_capture) => {
                     let status = finish_after_marker(
                         child.child.as_mut().expect("managed child must exist"),
                         spec.completion_action,
                         &display,
                     )?;
-                    break (Some(status), false, true);
+                    break (Some(status), false, true, false);
                 }
                 Ok(None) if started.elapsed() >= spec.timeout => {
                     let status = child.terminate()?;
-                    break (Some(status), true, false);
+                    break (Some(status), true, false, false);
+                }
+                Ok(None) if options.idle_timeout.is_some_and(idle) => {
+                    let status = child.terminate()?;
+                    break (Some(status), true, false, true);
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(10)),
                 Err(error) => {
@@ -337,15 +412,76 @@ impl CommandRunner {
         if !timed_out {
             completion_marker_hit |= marker_seen_in_output(spec, &stdout, &stderr);
         }
-        Ok(CommandOutput {
-            status,
-            timed_out,
-            completion_marker_hit,
-            duration: started.elapsed(),
-            stdout,
-            stderr,
+        Ok(ObservedOutput {
+            output: CommandOutput {
+                status,
+                timed_out,
+                completion_marker_hit,
+                duration: started.elapsed(),
+                stdout,
+                stderr,
+            },
+            idle_timed_out,
         })
     }
+}
+
+fn open_log(path: Option<&Path>, stream: &'static str) -> Result<Option<File>, CommandError> {
+    path.map(File::create)
+        .transpose()
+        .map_err(|source| CommandError::Capture { stream, source })
+}
+
+/// What a reader thread does with each chunk besides capturing it.
+struct Observer {
+    echo_prefix: Option<String>,
+    pending_line: Vec<u8>,
+    log: Option<File>,
+    last_output: Arc<Mutex<Instant>>,
+}
+
+impl Observer {
+    fn new(options: &RunOptions, log: Option<File>, last_output: &Arc<Mutex<Instant>>) -> Self {
+        Self {
+            echo_prefix: options.echo_prefix.clone(),
+            pending_line: Vec::new(),
+            log,
+            last_output: Arc::clone(last_output),
+        }
+    }
+
+    fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
+        *self.last_output.lock().unwrap() = Instant::now();
+        if let Some(log) = &mut self.log {
+            log.write_all(bytes)?;
+            log.flush()?;
+        }
+        if let Some(prefix) = &self.echo_prefix {
+            self.pending_line.extend_from_slice(bytes);
+            while let Some(end) = self.pending_line.iter().position(|&byte| byte == b'\n') {
+                let line: Vec<u8> = self.pending_line.drain(..=end).collect();
+                echo_line(prefix, &line);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        if let Some(prefix) = &self.echo_prefix
+            && !self.pending_line.is_empty()
+        {
+            let mut line = core::mem::take(&mut self.pending_line);
+            line.push(b'\n');
+            echo_line(prefix, &line);
+        }
+    }
+}
+
+/// Writes one line to stderr. Echo is best effort: a closed stderr must not fail the command.
+fn echo_line(prefix: &str, line: &[u8]) {
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(prefix.as_bytes());
+    let _ = stderr.write_all(line);
 }
 
 fn configured_command(spec: &CommandSpec, stdout: Stdio, stderr: Stdio) -> Command {
@@ -403,15 +539,19 @@ fn interrupt(_child: &GroupChild) {}
 fn spawn_reader(
     mut reader: impl Read + Send + 'static,
     capture: Arc<Mutex<Vec<u8>>>,
+    mut observer: Observer,
 ) -> thread::JoinHandle<io::Result<()>> {
     thread::spawn(move || {
         let mut chunk = [0_u8; 1024];
         loop {
             let count = reader.read(&mut chunk)?;
             if count == 0 {
+                observer.finish();
                 return Ok(());
             }
-            capture.lock().unwrap().extend_from_slice(&chunk[..count]);
+            let bytes = &chunk[..count];
+            capture.lock().unwrap().extend_from_slice(bytes);
+            observer.chunk(bytes)?;
         }
     })
 }
@@ -521,6 +661,47 @@ mod tests {
         assert!(output.timed_out);
         assert!(!output.success());
         assert!(output.duration < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn idle_timeout_ends_a_silent_command_and_keeps_its_output_in_the_logs() {
+        let dir = std::env::temp_dir().join(format!("krabi-caliper-idle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = RunOptions::new()
+            .idle_timeout(Some(Duration::from_millis(500)))
+            .logs(dir.join("stdout.log"), dir.join("stderr.log"));
+        let observed = CommandRunner
+            .run_with(
+                &CommandSpec::new("sh", ".")
+                    .args(["-c", "echo partial; echo warn >&2; exec sleep 10"])
+                    .timeout(Duration::from_secs(20)),
+                &options,
+            )
+            .unwrap();
+
+        assert!(observed.idle_timed_out);
+        assert!(observed.output.timed_out);
+        assert!(observed.output.duration < Duration::from_secs(5));
+        assert_eq!(observed.output.stdout, b"partial\n");
+        assert_eq!(std::fs::read(dir.join("stdout.log")).unwrap(), b"partial\n");
+        assert_eq!(std::fs::read(dir.join("stderr.log")).unwrap(), b"warn\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn idle_timeout_spares_a_command_that_keeps_writing() {
+        let observed = CommandRunner
+            .run_with(
+                &CommandSpec::new("sh", ".")
+                    .args(["-c", "for i in 1 2 3 4; do echo $i; sleep 0.3; done"])
+                    .timeout(Duration::from_secs(20)),
+                &RunOptions::new().idle_timeout(Some(Duration::from_secs(1))),
+            )
+            .unwrap();
+
+        assert!(!observed.idle_timed_out);
+        assert!(observed.output.success());
+        assert_eq!(observed.output.stdout, b"1\n2\n3\n4\n");
     }
 
     #[test]

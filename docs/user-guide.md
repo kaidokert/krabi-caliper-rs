@@ -91,9 +91,24 @@ cargo krabi-caliper validate-config
 cargo krabi-caliper run smoke
 ```
 
-Commands are announced by default and complete stdout and stderr are retained
-for failed builds and runs. Use `--silent` only when command announcements are
-not wanted.
+Commands are announced on stderr by default. While a case's prepare and run
+commands execute:
+
+- each line they print is copied to stderr after a `[case-id]` prefix;
+- their stdout and stderr are written to the case directory as they arrive
+  (`raw-stdout.log` and `raw-stderr.log` for the run command);
+- the campaign's `report.md`, `report.csv` and `results.json` are rewritten
+  after every case.
+
+A killed or hung campaign therefore still leaves the output it produced in the
+job log and on disk. `--silent` turns off the announcements and the copy to
+stderr; stdout carries only the campaign report.
+
+`timeout-seconds` bounds a whole command. A profile can also set
+`idle-timeout-seconds` to stop a command that has printed nothing on stdout or
+stderr for that long, such as a probe session waiting for RTT output that never
+comes. It is reported as `timed-out`, with the idle limit in the reason. Set it
+above the longest silent stretch of a healthy run, flashing included.
 
 An emulator, probe or host process can fail for reasons unrelated to the
 firmware. A campaign can run such a case again:
