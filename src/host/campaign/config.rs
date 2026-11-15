@@ -565,6 +565,7 @@ pub enum RunnerKind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum RunnerPreset {
     QemuCortexM0,
     QemuCortexM3,
