@@ -1,6 +1,6 @@
 [package]
 name = "krabi-caliper"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Portable measurement primitives for embedded targets and host-side analysis"
@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/kaidokert/krabi-caliper-rs"
 keywords = ["embedded", "benchmark", "no-std", "profiling"]
 categories = ["embedded", "no-std", "development-tools::profiling"]
-exclude = [".github/actions/**", ".github/workflows/hw-ct.yml"]
+exclude = [".github/**", "hw-runner/**"]
 
 [package.metadata.docs.rs]
 all-features = true
