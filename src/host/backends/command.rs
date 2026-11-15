@@ -24,6 +24,7 @@ pub enum CompletionAction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct CommandSpec {
     pub program: OsString,
     pub args: Vec<OsString>,
@@ -31,9 +32,17 @@ pub struct CommandSpec {
     pub env: Vec<(OsString, OsString)>,
     pub env_remove: Vec<OsString>,
     pub timeout: Duration,
+    /// End the command once it has written nothing to stdout or stderr for this long.
+    pub idle_timeout: Option<Duration>,
     pub completion_marker: Option<Vec<u8>>,
     pub completion_action: CompletionAction,
     pub silent: bool,
+    /// Copy each complete output line to this process's stderr as it arrives, after this prefix.
+    pub echo_prefix: Option<String>,
+    /// Write stdout to this file as it arrives; created or truncated when the command starts.
+    pub stdout_log: Option<PathBuf>,
+    /// Write stderr to this file as it arrives; created or truncated when the command starts.
+    pub stderr_log: Option<PathBuf>,
 }
 
 impl CommandSpec {
@@ -45,9 +54,13 @@ impl CommandSpec {
             env: Vec::new(),
             env_remove: Vec::new(),
             timeout: Duration::from_secs(60),
+            idle_timeout: None,
             completion_marker: None,
             completion_action: CompletionAction::Kill,
             silent: false,
+            echo_prefix: None,
+            stdout_log: None,
+            stderr_log: None,
         }
     }
 
@@ -73,6 +86,22 @@ impl CommandSpec {
 
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub const fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    pub fn echo_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.echo_prefix = Some(prefix.into());
+        self
+    }
+
+    pub fn logs(mut self, stdout: impl Into<PathBuf>, stderr: impl Into<PathBuf>) -> Self {
+        self.stdout_log = Some(stdout.into());
+        self.stderr_log = Some(stderr.into());
         self
     }
 
@@ -123,9 +152,13 @@ impl CommandSpec {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CommandOutput {
     pub status: Option<ExitStatus>,
+    /// The command was ended by its timeout or its idle timeout.
     pub timed_out: bool,
+    /// The command was ended by [`CommandSpec::idle_timeout`].
+    pub idle_timed_out: bool,
     pub completion_marker_hit: bool,
     pub duration: Duration,
     pub stdout: Vec<u8>,
@@ -154,54 +187,6 @@ impl CommandOutput {
         output.push_str(&self.stderr_lossy());
         output
     }
-}
-
-/// How [`CommandRunner::run_with`] observes a command while it runs.
-#[derive(Clone, Debug, Default)]
-#[non_exhaustive]
-pub struct RunOptions {
-    /// Copy each complete line of the command's stdout and stderr to this process's stderr as it
-    /// arrives, after this prefix.
-    pub echo_prefix: Option<String>,
-    /// End the command once it has written nothing to stdout or stderr for this long.
-    pub idle_timeout: Option<Duration>,
-    /// Append the command's stdout to this file as it arrives.
-    pub stdout_log: Option<PathBuf>,
-    /// Append the command's stderr to this file as it arrives.
-    pub stderr_log: Option<PathBuf>,
-}
-
-impl RunOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn echo_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.echo_prefix = Some(prefix.into());
-        self
-    }
-
-    pub const fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.idle_timeout = timeout;
-        self
-    }
-
-    /// Writes stdout and stderr to these files while the command runs. The files are created or
-    /// truncated when the command starts.
-    pub fn logs(mut self, stdout: impl Into<PathBuf>, stderr: impl Into<PathBuf>) -> Self {
-        self.stdout_log = Some(stdout.into());
-        self.stderr_log = Some(stderr.into());
-        self
-    }
-}
-
-/// A command's output from [`CommandRunner::run_with`].
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct ObservedOutput {
-    pub output: CommandOutput,
-    /// The command was ended by [`RunOptions::idle_timeout`]; `output.timed_out` is also set.
-    pub idle_timed_out: bool,
 }
 
 #[derive(Debug)]
@@ -335,18 +320,8 @@ impl CommandRunner {
     }
 
     pub fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, CommandError> {
-        Ok(self.run_with(spec, &RunOptions::default())?.output)
-    }
-
-    /// Runs a command like [`run`](Self::run), and also echoes, logs or idle-limits it as
-    /// `options` asks.
-    pub fn run_with(
-        &self,
-        spec: &CommandSpec,
-        options: &RunOptions,
-    ) -> Result<ObservedOutput, CommandError> {
-        let stdout_log = open_log(options.stdout_log.as_deref(), "stdout")?;
-        let stderr_log = open_log(options.stderr_log.as_deref(), "stderr")?;
+        let stdout_log = open_log(spec.stdout_log.as_deref(), "stdout")?;
+        let stderr_log = open_log(spec.stderr_log.as_deref(), "stderr")?;
         let started = Instant::now();
         let mut child = self.spawn(spec, Stdio::piped(), Stdio::piped())?;
         let display = String::from(child.display());
@@ -366,12 +341,12 @@ impl CommandRunner {
         let stdout_thread = spawn_reader(
             stdout,
             Arc::clone(&stdout_capture),
-            Observer::new(options, stdout_log, &last_output),
+            Observer::new(spec, stdout_log, &last_output),
         );
         let stderr_thread = spawn_reader(
             stderr,
             Arc::clone(&stderr_capture),
-            Observer::new(options, stderr_log, &last_output),
+            Observer::new(spec, stderr_log, &last_output),
         );
         let idle = |limit: Duration| last_output.lock().unwrap().elapsed() >= limit;
 
@@ -390,7 +365,7 @@ impl CommandRunner {
                     let status = child.terminate()?;
                     break (Some(status), true, false, false);
                 }
-                Ok(None) if options.idle_timeout.is_some_and(idle) => {
+                Ok(None) if spec.idle_timeout.is_some_and(idle) => {
                     let status = child.terminate()?;
                     break (Some(status), true, false, true);
                 }
@@ -412,16 +387,14 @@ impl CommandRunner {
         if !timed_out {
             completion_marker_hit |= marker_seen_in_output(spec, &stdout, &stderr);
         }
-        Ok(ObservedOutput {
-            output: CommandOutput {
-                status,
-                timed_out,
-                completion_marker_hit,
-                duration: started.elapsed(),
-                stdout,
-                stderr,
-            },
+        Ok(CommandOutput {
+            status,
+            timed_out,
             idle_timed_out,
+            completion_marker_hit,
+            duration: started.elapsed(),
+            stdout,
+            stderr,
         })
     }
 }
@@ -441,9 +414,9 @@ struct Observer {
 }
 
 impl Observer {
-    fn new(options: &RunOptions, log: Option<File>, last_output: &Arc<Mutex<Instant>>) -> Self {
+    fn new(spec: &CommandSpec, log: Option<File>, last_output: &Arc<Mutex<Instant>>) -> Self {
         Self {
-            echo_prefix: options.echo_prefix.clone(),
+            echo_prefix: spec.echo_prefix.clone(),
             pending_line: Vec::new(),
             log,
             last_output: Arc::clone(last_output),
@@ -667,22 +640,20 @@ mod tests {
     fn idle_timeout_ends_a_silent_command_and_keeps_its_output_in_the_logs() {
         let dir = std::env::temp_dir().join(format!("krabi-caliper-idle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let options = RunOptions::new()
-            .idle_timeout(Some(Duration::from_millis(500)))
-            .logs(dir.join("stdout.log"), dir.join("stderr.log"));
-        let observed = CommandRunner
-            .run_with(
+        let output = CommandRunner
+            .run(
                 &CommandSpec::new("sh", ".")
                     .args(["-c", "echo partial; echo warn >&2; exec sleep 10"])
-                    .timeout(Duration::from_secs(20)),
-                &options,
+                    .timeout(Duration::from_secs(20))
+                    .idle_timeout(Some(Duration::from_millis(500)))
+                    .logs(dir.join("stdout.log"), dir.join("stderr.log")),
             )
             .unwrap();
 
-        assert!(observed.idle_timed_out);
-        assert!(observed.output.timed_out);
-        assert!(observed.output.duration < Duration::from_secs(5));
-        assert_eq!(observed.output.stdout, b"partial\n");
+        assert!(output.idle_timed_out);
+        assert!(output.timed_out);
+        assert!(output.duration < Duration::from_secs(5));
+        assert_eq!(output.stdout, b"partial\n");
         assert_eq!(std::fs::read(dir.join("stdout.log")).unwrap(), b"partial\n");
         assert_eq!(std::fs::read(dir.join("stderr.log")).unwrap(), b"warn\n");
         std::fs::remove_dir_all(dir).unwrap();
@@ -690,18 +661,18 @@ mod tests {
 
     #[test]
     fn idle_timeout_spares_a_command_that_keeps_writing() {
-        let observed = CommandRunner
-            .run_with(
+        let output = CommandRunner
+            .run(
                 &CommandSpec::new("sh", ".")
                     .args(["-c", "for i in 1 2 3 4; do echo $i; sleep 0.3; done"])
-                    .timeout(Duration::from_secs(20)),
-                &RunOptions::new().idle_timeout(Some(Duration::from_secs(1))),
+                    .timeout(Duration::from_secs(20))
+                    .idle_timeout(Some(Duration::from_secs(1))),
             )
             .unwrap();
 
-        assert!(!observed.idle_timed_out);
-        assert!(observed.output.success());
-        assert_eq!(observed.output.stdout, b"1\n2\n3\n4\n");
+        assert!(!output.idle_timed_out);
+        assert!(output.success());
+        assert_eq!(output.stdout, b"1\n2\n3\n4\n");
     }
 
     #[test]

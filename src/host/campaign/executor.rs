@@ -26,28 +26,25 @@ impl CampaignExecutor {
     /// Runs a case's prepare or run command. Its output goes to `<stem>-stdout.log` and
     /// `<stem>-stderr.log` in the case directory as it arrives and, unless `silent`, to stderr
     /// line by line after `[label]`, so a hung or killed session still leaves its output behind.
-    /// Returns the idle limit when that is what ended the command.
     fn run_observed(
         &self,
-        spec: &CommandSpec,
+        spec: CommandSpec,
         profile: &ResolvedRunnerProfile,
         case_dir: &Path,
         stem: &str,
         label: &str,
         silent: bool,
-    ) -> Result<(CommandOutput, Option<Duration>), CampaignError> {
-        let idle = profile.idle_timeout_seconds.map(Duration::from_secs);
-        let mut options = RunOptions::new()
-            .idle_timeout(idle)
+    ) -> Result<CommandOutput, CampaignError> {
+        let mut spec = spec
+            .idle_timeout(profile.idle_timeout_seconds.map(Duration::from_secs))
             .logs(
                 case_dir.join(format!("{stem}-stdout.log")),
                 case_dir.join(format!("{stem}-stderr.log")),
             );
         if !silent {
-            options = options.echo_prefix(format!("[{label}] "));
+            spec = spec.echo_prefix(format!("[{label}] "));
         }
-        let observed = self.runner.run_with(spec, &options)?;
-        Ok((observed.output, idle.filter(|_| observed.idle_timed_out)))
+        Ok(self.runner.run(&spec)?)
     }
 
     pub fn build_prepared(
@@ -478,8 +475,8 @@ impl CampaignExecutor {
         for (index, prepare) in profile.prepare.iter().enumerate() {
             let spec = configured_runner_command(prepare, workspace, &built_artifact).silent(silent);
             prepare_commands.push(spec.display());
-            let (output, idle) = self.run_observed(
-                &spec,
+            let output = self.run_observed(
+                spec,
                 profile,
                 &case_dir,
                 &format!("prepare-{index}"),
@@ -508,7 +505,7 @@ impl CampaignExecutor {
                     } else {
                         CaseStatus::RunFailed
                     },
-                    error: Some(command_failure_reason("prepare command", &output, idle)),
+                    error: Some(command_failure_reason("prepare command", &output, profile.idle_timeout_seconds)),
                     stdout: output.stdout_lossy(),
                     stderr: output.stderr_lossy(),
                     result: None,
@@ -524,15 +521,14 @@ impl CampaignExecutor {
         }
         let run = runner_spec(profile, workspace, case, &built_artifact)?.silent(silent);
         let run_display = run.display();
-        let (run_output, idle) =
-            self.run_observed(&run, profile, &case_dir, "raw", &case.id, silent)?;
+        let run_output = self.run_observed(run, profile, &case_dir, "raw", &case.id, silent)?;
         let combined = run_output.combined_lossy();
         let parsed = parse(&combined).map(|mut result| {
             result.correlate_external(profile.require_external_measurements);
             enrich_result(&mut result, campaign_name, profile_name, case, &environment);
             result
         });
-        let (status, error, result) = classify_run(profile, case, &run_output, idle, parsed);
+        let (status, error, result) = classify_run(profile, case, &run_output, parsed);
         if let Some(result) = &result {
             write_text(
                 &case_dir.join("result.json"),
@@ -618,8 +614,8 @@ impl CampaignExecutor {
         for (index, prepare) in profile.prepare.iter().enumerate() {
             let spec = configured_runner_command(prepare, workspace, artifact).silent(silent);
             prepare_commands.push(spec.display());
-            let (output, idle) = self.run_observed(
-                &spec,
+            let output = self.run_observed(
+                spec,
                 profile,
                 &case_dir,
                 &format!("prepare-{index}"),
@@ -648,7 +644,7 @@ impl CampaignExecutor {
                     } else {
                         CaseStatus::RunFailed
                     },
-                    error: Some(command_failure_reason("prepare command", &output, idle)),
+                    error: Some(command_failure_reason("prepare command", &output, profile.idle_timeout_seconds)),
                     stdout: output.stdout_lossy(),
                     stderr: output.stderr_lossy(),
                     result: None,
@@ -664,8 +660,7 @@ impl CampaignExecutor {
         }
         let run = runner_spec(profile, workspace, case, artifact)?.silent(silent);
         let run_display = run.display();
-        let (run_output, idle) =
-            self.run_observed(&run, profile, &case_dir, "raw", &case.id, silent)?;
+        let run_output = self.run_observed(run, profile, &case_dir, "raw", &case.id, silent)?;
         let combined = run_output.combined_lossy();
         let parsed = parse(&combined).map(|mut result| {
             result.correlate_external(profile.require_external_measurements);
@@ -678,7 +673,7 @@ impl CampaignExecutor {
             );
             result
         });
-        let (status, error, result) = classify_run(profile, case, &run_output, idle, parsed);
+        let (status, error, result) = classify_run(profile, case, &run_output, parsed);
         if let Some(result) = &result {
             write_text(
                 &case_dir.join("result.json"),
@@ -1436,20 +1431,19 @@ fn classify_run(
     profile: &ResolvedRunnerProfile,
     case: &ExpandedCase,
     output: &CommandOutput,
-    idle: Option<Duration>,
     parsed: Result<RunResult, super::ParseError>,
 ) -> (CaseStatus, Option<String>, Option<RunResult>) {
     if output.timed_out {
         return (
             CaseStatus::TimedOut,
-            Some(command_failure_reason("runner command", output, idle)),
+            Some(command_failure_reason("runner command", output, profile.idle_timeout_seconds)),
             parsed.ok(),
         );
     }
     if !output.success() {
         return (
             CaseStatus::RunFailed,
-            Some(command_failure_reason("runner command", output, idle)),
+            Some(command_failure_reason("runner command", output, profile.idle_timeout_seconds)),
             parsed.ok(),
         );
     }
@@ -1710,12 +1704,12 @@ fn write_case_artifacts(path: &Path, report: &CaseReport) -> Result<(), Campaign
     Ok(())
 }
 
-/// `idle` is the idle limit that ended the command, if that is what ended it.
-fn command_failure_reason(phase: &str, output: &CommandOutput, idle: Option<Duration>) -> String {
-    if let Some(idle) = idle {
+/// `idle_seconds` is the idle limit the command ran under, for the reason when it ended it.
+fn command_failure_reason(phase: &str, output: &CommandOutput, idle_seconds: Option<u64>) -> String {
+    if output.idle_timed_out {
         format!(
             "{phase} wrote no output for {} s and was stopped after {:.1} seconds",
-            idle.as_secs(),
+            idle_seconds.unwrap_or_default(),
             output.duration.as_secs_f64()
         )
     } else if output.timed_out {

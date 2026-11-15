@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use super::render::format_duration;
 use super::{
     BuildMetadata, CommandError, CommandOutput, CommandRunner, CommandSpec, CompletionAction,
-    ElfFootprint, MetricPolicy, RunOptions, RunResult, RunStatus, SourceMetadata, TargetMetadata,
-    parse, read_elf_footprint, render_json, render_markdown,
+    ElfFootprint, MetricPolicy, RunResult, RunStatus, SourceMetadata, TargetMetadata, parse,
+    read_elf_footprint, render_json, render_markdown,
 };
 
 include!("campaign/config.rs");
