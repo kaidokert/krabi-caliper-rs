@@ -1,6 +1,9 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![cfg_attr(target_arch = "avr", feature(asm_experimental_arch))]
+#![cfg_attr(
+    all(target_arch = "avr", feature = "avr", feature = "stack"),
+    feature(asm_experimental_arch)
+)]
 
 //! Architecture-neutral measurement values and fixed-capacity samples.
 //!
@@ -27,7 +30,7 @@ pub use core::deterministic;
 pub use core::footprint::FootprintError;
 #[cfg(feature = "paired")]
 pub use core::paired;
-pub use core::sample::{SampleSet, Summary, SummaryError};
+pub use core::sample::{PushError, SampleSet, Summary, SummaryError};
 #[cfg(feature = "stack")]
 pub use core::stack;
 #[cfg(feature = "paired")]

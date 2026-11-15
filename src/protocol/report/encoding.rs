@@ -204,7 +204,7 @@ fn write_sample_ufmt<W: ufmt::uWrite + ?Sized>(
         record.fixture,
         record.side,
         record.index,
-        record.ticks,
+        Decimal(record.ticks),
         record.wrapped as u8,
     )
     .map_err(UfmtReportError::Writer)?;
@@ -239,11 +239,11 @@ fn write_comparison_ufmt<W: ufmt::uWrite + ?Sized>(
     ufmt::uwrite!(
         writer,
         " a_min:{} a_max:{} b_min:{} b_max:{} spread:{} overlap:{} wrapped:{} output_ok:{}",
-        record.a_min,
-        record.a_max,
-        record.b_min,
-        record.b_max,
-        record.spread,
+        Decimal(record.a_min),
+        Decimal(record.a_max),
+        Decimal(record.b_min),
+        Decimal(record.b_max),
+        Decimal(record.spread),
         record.overlap as u8,
         record.wrapped as u8,
         record.output_ok as u8,
@@ -327,14 +327,11 @@ fn write_measurement_ufmt_indexed<W: ufmt::uWrite + ?Sized>(
         "EM_MEASUREMENT schema:{} benchmark:{} ticks:{} unit:{} frequency_hz:",
         SCHEMA_VERSION,
         record.benchmark,
-        record.measurement.ticks,
+        Decimal(record.measurement.ticks),
         unit_name(record.measurement.unit),
     )
     .map_err(UfmtReportError::Writer)?;
-    match record.measurement.frequency_hz {
-        Some(value) => ufmt::uwrite!(writer, "{}", value).map_err(UfmtReportError::Writer)?,
-        None => ufmt::uWrite::write_str(writer, "none").map_err(UfmtReportError::Writer)?,
-    }
+    write_optional_u64_ufmt(writer, record.measurement.frequency_hz)?;
     ufmt::uwrite!(writer, " wrapped:{}", record.measurement.wrapped as u8)
         .map_err(UfmtReportError::Writer)?;
     if let Some(trial) = trial {
@@ -404,7 +401,7 @@ fn write_counter_snapshot_ufmt<W: ufmt::uWrite + ?Sized>(
         record.benchmark,
         record.trial,
         phase_name(record.phase),
-        record.ticks,
+        Decimal(record.ticks),
         record.width_bits,
         unit_name(record.unit),
     )
@@ -431,7 +428,7 @@ fn write_metric_ufmt<W: ufmt::uWrite + ?Sized>(
         SCHEMA_VERSION,
         record.benchmark,
         record.name,
-        record.value,
+        Decimal(record.value),
         record.unit.unwrap_or("none"),
         record.policy.as_str(),
     )
@@ -447,13 +444,72 @@ pub enum UfmtReportError<E> {
     InvalidToken,
 }
 
+/// A `u64` printed in decimal by repeated subtraction of powers of ten.
+///
+/// `ufmt`'s own `u64` formatting divides by ten in 64-bit arithmetic, which on a target without a
+/// 64-bit divider links the 64-bit division helpers (`__udivdi3`/`__umoddi3` on AVR,
+/// `__aeabi_uldivmod` on Armv6-M) into every image that reports a measurement. This needs only
+/// 64-bit compare, subtract, shift and add, which those targets inline: at most nine
+/// subtractions per digit, 20 digits. CI checks the Armv6-M build of this module for a 64-bit
+/// division call.
+///
+/// Each power of ten is computed when it is needed. A table of them would be read-only data,
+/// which AVR copies into RAM at startup: 160 bytes for 20 `u64`s. Computing the power for each
+/// digit costs `n(n-1)/2` multiplications by ten, each two shifts and an add, for an `n`-digit
+/// value: 45 for 10 digits, 190 for 20. Values are printed after measurement, outside any
+/// measured window.
+#[cfg(feature = "ufmt")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Decimal(pub(crate) u64);
+
+#[cfg(feature = "ufmt")]
+impl ufmt::uDisplay for Decimal {
+    fn fmt<W: ufmt::uWrite + ?Sized>(
+        &self,
+        formatter: &mut ufmt::Formatter<'_, W>,
+    ) -> Result<(), W::Error> {
+        let mut rest = self.0;
+        // The exponent of the leading digit: the largest `top` with 10^top <= the value.
+        let mut top = 0_u32;
+        let mut power = 1_u64;
+        // 10^19 is the largest power that fits in a u64, so `power` stops there.
+        while top < 19 && times_ten(power) <= rest {
+            power = times_ten(power);
+            top += 1;
+        }
+        for exponent in (0..=top).rev() {
+            if exponent != top {
+                power = 1;
+                for _ in 0..exponent {
+                    power = times_ten(power);
+                }
+            }
+            let mut digit = 0_u8;
+            while rest >= power {
+                rest -= power;
+                // At most 9, and 1 for the top power: `u64::MAX` is below 2 * 10^19.
+                digit = digit.wrapping_add(1);
+            }
+            formatter.write_char(char::from(b'0'.wrapping_add(digit)))?;
+        }
+        Ok(())
+    }
+}
+
+/// `value * 10` as two shifts and an add: a 64-bit multiply is a libgcc call (`__muldi3`) on AVR.
+/// Callers stay at or below 10^19, which does not overflow.
+#[cfg(feature = "ufmt")]
+fn times_ten(value: u64) -> u64 {
+    (value << 3).wrapping_add(value << 1)
+}
+
 #[cfg(feature = "ufmt")]
 fn write_optional_u64_ufmt<W: ufmt::uWrite + ?Sized>(
     writer: &mut W,
     value: Option<u64>,
 ) -> Result<(), UfmtReportError<W::Error>> {
     match value {
-        Some(value) => ufmt::uwrite!(writer, "{}", value).map_err(UfmtReportError::Writer),
+        Some(value) => ufmt::uwrite!(writer, "{}", Decimal(value)).map_err(UfmtReportError::Writer),
         None => ufmt::uWrite::write_str(writer, "none").map_err(UfmtReportError::Writer),
     }
 }
@@ -470,7 +526,7 @@ fn write_fields_ufmt<W: ufmt::uWrite + ?Sized>(
                 ufmt::uWrite::write_str(writer, value).map_err(UfmtReportError::Writer)?;
             }
             FieldValue::U64(value) => {
-                ufmt::uwrite!(writer, "{}", value).map_err(UfmtReportError::Writer)?;
+                ufmt::uwrite!(writer, "{}", Decimal(value)).map_err(UfmtReportError::Writer)?;
             }
             FieldValue::Bool(value) => {
                 ufmt::uWrite::write_str(writer, if value { "1" } else { "0" })

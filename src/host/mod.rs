@@ -11,6 +11,8 @@ pub mod ct_asm;
 #[cfg(feature = "ctgrind")]
 pub mod ctgrind;
 mod elf;
+pub mod elf_audit;
+pub mod exec_trace;
 pub mod isa;
 mod model;
 #[cfg(feature = "campaign")]
