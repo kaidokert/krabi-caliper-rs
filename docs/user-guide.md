@@ -110,6 +110,11 @@ stderr for that long, such as a probe session waiting for RTT output that never
 comes. It is reported as `timed-out`, with the idle limit in the reason. Set it
 above the longest silent stretch of a healthy run, flashing included.
 
+A campaign runs every case even after one fails. Set
+`continue-on-failure = false` on the campaign to stop at the first case that
+does not pass, which suits a CI gate where one dead session would otherwise
+repeat its timeout for every remaining case.
+
 An emulator, probe or host process can fail for reasons unrelated to the
 firmware. A campaign can run such a case again:
 
