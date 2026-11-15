@@ -35,7 +35,7 @@ inputs:
   caliper-version:
     description: Exact krabi-caliper CLI version required in the runner image
     required: false
-    default: 0.1.3
+    default: 0.2.2
 
 runs:
   using: composite
@@ -63,7 +63,7 @@ runs:
         }
         expected="krabi-caliper v${KRABI_ACTION_CALIPER_VERSION}:"
         cargo install --list | grep -Fx "$expected" >/dev/null || {
-          echo "::error::runner does not provide $expected"
+          echo "::error::runner does not provide $expected; set caliper-version to the krabi-caliper version the container image provides"
           cargo install --list
           exit 1
         }

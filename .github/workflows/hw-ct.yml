@@ -39,7 +39,7 @@ on:
       container-image:
         description: Hardware job image
         required: false
-        default: 127.0.0.1:5000/pi-hw-runner:caliper-0.1.3-probe-rs-0.32.0-kk.1-trixie
+        default: ghcr.io/kaidokert/krabi-hw-runner:caliper-0.2.2-probe-rs-0.32.0-kk.2-trixie-844dfaa6d40e
         type: string
       container-options:
         description: Docker options for probe access and CPU control
@@ -59,7 +59,7 @@ on:
       caliper-version:
         description: Exact krabi-caliper CLI version used for build and run
         required: false
-        default: 0.1.3
+        default: 0.2.2
         type: string
       opt-level:
         description: Release opt-level override for prepared builds (empty keeps the profile's)
