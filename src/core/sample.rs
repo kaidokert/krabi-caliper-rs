@@ -3,8 +3,8 @@ use crate::{Measurement, Unit};
 /// Fixed-capacity measurements from one counter, collected without allocation.
 ///
 /// Every sample in a set shares the unit and frequency of the first one; [`push`](Self::push)
-/// rejects a sample that does not. So the set stores, per sample, only its tick count and whether
-/// it wrapped: `9 * N` bytes plus a few words, rather than a whole [`Measurement`] each.
+/// rejects a sample that does not. Per sample the set stores only the tick count and the wrap
+/// flag, `9 * N` bytes, plus one shared unit, frequency and length.
 //
 // The derived equality relies on two invariants: slots at and past `len` are never written, so
 // they stay 0 and false, and an empty set keeps `CoreCycles` and `None`. Anything that removes
@@ -144,12 +144,11 @@ impl<const N: usize> SampleSet<N> {
     /// Returns the `index`-th smallest tick count, counting from zero, as a measurement.
     ///
     /// The set must be non-empty. The result carries the set's unit and frequency, and `wrapped`
-    /// is set if any sample in the set wrapped, as for [`summary`](Self::summary): a selected
-    /// value is only as trustworthy as the set it was selected from.
+    /// is set if any sample in the set wrapped, as for [`summary`](Self::summary).
     ///
-    /// The selection counts in place instead of sorting: no copy of the set, no allocator and
-    /// no panic path, in O(len²) comparisons. That suits the small fixed capacities a target
-    /// collects; for large sets on a host, sort the ticks instead.
+    /// Selection counts in place in O(len²) comparisons, with no copy of the set and no
+    /// allocator, which suits the small capacities a target collects. For large sets on a host,
+    /// sort [`ticks`](Self::ticks) instead.
     pub fn order_statistic(&self, index: usize) -> Result<Measurement, SummaryError> {
         let mut result = self.qualification()?;
         if index >= self.len {
@@ -378,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn stores_ticks_and_wrap_flags_rather_than_whole_measurements() {
+    fn stores_only_ticks_and_wrap_flags_per_sample() {
         // Per sample, a u64 and a bool; then the length, the shared unit and frequency, and at
         // most 7 bytes of padding after the flags.
         use core::mem::size_of;
@@ -499,7 +498,7 @@ mod tests {
         assert_eq!(decoded, samples);
         assert!(serde_json::from_str::<SampleSet<1>>(&encoded).is_err());
 
-        // A mixed set, which the earlier layout could hold, is refused with the reason.
+        // A set mixing units is refused, and the error says which field differs.
         let mut mixed: std::vec::Vec<_> = samples.iter().collect();
         mixed.push(Measurement::new(5, Unit::TimerTicks).with_frequency(48_000_000));
         let encoded = serde_json::to_string(&mixed).unwrap();

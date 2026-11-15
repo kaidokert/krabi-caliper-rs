@@ -41,14 +41,14 @@ types.
 
 Target facilities include:
 
-- allocation-free measurements, samples, summaries, and repeated benchmarks.
-  A `SampleSet` holds samples from one counter: `push` rejects a measurement
-  whose unit or frequency differs from the first, so the set stores only each
-  sample's ticks and wrap flag (9 bytes per sample);
-- order statistics on a `SampleSet`: `median` (the upper median, always an
-  observed value), `percentile` (nearest rank) and `order_statistic`. They
-  select in place in O(len²) comparisons, with no copy, sort or allocator,
-  and report `wrapped` for the whole set, as `summary` does;
+- allocation-free measurements, samples, summaries, and repeated benchmarks;
+- `SampleSet`, which holds samples from one counter. `push` rejects a
+  measurement whose unit or frequency differs from the first, so the set
+  stores only each sample's ticks and wrap flag;
+- order statistics on a `SampleSet`: `median` (the upper median),
+  `percentile` (nearest rank) and `order_statistic`. Each returns an observed
+  value, selects in place without an allocator, and sets `wrapped` if any
+  sample in the set wrapped, as `summary` does;
 - stack painting through an application-supplied memory contract;
 - Cortex-M SysTick and DWT, RISC-V cycle/instruction CSRs, and ATmega2560
   Timer1 adapters (Timer1 at a chosen prescaler, `Timer1Prescale`, from `/1`

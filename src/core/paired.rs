@@ -1,4 +1,4 @@
-use crate::{Measurement, SampleSet, Summary, SummaryError};
+use crate::{Measurement, PushError, SampleSet, Summary, SummaryError};
 
 /// Input class selected for one paired measurement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,9 +137,10 @@ impl<const N: usize> PairedRunner<N> {
                     samples
                         .push(side, measurement)
                         .map_err(|error| match error {
-                            crate::PushError::Full(_) => RunError::CapacityExceeded,
-                            crate::PushError::UnitMismatch(_)
-                            | crate::PushError::FrequencyMismatch(_) => RunError::MixedSamples,
+                            PushError::Full(_) => RunError::CapacityExceeded,
+                            PushError::UnitMismatch(_) | PushError::FrequencyMismatch(_) => {
+                                RunError::MixedSamples
+                            }
                         })?;
                 }
             }
@@ -241,7 +242,7 @@ impl<const N: usize> PairedSamples<N> {
         }
     }
 
-    pub fn push(&mut self, side: Side, measurement: Measurement) -> Result<(), crate::PushError> {
+    pub fn push(&mut self, side: Side, measurement: Measurement) -> Result<(), PushError> {
         match side {
             Side::A => self.a.push(measurement),
             Side::B => self.b.push(measurement),
@@ -455,6 +456,22 @@ mod tests {
             }),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn runner_reports_mixed_units_on_one_side() {
+        let mut measured = 0;
+        let run = PairedRunner::<2>::new().warmup_blocks(0).run(|_| {
+            measured += 1;
+            // The fourth sample is side A's second, in ABBA order.
+            let unit = if measured == 4 {
+                Unit::TimerTicks
+            } else {
+                Unit::CoreCycles
+            };
+            (Measurement::new(1, unit), true)
+        });
+        assert_eq!(run, Err(RunError::MixedSamples));
     }
 
     #[test]
