@@ -5,6 +5,7 @@ use crate::stack::StackError;
 
 /// Failure to acquire or report a target footprint measurement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum FootprintError<E> {
     /// The architecture counter required by the lifecycle is unavailable.
     CounterUnavailable,

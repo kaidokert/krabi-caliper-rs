@@ -17,6 +17,7 @@ use command_group::{Signal, UnixChildExt};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum CompletionAction {
     #[default]
     Kill,
@@ -190,6 +191,7 @@ impl CommandOutput {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CommandError {
     Spawn {
         command: String,

@@ -334,6 +334,7 @@ fn matrix_campaign() -> CampaignConfig {
         continue_on_failure: true,
         artifact_dir: None,
         retry: RetryPolicy::default(),
+        time_budget_seconds: None,
     }
 }
 
@@ -1306,6 +1307,122 @@ cases = [{ name = "fixture", example = "fixture" }]
         std::fs::read_to_string(workspace.join("target/krabi-caliper/idle/results.json")).unwrap();
     assert!(summary.contains("\"timed-out\""), "{summary}");
     std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_campaign_stops_at_the_first_failure_and_reports_the_rest_as_not_run() {
+    let workspace = failure_workspace("fail-fast-test", "fn main() {}\n");
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+target-dir = "target"
+executable = "sh"
+args = ["-c", "exit 7"]
+
+[campaigns.gate]
+profile = "host"
+cases = [
+  { name = "first", example = "fixture" },
+  { name = "second", example = "fixture" },
+  { name = "third", example = "fixture" },
+]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(&config, "gate", &workspace, &CampaignSelection::default())
+        .unwrap();
+
+    let statuses: Vec<_> = report.cases.iter().map(|case| case.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            CaseStatus::RunFailed,
+            CaseStatus::NotRun,
+            CaseStatus::NotRun
+        ]
+    );
+    assert_eq!(report.cases[1].attempts, 0);
+    assert!(!report.success());
+    let markdown = report.render_markdown();
+    assert!(
+        markdown.contains(
+            "- `second`: case `first` did not pass and the campaign does not continue on failure"
+        ),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("### `second`"), "{markdown}");
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_campaign_starts_no_case_after_its_time_budget() {
+    let workspace = failure_workspace("budget-test", "fn main() {}\n");
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+target-dir = "target"
+executable = "sh"
+args = ["-c", "sleep 1.2; exit 7"]
+
+[campaigns.budget]
+profile = "host"
+continue-on-failure = true
+time-budget-seconds = 1
+cases = [
+  { name = "first", example = "fixture" },
+  { name = "second", example = "fixture" },
+]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(&config, "budget", &workspace, &CampaignSelection::default())
+        .unwrap();
+
+    assert_eq!(report.cases[0].status, CaseStatus::RunFailed);
+    assert_eq!(report.cases[1].status, CaseStatus::NotRun);
+    assert_eq!(
+        report.cases[1].error.as_deref(),
+        Some("the campaign's time budget of 1 s was used up")
+    );
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn campaign_limits_reject_zero_budgets_and_retrying_not_run() {
+    for (campaign_line, expected) in [
+        (
+            "time-budget-seconds = 0",
+            "time-budget-seconds must be at least 1",
+        ),
+        (
+            "retry = { attempts = 2, on = [\"not-run\"] }",
+            "cannot retry a case that was not run",
+        ),
+    ] {
+        let config = parse(&format!(
+            r#"
+[profiles.host]
+runner = "command"
+target = "host"
+executable = "true"
+
+[campaigns.limits]
+profile = "host"
+{campaign_line}
+cases = [{{ name = "fixture", example = "fixture" }}]
+"#
+        ));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+    }
 }
 
 #[test]

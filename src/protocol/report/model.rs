@@ -1,5 +1,6 @@
 /// Stable event taxonomy shared by target encoders and host decoders.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum EventTag {
     Begin,
     Sample,
@@ -50,6 +51,7 @@ impl EventTag {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum FieldValue<'a> {
     Token(&'a str),
     U64(u64),
@@ -177,6 +179,7 @@ pub struct OutcomeRecord<'a> {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "host", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "host", serde(rename_all = "kebab-case"))]
+#[non_exhaustive]
 pub enum BoundaryPhase {
     Begin,
     End,
@@ -207,6 +210,7 @@ pub struct CounterSnapshotRecord<'a> {
 #[cfg_attr(feature = "host", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "host", serde(rename_all = "kebab-case"))]
 #[derive(Default)]
+#[non_exhaustive]
 pub enum MetricPolicy {
     LowerIsBetter,
     HigherIsBetter,
@@ -236,6 +240,7 @@ pub struct MetricRecord<'a> {
 
 /// Borrowed target-side event model. Text is one encoding of these events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Event<'a> {
     Begin(&'a RunStart<'a>),
     Sample(&'a SampleRecord<'a>),

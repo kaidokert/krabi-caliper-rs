@@ -51,6 +51,7 @@ pub struct PairedSuiteFields<'a> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SuiteError<E> {
     Reporter(E),
     Runner(RunError),

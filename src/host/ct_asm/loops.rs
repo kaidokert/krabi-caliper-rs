@@ -28,6 +28,7 @@
 // only stops public-shape loops from drowning out real findings.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoopIsa {
     Thumb,
     RiscV,
@@ -117,6 +118,7 @@ pub fn outermost_loop(block: &FunctionBlock, isa: LoopIsa) -> Option<(u64, u64)>
 
 /// Where a branch sits relative to a loop `(head, tail)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoopRole {
     /// The loop's back edge, at `tail`.
     BackEdge,

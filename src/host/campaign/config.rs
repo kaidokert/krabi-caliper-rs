@@ -58,6 +58,16 @@ impl ToolkitConfig {
                     "campaign {name:?} retries no status; list one in retry.on"
                 )));
             }
+            if campaign.time_budget_seconds == Some(0) {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "campaign {name:?} time-budget-seconds must be at least 1"
+                )));
+            }
+            if campaign.retry.on.contains(&CaseStatus::NotRun) {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "campaign {name:?} cannot retry a case that was not run"
+                )));
+            }
             if campaign.retry.on.contains(&CaseStatus::Pass) {
                 return Err(CampaignError::InvalidConfig(format!(
                     "campaign {name:?} cannot retry a passing case"
@@ -454,6 +464,7 @@ fn configuration_identity(profile: &ResolvedRunnerProfile) -> String {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct VenueConfig {
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -529,6 +540,7 @@ pub struct RunnerProfile {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum ConfiguredU64 {
     Number(u64),
     Binding(String),
@@ -536,6 +548,7 @@ pub enum ConfiguredU64 {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct ConstantTimeConfig {
     #[serde(default = "default_welch_threshold")]
     pub welch_threshold: f64,
@@ -569,6 +582,7 @@ fn default_control_classes() -> Vec<String> {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct RunnerCommandConfig {
     pub executable: String,
     #[serde(default)]
@@ -579,6 +593,7 @@ pub struct RunnerCommandConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum RunnerKind {
     Simavr,
     Command,

@@ -21,6 +21,7 @@ pub struct ComparisonPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ComparisonStatus {
     Pass,
     Regression,
@@ -29,6 +30,7 @@ pub enum ComparisonStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MetricKind {
     Flash,
     StaticRam,

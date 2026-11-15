@@ -60,6 +60,7 @@ pub struct SourceMetadata {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum EventStatus {
     Pass,
     Fail,
@@ -67,6 +68,7 @@ pub enum EventStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum RunStatus {
     Pass,
     Fail,
@@ -202,6 +204,7 @@ impl MeasurementEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum OwnedEvent {
     Begin(BeginEvent),
     Sample(SampleEvent),
