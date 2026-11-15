@@ -58,7 +58,7 @@ runs:
         }
         expected="krabi-caliper v${KRABI_ACTION_CALIPER_VERSION}:"
         cargo install --list | grep -Fx "$expected" >/dev/null || {
-          echo "::error::runner does not provide $expected"
+          echo "::error::runner does not provide $expected; set caliper-version to the krabi-caliper version the container image provides"
           cargo install --list
           exit 1
         }

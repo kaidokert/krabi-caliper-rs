@@ -5,10 +5,10 @@
 # F407- or bench-specific, so one image serves every rig.
 #
 # Built and published by .github/workflows/hw-runner-image.yml as
-# ghcr.io/kaidokert/pi-hw-runner:caliper-<KRABI_CALIPER_VERSION>-probe-rs-<PROBE_RS_TAG>-<distro>,
-# the image .github/workflows/hw-ct.yml runs hardware jobs in. The tag is
-# derived from the ARGs below, so changing what the image contains means
-# changing one of them.
+# ghcr.io/kaidokert/krabi-hw-runner:caliper-<KRABI_CALIPER_VERSION>-probe-rs-<PROBE_RS_TAG>-<distro>-<recipe>,
+# the image .github/workflows/hw-ct.yml runs hardware jobs in. <recipe> is a
+# hash of this file, so any edit here publishes under a new tag and the
+# defaults in hw-ct.yml must follow (CI reports the expected value).
 FROM rust:1-trixie
 
 # probe-rs needs libusb + libudev (build + run). uhubctl for power-cycle recovery
