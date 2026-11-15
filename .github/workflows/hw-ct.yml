@@ -72,7 +72,7 @@ on:
         default: true
         type: boolean
       report-artifact-path:
-        description: Campaign artifact directory to upload, relative to working-directory
+        description: Directory to upload after the run, relative to working-directory; a common parent when campaigns set their own artifact-dir
         required: false
         default: target/krabi-caliper
         type: string
@@ -183,6 +183,22 @@ jobs:
         run: |
           echo "::error::opt-level only applies to prepared builds"
           exit 1
+
+      # The job mounts /rigs, so the uploaded directory must stay inside the
+      # checkout: no absolute path and no `..` component.
+      - name: Check the report upload path
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          REPORT_ARTIFACT_PATH: ${{ inputs.report-artifact-path }}
+        run: |
+          for path in "$WORKING_DIRECTORY" "$REPORT_ARTIFACT_PATH"; do
+            case "/$path/" in
+              //* | */../*)
+                echo "::error::path must be relative and inside the checkout: $path"
+                exit 1
+                ;;
+            esac
+          done
 
       - uses: actions/checkout@v4
         with:

@@ -116,8 +116,11 @@ runs:
               cat "$report" >> "$GITHUB_STEP_SUMMARY"
               summary_budget=$((summary_budget - size))
             else
-              printf '\nThe report for campaign `%s` (%s bytes) does not fit in the job summary; see the campaign'"'"'s report.md.\n\n' \
-                "$campaign" "$size" >> "$GITHUB_STEP_SUMMARY"
+              note=$(printf 'The report for campaign `%s` (%s bytes) does not fit in the job summary; see the campaign'"'"'s report.md.' "$campaign" "$size")
+              if [ "$((${#note} + 4))" -le "$summary_budget" ]; then
+                printf '\n%s\n\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+                summary_budget=$((summary_budget - ${#note} - 4))
+              fi
             fi
           fi
           [ "$status" -eq 0 ] || exit "$status"
