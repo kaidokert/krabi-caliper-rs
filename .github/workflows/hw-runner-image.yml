@@ -6,7 +6,8 @@
 # built from names a new tag.
 #
 # A tag is published once and never overwritten: runs for the same tag are
-# serialised, and a run that finds it already published leaves it alone.
+# serialised, and a run that finds it already published (the registry says
+# so; an unclear answer fails the run) leaves it alone and builds nothing.
 # Pull requests from this repository publish too, so the image a default names
 # exists, built from exactly the Dockerfile being merged, before that default
 # reaches main. The package is linked to this public repository and must stay
@@ -104,7 +105,21 @@ jobs:
           REF: ${{ steps.tag.outputs.ref }}
           FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
-          if docker manifest inspect "$REF" >/dev/null 2>&1; then
+          set -euo pipefail
+          # present / missing, from the registry's answer; anything else (network,
+          # auth) is retried and then fails, so it can never read as missing.
+          manifest_state() {
+            for attempt in 1 2 3; do
+              if out="$(docker manifest inspect "$REF" 2>&1)"; then echo present; return; fi
+              case "$out" in *"manifest unknown"*) echo missing; return ;; esac
+              echo "::warning::inspecting $REF: $out" >&2
+              sleep $((attempt * 10))
+            done
+            echo "::error::cannot tell whether $REF is published" >&2
+            return 1
+          }
+          state="$(manifest_state)"
+          if [ "$state" = present ]; then
             echo "published=true" >> "$GITHUB_OUTPUT"
             echo "$REF is published"
           elif [ "$FORK_PR" = true ]; then
@@ -133,13 +148,40 @@ jobs:
     env:
       REF: ${{ needs.tag.outputs.ref }}
     steps:
+      # A run that queued behind another for this tag finds it published here
+      # and skips the build; only one run per tag is past this point at a time.
+      - name: Check whether another run published it
+        id: published
+        run: |
+          set -euo pipefail
+          # present / missing, from the registry's answer; anything else (network,
+          # auth) is retried and then fails, so it can never read as missing.
+          manifest_state() {
+            for attempt in 1 2 3; do
+              if out="$(docker manifest inspect "$REF" 2>&1)"; then echo present; return; fi
+              case "$out" in *"manifest unknown"*) echo missing; return ;; esac
+              echo "::warning::inspecting $REF: $out" >&2
+              sleep $((attempt * 10))
+            done
+            echo "::error::cannot tell whether $REF is published" >&2
+            return 1
+          }
+          state="$(manifest_state)"
+          if [ "$state" = present ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "$REF was published by another run; leaving it as it is"
+          fi
+
       - uses: actions/checkout@v7
+        if: steps.published.outputs.published != 'true'
         with:
           persist-credentials: false
 
       - uses: docker/setup-buildx-action@v3
+        if: steps.published.outputs.published != 'true'
 
       - name: Build
+        if: steps.published.outputs.published != 'true'
         uses: docker/build-push-action@v6
         with:
           context: hw-runner
@@ -151,6 +193,7 @@ jobs:
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
       - name: Validate the pinned tools
+        if: steps.published.outputs.published != 'true'
         env:
           CALIPER: ${{ needs.tag.outputs.caliper }}
           COMMIT: ${{ needs.tag.outputs.probe-rs-commit }}
@@ -165,21 +208,18 @@ jobs:
           esac
 
       - uses: docker/login-action@v3
+        if: steps.published.outputs.published != 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish unless another run already did
-        run: |
-          set -euo pipefail
-          if docker manifest inspect "$REF" >/dev/null 2>&1; then
-            echo "$REF was published by another run; leaving it as it is"
-          else
-            docker push "$REF"
-          fi
+      - name: Publish
+        if: steps.published.outputs.published != 'true'
+        run: docker push "$REF"
 
       - name: Check an anonymous pull works
+        if: steps.published.outputs.published != 'true'
         run: |
           docker logout ghcr.io
           docker manifest inspect "$REF" >/dev/null || {
