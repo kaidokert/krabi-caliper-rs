@@ -1429,6 +1429,13 @@ fn retry_reruns_only_listed_statuses_up_to_the_attempt_limit() {
     };
     assert!(campaign.render_markdown().contains("| Pass (3 attempts) |"));
     assert!(campaign.render_csv().contains("retry,attempts,3"));
+    assert!(!failure.contains("\n\n\n"), "{failure}");
+    let (single, _) = run_script(&RetryPolicy::default(), &[RunFailed]);
+    let failure = single.render_failure_markdown();
+    assert!(
+        !failure.contains("Attempts") && !failure.contains("\n\n\n"),
+        "{failure}"
+    );
 
     // The limit counts every run; the last failure is the reported one.
     let (report, calls) = run_script(&policy, &[RunFailed, RunFailed, RunFailed]);

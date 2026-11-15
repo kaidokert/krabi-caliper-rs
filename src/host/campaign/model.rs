@@ -156,7 +156,10 @@ impl CampaignReport {
             for case in failed {
                 output.push_str(&format!("### `{}` — `{:?}`\n\n", case.id, case.status));
                 output.push_str(&format!("**Reason:** {}\n\n", failure_reason(case)));
-                render_retried(&mut output, case);
+                if !case.retried.is_empty() {
+                    render_retried(&mut output, case);
+                    output.push('\n');
+                }
                 output.push_str("**Command:**\n\n```console\n");
                 output.push_str(failure_command(case));
                 output.push_str("\n```\n\n");
@@ -376,8 +379,10 @@ impl CaseReport {
             failure_reason(self),
             failure_command(self),
         );
-        output.push('\n');
-        render_retried(&mut output, self);
+        if !self.retried.is_empty() {
+            output.push('\n');
+            render_retried(&mut output, self);
+        }
         render_output_stream(&mut output, "stdout", &self.stdout, 2);
         render_output_stream(&mut output, "stderr", &self.stderr, 2);
         output
@@ -425,9 +430,6 @@ fn status_cell(case: &CaseReport) -> String {
 
 /// Lists a retried case's discarded attempts, one line each.
 fn render_retried(output: &mut String, case: &CaseReport) {
-    if case.retried.is_empty() {
-        return;
-    }
     output.push_str(&format!("**Attempts:** {}\n\n", case.attempts));
     for (index, attempt) in case.retried.iter().enumerate() {
         let reason = attempt
@@ -446,7 +448,6 @@ fn render_retried(output: &mut String, case: &CaseReport) {
         }
         output.push('\n');
     }
-    output.push('\n');
 }
 
 fn failure_reason(case: &CaseReport) -> &str {
