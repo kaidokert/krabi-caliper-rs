@@ -1,4 +1,4 @@
-use crate::{Measurement, SampleSet, Summary, SummaryError};
+use crate::{Measurement, PushError, SampleSet, Summary, SummaryError};
 
 /// Input class selected for one paired measurement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +52,8 @@ pub enum RunError {
     OddSampleCapacity,
     BlockCountOverflow,
     CapacityExceeded,
+    /// A measurement's unit or frequency differs from the earlier ones on its side.
+    MixedSamples,
 }
 
 /// Raw paired evidence plus application-output validation.
@@ -134,7 +136,12 @@ impl<const N: usize> PairedRunner<N> {
                     outputs_ok &= ok;
                     samples
                         .push(side, measurement)
-                        .map_err(|_| RunError::CapacityExceeded)?;
+                        .map_err(|error| match error {
+                            PushError::Full(_) => RunError::CapacityExceeded,
+                            PushError::UnitMismatch(_) | PushError::FrequencyMismatch(_) => {
+                                RunError::MixedSamples
+                            }
+                        })?;
                 }
             }
             block += 1;
@@ -235,7 +242,7 @@ impl<const N: usize> PairedSamples<N> {
         }
     }
 
-    pub fn push(&mut self, side: Side, measurement: Measurement) -> Result<(), Measurement> {
+    pub fn push(&mut self, side: Side, measurement: Measurement) -> Result<(), PushError> {
         match side {
             Side::A => self.a.push(measurement),
             Side::B => self.b.push(measurement),
@@ -449,6 +456,22 @@ mod tests {
             }),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn runner_reports_mixed_units_on_one_side() {
+        let mut measured = 0;
+        let run = PairedRunner::<2>::new().warmup_blocks(0).run(|_| {
+            measured += 1;
+            // The fourth sample is side A's second, in ABBA order.
+            let unit = if measured == 4 {
+                Unit::TimerTicks
+            } else {
+                Unit::CoreCycles
+            };
+            (Measurement::new(1, unit), true)
+        });
+        assert_eq!(run, Err(RunError::MixedSamples));
     }
 
     #[test]
