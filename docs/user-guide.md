@@ -51,7 +51,9 @@ Target facilities include:
   and report `wrapped` for the whole set, as `summary` does;
 - stack painting through an application-supplied memory contract;
 - Cortex-M SysTick and DWT, RISC-V cycle/instruction CSRs, and ATmega2560
-  Timer1 adapters;
+  Timer1 adapters (Timer1 at a chosen prescaler, `Timer1Prescale`, from `/1`
+  for one tick per CPU cycle to `/1024` for long intervals; the overflow ISR
+  must run within 0x8000 ticks of each wrap);
 - the versioned `EM_*` event protocol over formatting sinks, `ufmt`, RTT,
   semihosting, or application-owned UART output;
 - balanced paired acquisition and deterministic fixtures.
@@ -110,10 +112,160 @@ resolves runner-only bindings such as probe selectors only in the execution
 job. CI remains responsible for artifact transfer and for acquiring any
 hardware lock after the bundle has been downloaded.
 
+### Runner presets
+
+A profile's `preset` supplies the runner command, the target and the recorded
+board, MCU and transport. A field set in the profile overrides the preset's
+value.
+
+- `qemu-cortex-m0`, `qemu-cortex-m3`, `qemu-cortex-m4`: QEMU, reporting over
+  semihosting.
+- `qemu-riscv32-sifive-e`: QEMU, reporting over UART.
+- `simavr-atmega2560`: simavr, reporting over UART.
+- `probe-rs-rtt`: physical hardware through `probe-rs run`, reporting over RTT.
+
+### `probe-rs-rtt`
+
+```toml
+[venues.bench]
+bindings = { PROBE_RS_CHIP = "STM32L431KCUx", PROBE_RS_PROBE = "0483:374f:000000000000" }
+
+[profiles.l431]
+preset = "probe-rs-rtt"
+target = "thumbv7em-none-eabihf"
+venue = "bench"
+```
+
+The preset needs two bindings, from a venue's `bindings` or the environment:
+
+- `PROBE_RS_CHIP`: the probe-rs chip name, recorded as the MCU.
+- `PROBE_RS_PROBE`: the probe selector. Use `VID:PID:Serial` when several
+  probes of one model are attached; `VID:PID` matches each of them. The
+  selector is not part of the configuration identity, so replacing a probe
+  does not block comparisons.
+
+The profile sets `target`, because the target triple depends on the chip.
+
+The firmware must report over RTT (the `rtt` feature). With
+`cortex_m_reporter!("<feature>")`, list that feature in the profile's
+`build-features`; without it the firmware reports over semihosting and the run
+times out.
+
+The run ends at the first `EM_OUTCOME` event. On Unix probe-rs then gets SIGINT
+so it can detach from the target, and is killed if it has not exited within
+three seconds. On Windows it is killed after those three seconds. A timeout
+kills it at once.
+
+`build --output` needs neither binding, so firmware can be built where no probe
+is attached. `validate` and `run` resolve every profile in the file, so set the
+bindings wherever those commands run, or keep hardware profiles in a separate
+configuration file.
+
+`mcu` and `probe` set in a profile are recorded metadata only. `args` replaces
+the whole command line, including the chip and probe selectors.
+
 Host facilities include Cargo artifact discovery, timeouts, retained logs, ELF
 footprint extraction, comparisons, JSON/CSV/Markdown reports, CT-grind
 integration, panic-path auditing, Welch analysis, and combined DWT/ETM
 evidence.
+
+`read_elf_footprint` counts each section as text, read-only data, data or BSS,
+by name and then by section kind, and skips the rest.
+`read_elf_unclassified_sections` lists the allocated, non-empty sections it
+skips, such as a linker-script `.uninit` region or `.got`, so a size gate can
+require the list to be empty. Runtime reservations such as `riscv-rt`'s
+`.stack` and `.heap` are listed too; a gate allows those by name.
+
+`cargo krabi-caliper audit-elf` checks a built image for symbols and strings
+that must or must not be there, for example that a feature compiled out or that
+an allocator, formatting or soft float never reached the image:
+
+```sh
+cargo krabi-caliper audit-elf target/thumbv7m-none-eabi/release/app \
+  --forbid-symbol core::panicking --forbid-symbol __rust_alloc \
+  --forbid-string "panicked at" --require-symbol app::feature::enable
+```
+
+- Symbol rules are substrings of a symbol's name, as stored or demangled, with
+  or without hashes and crate disambiguators. `core::panicking` matches legacy
+  and v0 mangling.
+- Only a defined symbol satisfies a required rule. Any mention, including an
+  undefined reference, breaks a forbidden one.
+- String rules search the contents of allocated sections, which is what reaches
+  the target. `--string-scope whole-file` also searches debug information and
+  symbol tables.
+- `--rules` reads the same rules from a TOML file, and `--json` writes every
+  image's report.
+
+The command reports every broken rule and fails if any image breaks one. A
+non-ELF file, an unreadable section, and rules with nothing to search (symbol
+rules on a stripped image) are errors.
+
+The library is `host::elf_audit`. Its `elf_symbols` lists the symbols the audit
+examines in each form a rule matches, for checks a substring cannot express,
+such as an anchored pattern or every match. It also fails on an image with no
+symbols.
+
+## Counting instructions from QEMU execution traces
+
+`host::exec_trace` (feature `host`) counts the instructions an image executes
+between two markers, from QEMU's per-instruction execution log:
+
+```rust,ignore
+use krabi_caliper::host::exec_trace::{
+    ExecTracePcs, QemuExecTrace, TraceMarker, marker_intervals,
+};
+
+let (trace, _attempts) = QemuExecTrace::new(
+    "qemu-system-arm",
+    ["-cpu", "cortex-m4", "-machine", "mps2-an386", "-nographic",
+     "-semihosting-config", "enable=on,target=native", "-kernel", "app.elf"],
+)
+.attempts(3)
+.timeout(std::time::Duration::from_secs(120))
+.capture(std::path::Path::new("target/trace.log"))?;
+// Marker functions from the symbol table: value (bit 0 is ignored) and size.
+let begin = TraceMarker::function(0x1001, 4);
+let end = TraceMarker::function(0x1005, 4);
+let intervals = marker_intervals(ExecTracePcs::open(&trace)?, &begin, &end, None)?;
+let counts: Vec<usize> = intervals.iter().map(Vec::len).collect();
+```
+
+`QemuExecTrace::capture`:
+
+- appends `-accel tcg,one-insn-per-tb=on -d exec,nochain -D <trace>`, which
+  writes one log line per executed instruction (QEMU 8.1 or later);
+- resolves a relative trace path against `cwd`;
+- kills a run at the timeout, which also bounds the trace size;
+- retries failed runs up to `attempts`.
+
+The image must exit on its own, for example through semihosting.
+
+Markers are a function's range, from `TraceMarker::function(value, size)`, or
+one address, `TraceMarker::Address`. Bit 0 is cleared from markers and PCs, so
+Thumb symbol values can be passed as they are.
+
+`marker_intervals` cuts the trace into intervals:
+
+- An interval opens on a PC in `begin`. PCs that stay in `begin` right after it
+  are skipped.
+- It holds every PC up to, but not including, the first PC in `end`, including
+  callees, returns into `begin` and interrupt handlers.
+- A begin hit inside an open interval does not restart it.
+- With a limit, reading stops after that many intervals.
+
+A trace that ends inside an interval or never reaches `begin` is an error, as
+is a `Trace` line without a readable PC.
+
+Each interval keeps its PCs, so callers can attribute them to functions, for
+example with a disassembly, before counting.
+
+The log's CPU index is ignored, so use single-core machines: PCs from several
+cores would be read as one sequence.
+
+These are instruction counts from an emulator, not cycles: QEMU models no
+pipeline, caches or wait states. The log format can change between QEMU
+versions, so record the QEMU version with the counts.
 
 ## Feature groups
 
@@ -121,6 +273,9 @@ evidence.
 - Architectures: `cortex-m`, `cortex-m-dwt`, `risc-v`, `avr`,
   `avr-atmega2560`
 - Target transports: `rtt`, `semihosting`, `uart`, `ufmt`
+  (with `uart` and `ufmt` together, `protocol::uart::ufmt_reporter` reports
+  through any `protocol::uart::WriteByte` transmitter without requiring
+  `core::fmt`)
 - Host analysis: `host`, `campaign`, `ctgrind`
 - Cargo subcommand: `cli` plus `campaign`
 

@@ -1,6 +1,9 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![cfg_attr(target_arch = "avr", feature(asm_experimental_arch))]
+#![cfg_attr(
+    all(target_arch = "avr", feature = "avr", feature = "stack"),
+    feature(asm_experimental_arch)
+)]
 
 //! Architecture-neutral measurement values and fixed-capacity samples.
 //!
