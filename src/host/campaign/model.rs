@@ -74,7 +74,7 @@ pub struct CaseReport {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stderr: String,
     pub result: Option<RunResult>,
-    /// Runs of this case, counting the one reported; above one when a retry policy applied.
+    /// Runs of this case, including the reported one; 1 unless the case was retried.
     #[serde(default = "one_attempt")]
     pub attempts: u32,
     /// The status and error of each earlier attempt that was retried, oldest first.
@@ -419,7 +419,7 @@ impl CaseStatus {
     }
 }
 
-/// The status-table cell: the status, plus the attempt count when a retry policy applied.
+/// The status-table cell: the status, plus the attempt count for a retried case.
 fn status_cell(case: &CaseReport) -> String {
     if case.attempts > 1 {
         format!("{:?} ({} attempts)", case.status, case.attempts)

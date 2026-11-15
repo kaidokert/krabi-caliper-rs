@@ -49,7 +49,7 @@ pub struct CampaignConfig {
     pub continue_on_failure: bool,
     #[serde(default)]
     pub artifact_dir: Option<PathBuf>,
-    /// How often a case that ends in a transient status is run again.
+    /// When to run a case again after a transient status.
     #[serde(default)]
     pub retry: RetryPolicy,
 }
@@ -59,8 +59,8 @@ pub struct CampaignConfig {
 /// The default, one attempt, never retries. `on` defaults to `run-failed` and `timed-out`: the
 /// statuses a flaky emulator, probe or host process produces. A workload or measurement failure
 /// is a result, so retrying it would hide a real failure; list it explicitly only if the fixture
-/// itself is known to be nondeterministic. The final attempt's report is kept and records every
-/// status it retried past.
+/// itself is known to be nondeterministic. The final attempt's report is kept and records the
+/// status of each earlier attempt.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 #[non_exhaustive]

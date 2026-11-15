@@ -1563,7 +1563,7 @@ fn write_case_metadata(path: &Path, report: &CaseReport) -> Result<(), CampaignE
     )
 }
 
-/// Runs one case, then runs it again while `policy` says its status is transient.
+/// Runs one case, then runs it again while `policy` retries its status.
 ///
 /// Each attempt starts from an empty case directory. A discarded attempt's directory (its
 /// logs, metadata and failure report) is kept and ends up in the final case directory as
@@ -1594,8 +1594,9 @@ fn run_with_retry(
             }
             let mut artifacts = None;
             if case_dir.is_dir() {
-                // Staged outside the case directory, which the next attempt empties, in a
-                // directory this run creates, so no other case's artifacts can be in the way.
+                // Move the attempt out of the case directory, which the next attempt empties,
+                // into a directory created for this run, so no other case's artifacts are in
+                // the way.
                 let root = match &stage_root {
                     Some(root) => root,
                     None => stage_root.insert(create_unique_dir(campaign_dir, &report.id)?),
