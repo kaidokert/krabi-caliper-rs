@@ -502,6 +502,14 @@ cases = [{ name = "external", example = "external-fixture", expected-benchmark =
             .ticks,
         456
     );
+    // 456 cycles at 16 MHz.
+    assert!(
+        report
+            .render_markdown()
+            .contains("| 456 simulator cycles | 28.500 µs |"),
+        "{}",
+        report.render_markdown()
+    );
     assert!(output_dir.join("report.md").is_file());
     assert!(output_dir.join("report.csv").is_file());
     assert!(output_dir.join("results.json").is_file());

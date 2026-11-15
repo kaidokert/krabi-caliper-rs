@@ -66,6 +66,16 @@ on:
         required: false
         default: ""
         type: string
+      job-summary:
+        description: Append each campaign's Markdown report to the GitHub job summary
+        required: false
+        default: true
+        type: boolean
+      report-artifact-path:
+        description: Directory to upload after the run, relative to working-directory; a common parent when campaigns set their own artifact-dir
+        required: false
+        default: target/krabi-caliper
+        type: string
 
 jobs:
   build:
@@ -174,6 +184,22 @@ jobs:
           echo "::error::opt-level only applies to prepared builds"
           exit 1
 
+      # The job mounts /rigs, so the uploaded directory must stay inside the
+      # checkout: no absolute path and no `..` component.
+      - name: Check the report upload path
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          REPORT_ARTIFACT_PATH: ${{ inputs.report-artifact-path }}
+        run: |
+          for path in "$WORKING_DIRECTORY" "$REPORT_ARTIFACT_PATH"; do
+            case "/$path/" in
+              //* | */../*)
+                echo "::error::path must be relative and inside the checkout: $path"
+                exit 1
+                ;;
+            esac
+          done
+
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -193,3 +219,12 @@ jobs:
           prepared-root: ${{ runner.temp }}/prepared
           lock-timeout-seconds: ${{ inputs.lock-timeout-seconds }}
           caliper-version: ${{ inputs.caliper-version }}
+          job-summary: ${{ inputs.job-summary }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: krabi-hw-results-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.invocation-name }}
+          path: ${{ inputs.working-directory }}/${{ inputs.report-artifact-path }}
+          if-no-files-found: warn
+          retention-days: 14
