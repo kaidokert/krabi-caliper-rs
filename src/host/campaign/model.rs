@@ -168,9 +168,9 @@ impl CampaignReport {
             }
         }
         output.push_str(
-            "| Case | Parameters | Status | Flash | Δ Flash | Static RAM | Stack | Δ Stack | Measurements | Metrics | Δ Ticks |\n",
+            "| Case | Parameters | Status | Flash | Δ Flash | Static RAM | Stack | Δ Stack | Measurements | Duration | Metrics | Δ Ticks |\n",
         );
-        output.push_str("|---|---|---|---:|---:|---:|---:|---:|---|---|---:|\n");
+        output.push_str("|---|---|---|---:|---:|---:|---:|---:|---|---:|---|---:|\n");
         for case in &self.cases {
             let parameters = case
                 .parameters
@@ -178,8 +178,11 @@ impl CampaignReport {
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let (stack, measurements, metrics) = case.result.as_ref().map_or_else(
-                || ("—".to_string(), "—".to_string(), "—".to_string()),
+            let (stack, measurements, durations, metrics) = case.result.as_ref().map_or_else(
+                || {
+                    let none = || "—".to_string();
+                    (none(), none(), none(), none())
+                },
                 |result| {
                     let stack = result
                         .benchmarks
@@ -194,6 +197,19 @@ impl CampaignReport {
                         .values()
                         .flat_map(|value| &value.measurements)
                         .map(|value| format!("{} {}", value.ticks, unit_name(value.unit)))
+                        .collect::<Vec<_>>()
+                        .join("<br>");
+                    // One line per measurement, aligned with the Measurements cell; a
+                    // measurement without a known frequency has no duration.
+                    let durations = result
+                        .benchmarks
+                        .values()
+                        .flat_map(|value| &value.measurements)
+                        .map(|value| {
+                            value
+                                .nanoseconds()
+                                .map_or_else(|| "—".to_string(), format_duration)
+                        })
                         .collect::<Vec<_>>()
                         .join("<br>");
                     let metrics = result
@@ -217,6 +233,7 @@ impl CampaignReport {
                     (
                         stack,
                         measurements,
+                        durations,
                         if metrics.is_empty() {
                             "—".to_string()
                         } else {
@@ -230,7 +247,7 @@ impl CampaignReport {
                 .as_ref()
                 .and_then(|id| self.cases.iter().find(|candidate| &candidate.id == id));
             output.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 case.id,
                 parameters,
                 status_cell(case),
@@ -247,6 +264,7 @@ impl CampaignReport {
                 stack,
                 delta(case_stack(case), baseline.and_then(case_stack)),
                 measurements,
+                durations,
                 metrics,
                 delta(primary_ticks(case), baseline.and_then(primary_ticks)),
             ));

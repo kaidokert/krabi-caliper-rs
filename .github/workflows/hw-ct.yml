@@ -66,6 +66,16 @@ on:
         required: false
         default: ""
         type: string
+      job-summary:
+        description: Append each campaign's Markdown report to the GitHub job summary
+        required: false
+        default: true
+        type: boolean
+      report-artifact-path:
+        description: Campaign artifact directory to upload, relative to working-directory
+        required: false
+        default: target/krabi-caliper
+        type: string
 
 jobs:
   build:
@@ -193,3 +203,12 @@ jobs:
           prepared-root: ${{ runner.temp }}/prepared
           lock-timeout-seconds: ${{ inputs.lock-timeout-seconds }}
           caliper-version: ${{ inputs.caliper-version }}
+          job-summary: ${{ inputs.job-summary }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: krabi-hw-results-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.invocation-name }}
+          path: ${{ inputs.working-directory }}/${{ inputs.report-artifact-path }}
+          if-no-files-found: warn
+          retention-days: 14
