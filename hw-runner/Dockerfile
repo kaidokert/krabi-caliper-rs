@@ -38,7 +38,7 @@ RUN cargo install probe-rs-tools --git ${PROBE_RS_GIT} --tag ${PROBE_RS_TAG} --l
 # Pinned EXACT so a later release can't silently change what the bench runs.
 # Needs both cli + campaign features (the cargo-krabi-caliper bin's
 # required-features). Same in-layer cache cleanup.
-ARG KRABI_CALIPER_VERSION=0.2.2
+ARG KRABI_CALIPER_VERSION=0.3.0
 RUN cargo install krabi-caliper --version =${KRABI_CALIPER_VERSION} --locked --features cli,campaign \
  && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
 
