@@ -198,6 +198,8 @@ mod tests {
                 error: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                attempts: 1,
+                retried: Vec::new(),
                 result: Some(crate::host::RunResult {
                     welch_analyses: vec![WelchAnalysis {
                         fixture: "fixture".to_string(),
