@@ -20,6 +20,10 @@ inputs:
     description: Directory containing one prepared bundle per campaign
     required: false
     default: ""
+  job-summary:
+    description: Append each campaign's Markdown report to the GitHub job summary
+    required: false
+    default: "true"
   rig-directory:
     description: Mounted directory containing rig environment files
     required: false
@@ -31,7 +35,7 @@ inputs:
   caliper-version:
     description: Exact krabi-caliper CLI version required in the runner image
     required: false
-    default: 0.1.3
+    default: 0.2.2
 
 runs:
   using: composite
@@ -47,6 +51,7 @@ runs:
         KRABI_ACTION_RIG_DIRECTORY: ${{ inputs.rig-directory }}
         KRABI_ACTION_LOCK_TIMEOUT: ${{ inputs.lock-timeout-seconds }}
         KRABI_ACTION_CALIPER_VERSION: ${{ inputs.caliper-version }}
+        KRABI_ACTION_JOB_SUMMARY: ${{ inputs.job-summary }}
       run: |
         set -euo pipefail
         export PATH="/usr/local/cargo/bin:$HOME/.cargo/bin:$PATH"
@@ -58,7 +63,7 @@ runs:
         }
         expected="krabi-caliper v${KRABI_ACTION_CALIPER_VERSION}:"
         cargo install --list | grep -Fx "$expected" >/dev/null || {
-          echo "::error::runner does not provide $expected"
+          echo "::error::runner does not provide $expected; set caliper-version to the krabi-caliper version the container image provides"
           cargo install --list
           exit 1
         }
@@ -86,18 +91,37 @@ runs:
           exit 1
         }
 
+        # GitHub rejects a step summary over 1 MiB; a report that would cross it
+        # is replaced by a note pointing at the campaign's report.md.
+        summary_budget=1000000
         cd "$GITHUB_WORKSPACE/$KRABI_ACTION_WORKING_DIRECTORY"
         for campaign in $KRABI_ACTION_CAMPAIGNS; do
           echo "::group::campaign $campaign"
+          report="$RUNNER_TEMP/krabi-caliper-report-$campaign.md"
+          status=0
           if [ "$KRABI_ACTION_PREPARED" = "true" ]; then
             manifest="$KRABI_ACTION_PREPARED_ROOT/$campaign/manifest.json"
             [ -f "$manifest" ] || {
               echo "::error::prepared manifest missing for $campaign ($manifest)"
               exit 1
             }
-            cargo krabi-caliper run "$campaign" --prepared "$manifest"
+            cargo krabi-caliper run "$campaign" --prepared "$manifest" | tee "$report" || status=$?
           else
-            cargo krabi-caliper run "$campaign"
+            cargo krabi-caliper run "$campaign" | tee "$report" || status=$?
           fi
           echo "::endgroup::"
+          if [ "$KRABI_ACTION_JOB_SUMMARY" = "true" ] && [ -s "$report" ]; then
+            size=$(wc -c < "$report" | tr -d ' ')
+            if [ "$size" -le "$summary_budget" ]; then
+              cat "$report" >> "$GITHUB_STEP_SUMMARY"
+              summary_budget=$((summary_budget - size))
+            else
+              note=$(printf 'The report for campaign `%s` (%s bytes) does not fit in the job summary; see the campaign'"'"'s report.md.' "$campaign" "$size")
+              if [ "$((${#note} + 4))" -le "$summary_budget" ]; then
+                printf '\n%s\n\n' "$note" >> "$GITHUB_STEP_SUMMARY"
+                summary_budget=$((summary_budget - ${#note} - 4))
+              fi
+            fi
+          fi
+          [ "$status" -eq 0 ] || exit "$status"
         done

@@ -1,0 +1,228 @@
+# Build the hardware job image (hw-runner/Dockerfile) on a GitHub-hosted arm64
+# runner — native, matching the Pi rigs; QEMU would be far too slow for the
+# probe-rs + krabi-caliper compile — and publish it as
+# ghcr.io/kaidokert/krabi-hw-runner:caliper-<version>-probe-rs-<tag>-<distro>-<recipe>,
+# where <recipe> is a hash of the Dockerfile, so any change to what the image is
+# built from names a new tag.
+#
+# A tag is published once and never overwritten: runs for the same tag are
+# serialised, and a run that finds it already published (the registry says
+# so; an unclear answer fails the run) leaves it alone and builds nothing.
+# Pull requests from this repository publish too, so the image a default names
+# exists, built from exactly the Dockerfile being merged, before that default
+# reaches main. The package is linked to this public repository and must stay
+# public; publishing checks that an anonymous pull works.
+name: hw-runner image
+
+on:
+  pull_request:
+    paths:
+      - hw-runner/**
+      - .github/workflows/hw-runner-image.yml
+      - .github/workflows/hw-ct.yml
+      - .github/actions/krabi-hw-run/action.yml
+  push:
+    branches: [main]
+    paths:
+      - hw-runner/**
+      - .github/workflows/hw-runner-image.yml
+      - .github/workflows/hw-ct.yml
+      - .github/actions/krabi-hw-run/action.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/kaidokert/krabi-hw-runner
+  DOCKERFILE: hw-runner/Dockerfile
+
+jobs:
+  tag:
+    name: Derive the tag and check the defaults use it
+    runs-on: ubuntu-latest
+    outputs:
+      caliper: ${{ steps.tag.outputs.caliper }}
+      probe-rs-commit: ${{ steps.tag.outputs.probe-rs-commit }}
+      ref: ${{ steps.tag.outputs.ref }}
+      published: ${{ steps.published.outputs.published }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - id: tag
+        run: |
+          set -euo pipefail
+          arg() { sed -nE "s/^ARG $1=(.+)$/\1/p" "$DOCKERFILE" | head -1; }
+          caliper="$(arg KRABI_CALIPER_VERSION)"
+          probe_rs_git="$(arg PROBE_RS_GIT)"
+          probe_rs="$(arg PROBE_RS_TAG)"
+          distro="$(sed -nE 's/^FROM rust:1-([a-z]+).*/\1/p' "$DOCKERFILE" | head -1)"
+          if [ -z "$caliper" ] || [ -z "$probe_rs_git" ] || [ -z "$probe_rs" ] || [ -z "$distro" ]; then
+            echo "::error file=$DOCKERFILE::could not read KRABI_CALIPER_VERSION, PROBE_RS_GIT, PROBE_RS_TAG or the rust:1-<distro> base"
+            exit 1
+          fi
+          # The commit the tag names, which a fork build reports in --version.
+          # A peeled annotated tag sorts after the tag object, so take the last.
+          commit="$(git ls-remote "$probe_rs_git" "refs/tags/$probe_rs" "refs/tags/$probe_rs^{}" | tail -1 | cut -c1-8)"
+          if [ -z "$commit" ]; then
+            echo "::error file=$DOCKERFILE::$probe_rs_git has no tag $probe_rs"
+            exit 1
+          fi
+          recipe="$(sha256sum "$DOCKERFILE" | cut -c1-12)"
+          ref="$IMAGE:caliper-$caliper-probe-rs-${probe_rs#v}-$distro-$recipe"
+          {
+            echo "caliper=$caliper"
+            echo "probe-rs-commit=$commit"
+            echo "ref=$ref"
+          } >> "$GITHUB_OUTPUT"
+          echo "image: $ref"
+
+      - name: Check hw-ct.yml and krabi-hw-run default to this image
+        env:
+          CALIPER: ${{ steps.tag.outputs.caliper }}
+          REF: ${{ steps.tag.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # The `default:` line following each named input.
+          default_of() { awk -v key="$2:" '$1 == key { found = 1; next } found && $1 == "default:" { sub(/^[^:]*: */, ""); print; exit }' "$1"; }
+          status=0
+          check() {
+            if [ "$3" != "$4" ]; then
+              echo "::error file=$1::$2 defaults to '$3', but $DOCKERFILE builds '$4'"
+              status=1
+            fi
+          }
+          check .github/workflows/hw-ct.yml container-image "$(default_of .github/workflows/hw-ct.yml container-image)" "$REF"
+          check .github/workflows/hw-ct.yml caliper-version "$(default_of .github/workflows/hw-ct.yml caliper-version)" "$CALIPER"
+          check .github/actions/krabi-hw-run/action.yml caliper-version "$(default_of .github/actions/krabi-hw-run/action.yml caliper-version)" "$CALIPER"
+          exit "$status"
+
+      - name: Check whether the tag is published
+        id: published
+        env:
+          REF: ${{ steps.tag.outputs.ref }}
+          FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          set -euo pipefail
+          # present / missing, from the registry's answer; anything else (network,
+          # auth) is retried and then fails, so it can never read as missing.
+          manifest_state() {
+            for attempt in 1 2 3; do
+              if out="$(docker manifest inspect "$REF" 2>&1)"; then echo present; return; fi
+              case "$out" in *"manifest unknown"*) echo missing; return ;; esac
+              echo "::warning::inspecting $REF: $out" >&2
+              sleep $((attempt * 10))
+            done
+            echo "::error::cannot tell whether $REF is published" >&2
+            return 1
+          }
+          state="$(manifest_state)"
+          if [ "$state" = present ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "$REF is published"
+          elif [ "$FORK_PR" = true ]; then
+            # A fork's token cannot publish, and merging would point the
+            # defaults at an image that does not exist yet.
+            echo "::error::$REF is not published; a maintainer must publish it (push this Dockerfile on a branch of this repository) before this merges"
+            exit 1
+          fi
+
+  build:
+    name: Build, validate and publish (arm64)
+    needs: tag
+    # Fork pull requests get a read-only token; a manual run publishes only from main.
+    if: >-
+      needs.tag.outputs.published != 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04-arm
+    # One publisher per tag; never cancel one mid-push.
+    concurrency:
+      group: hw-runner-image-${{ needs.tag.outputs.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REF: ${{ needs.tag.outputs.ref }}
+    steps:
+      # A run that queued behind another for this tag finds it published here
+      # and skips the build; only one run per tag is past this point at a time.
+      - name: Check whether another run published it
+        id: published
+        run: |
+          set -euo pipefail
+          # present / missing, from the registry's answer; anything else (network,
+          # auth) is retried and then fails, so it can never read as missing.
+          manifest_state() {
+            for attempt in 1 2 3; do
+              if out="$(docker manifest inspect "$REF" 2>&1)"; then echo present; return; fi
+              case "$out" in *"manifest unknown"*) echo missing; return ;; esac
+              echo "::warning::inspecting $REF: $out" >&2
+              sleep $((attempt * 10))
+            done
+            echo "::error::cannot tell whether $REF is published" >&2
+            return 1
+          }
+          state="$(manifest_state)"
+          if [ "$state" = present ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "$REF was published by another run; leaving it as it is"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.published.outputs.published != 'true'
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.published.outputs.published != 'true'
+
+      - name: Build
+        if: steps.published.outputs.published != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: hw-runner
+          platforms: linux/arm64
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ env.REF }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Validate the pinned tools
+        if: steps.published.outputs.published != 'true'
+        env:
+          CALIPER: ${{ needs.tag.outputs.caliper }}
+          COMMIT: ${{ needs.tag.outputs.probe-rs-commit }}
+        run: |
+          set -euo pipefail
+          docker run --rm "$REF" cargo install --list | grep -Fx "krabi-caliper v$CALIPER:"
+          version="$(docker run --rm "$REF" probe-rs --version)"
+          echo "$version"
+          case "$version" in
+            *"git commit: $COMMIT"*) ;;
+            *) echo "::error::probe-rs reports '$version', expected commit $COMMIT"; exit 1 ;;
+          esac
+
+      - uses: docker/login-action@v3
+        if: steps.published.outputs.published != 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish
+        if: steps.published.outputs.published != 'true'
+        run: docker push "$REF"
+
+      - name: Check an anonymous pull works
+        if: steps.published.outputs.published != 'true'
+        run: |
+          docker logout ghcr.io
+          docker manifest inspect "$REF" >/dev/null || {
+            echo "::error::$REF is not anonymously pullable; set the krabi-hw-runner package to public"
+            exit 1
+          }
