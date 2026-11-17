@@ -110,6 +110,12 @@ stderr for that long, such as a probe session waiting for RTT output that never
 comes. It is reported as `timed-out`, with the idle limit in the reason. Set it
 above the longest silent stretch of a healthy run, flashing included.
 
+`failure-marker` on a profile ends the run command as soon as an output line
+contains it, and reports the case as `run-failed` with that line as the reason.
+Set it to the prefix the firmware's panic handler prints, such as `PANIC:`.
+The command keeps running until its output pauses for half a second, at most
+five seconds, so the rest of the panic message is captured.
+
 A campaign stops at the first case that does not pass, and reports the cases
 after it as `not-run`. Set `continue-on-failure = true` on the campaign to run
 every case regardless.

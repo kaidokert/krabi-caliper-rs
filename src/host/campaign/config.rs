@@ -309,6 +309,9 @@ fn resolve_profile_bindings(
     if let Some(value) = &mut profile.completion_marker {
         resolve!(value);
     }
+    if let Some(value) = &mut profile.failure_marker {
+        resolve!(value);
+    }
     for value in [
         &mut profile.board,
         &mut profile.mcu,
@@ -509,6 +512,10 @@ pub struct RunnerProfile {
     pub completion_marker: Option<String>,
     #[serde(default)]
     pub completion_action: Option<CompletionAction>,
+    /// Stop the run command and fail the case once an output line contains this, such as
+    /// a firmware panic handler's prefix.
+    #[serde(default)]
+    pub failure_marker: Option<String>,
     #[serde(default)]
     pub board: Option<String>,
     #[serde(default)]
@@ -626,6 +633,7 @@ struct ResolvedRunnerProfile {
     build_features: Vec<String>,
     completion_marker: Option<String>,
     completion_action: CompletionAction,
+    failure_marker: Option<String>,
     board: Option<String>,
     mcu: Option<String>,
     transport: Option<String>,
@@ -666,6 +674,7 @@ impl RunnerProfile {
         inherit_option!(build_features);
         inherit_option!(completion_marker);
         inherit_option!(completion_action);
+        inherit_option!(failure_marker);
         inherit_option!(board);
         inherit_option!(mcu);
         inherit_option!(transport);
@@ -783,6 +792,11 @@ impl RunnerProfile {
             }
             None => preset.as_ref().and_then(|value| value.clock_frequency_hz),
         };
+        if self.failure_marker.as_ref().is_some_and(String::is_empty) {
+            return Err(CampaignError::InvalidConfig(format!(
+                "profile {profile_name:?} failure-marker must not be empty"
+            )));
+        }
         if self.idle_timeout_seconds == Some(0) {
             return Err(CampaignError::InvalidConfig(format!(
                 "profile {profile_name:?} idle-timeout-seconds must be at least 1"
@@ -803,6 +817,7 @@ impl RunnerProfile {
                     .as_ref()
                     .map_or_else(CompletionAction::default, |value| value.completion_action)
             }),
+            failure_marker: self.failure_marker.clone(),
             board: self.board.clone().or_else(|| {
                 preset
                     .as_ref()
