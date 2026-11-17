@@ -34,12 +34,19 @@ ARG PROBE_RS_TAG=v0.32.0-kk.2
 RUN cargo install probe-rs-tools --git ${PROBE_RS_GIT} --tag ${PROBE_RS_TAG} --locked \
  && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
 
-# The measurement harness, invoked as `cargo krabi-caliper`, from crates.io.
-# Pinned EXACT so a later release can't silently change what the bench runs.
-# Needs both cli + campaign features (the cargo-krabi-caliper bin's
-# required-features). Same in-layer cache cleanup.
-ARG KRABI_CALIPER_VERSION=0.4.0-alpha.1
-RUN cargo install krabi-caliper --version =${KRABI_CALIPER_VERSION} --locked --features cli,campaign \
+# The measurement harness, invoked as `cargo krabi-caliper`. Pinned EXACT so a
+# later release can't silently change what the bench runs. A release comes from
+# crates.io; a pre-release (a version with a `-`) is never published there and
+# comes from its `v<version>` tag in KRABI_CALIPER_GIT. Needs both cli +
+# campaign features (the cargo-krabi-caliper bin's required-features). Same
+# in-layer cache cleanup.
+ARG KRABI_CALIPER_VERSION=0.4.0-alpha.2
+ARG KRABI_CALIPER_GIT=https://github.com/kaidokert/krabi-caliper-rs
+RUN case "$KRABI_CALIPER_VERSION" in \
+      *-*) source="--git $KRABI_CALIPER_GIT --tag v$KRABI_CALIPER_VERSION" ;; \
+      *) source="--version =$KRABI_CALIPER_VERSION" ;; \
+    esac \
+ && cargo install krabi-caliper $source --locked --features cli,campaign \
  && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
 
 # cargo + the installed bins are on PATH via the rust base image
