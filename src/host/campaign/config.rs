@@ -58,6 +58,16 @@ impl ToolkitConfig {
                     "campaign {name:?} retries no status; list one in retry.on"
                 )));
             }
+            if campaign.time_budget_seconds == Some(0) {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "campaign {name:?} time-budget-seconds must be at least 1"
+                )));
+            }
+            if campaign.retry.on.contains(&CaseStatus::NotRun) {
+                return Err(CampaignError::InvalidConfig(format!(
+                    "campaign {name:?} cannot retry a case that was not run"
+                )));
+            }
             if campaign.retry.on.contains(&CaseStatus::Pass) {
                 return Err(CampaignError::InvalidConfig(format!(
                     "campaign {name:?} cannot retry a passing case"
@@ -299,6 +309,9 @@ fn resolve_profile_bindings(
     if let Some(value) = &mut profile.completion_marker {
         resolve!(value);
     }
+    if let Some(value) = &mut profile.failure_marker {
+        resolve!(value);
+    }
     for value in [
         &mut profile.board,
         &mut profile.mcu,
@@ -454,6 +467,7 @@ fn configuration_identity(profile: &ResolvedRunnerProfile) -> String {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct VenueConfig {
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -498,6 +512,10 @@ pub struct RunnerProfile {
     pub completion_marker: Option<String>,
     #[serde(default)]
     pub completion_action: Option<CompletionAction>,
+    /// Stop the run command and fail the case once an output line contains this, such as
+    /// a firmware panic handler's prefix.
+    #[serde(default)]
+    pub failure_marker: Option<String>,
     #[serde(default)]
     pub board: Option<String>,
     #[serde(default)]
@@ -514,6 +532,10 @@ pub struct RunnerProfile {
     pub require_external_measurements: Option<bool>,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// End a run or prepare command that writes nothing to stdout or stderr for this many
+    /// seconds, reported as `timed-out`. Unset, only `timeout-seconds` applies.
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
     #[serde(default)]
     pub target_dir: Option<PathBuf>,
     #[serde(default)]
@@ -525,6 +547,7 @@ pub struct RunnerProfile {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum ConfiguredU64 {
     Number(u64),
     Binding(String),
@@ -532,6 +555,7 @@ pub enum ConfiguredU64 {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct ConstantTimeConfig {
     #[serde(default = "default_welch_threshold")]
     pub welch_threshold: f64,
@@ -565,6 +589,7 @@ fn default_control_classes() -> Vec<String> {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct RunnerCommandConfig {
     pub executable: String,
     #[serde(default)]
@@ -575,6 +600,7 @@ pub struct RunnerCommandConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum RunnerKind {
     Simavr,
     Command,
@@ -607,6 +633,7 @@ struct ResolvedRunnerProfile {
     build_features: Vec<String>,
     completion_marker: Option<String>,
     completion_action: CompletionAction,
+    failure_marker: Option<String>,
     board: Option<String>,
     mcu: Option<String>,
     transport: Option<String>,
@@ -615,6 +642,7 @@ struct ResolvedRunnerProfile {
     host_usb_path: Option<String>,
     require_external_measurements: bool,
     timeout_seconds: u64,
+    idle_timeout_seconds: Option<u64>,
     target_dir: Option<PathBuf>,
     artifact_extension: String,
     constant_time: Option<ConstantTimeConfig>,
@@ -646,6 +674,7 @@ impl RunnerProfile {
         inherit_option!(build_features);
         inherit_option!(completion_marker);
         inherit_option!(completion_action);
+        inherit_option!(failure_marker);
         inherit_option!(board);
         inherit_option!(mcu);
         inherit_option!(transport);
@@ -654,6 +683,7 @@ impl RunnerProfile {
         inherit_option!(host_usb_path);
         inherit_option!(require_external_measurements);
         inherit_option!(timeout_seconds);
+        inherit_option!(idle_timeout_seconds);
         inherit_option!(target_dir);
         inherit_option!(artifact_extension);
         inherit_option!(constant_time);
@@ -762,6 +792,16 @@ impl RunnerProfile {
             }
             None => preset.as_ref().and_then(|value| value.clock_frequency_hz),
         };
+        if self.failure_marker.as_ref().is_some_and(String::is_empty) {
+            return Err(CampaignError::InvalidConfig(format!(
+                "profile {profile_name:?} failure-marker must not be empty"
+            )));
+        }
+        if self.idle_timeout_seconds == Some(0) {
+            return Err(CampaignError::InvalidConfig(format!(
+                "profile {profile_name:?} idle-timeout-seconds must be at least 1"
+            )));
+        }
         let mut resolved = ResolvedRunnerProfile {
             runner,
             target,
@@ -777,6 +817,7 @@ impl RunnerProfile {
                     .as_ref()
                     .map_or_else(CompletionAction::default, |value| value.completion_action)
             }),
+            failure_marker: self.failure_marker.clone(),
             board: self.board.clone().or_else(|| {
                 preset
                     .as_ref()
@@ -801,6 +842,7 @@ impl RunnerProfile {
             host_usb_path: self.host_usb_path.clone(),
             require_external_measurements: self.require_external_measurements.unwrap_or(false),
             timeout_seconds: self.timeout_seconds.unwrap_or_else(default_timeout_seconds),
+            idle_timeout_seconds: self.idle_timeout_seconds,
             target_dir: self.target_dir.clone(),
             artifact_extension,
             constant_time: self.constant_time.clone(),

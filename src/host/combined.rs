@@ -11,6 +11,7 @@ use super::{CampaignReport, CaseStatus, JTraceCtGateReport};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum CombinedCtVerdict {
     Pass,
     Fail,

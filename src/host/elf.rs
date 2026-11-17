@@ -30,6 +30,7 @@ pub struct ElfSection {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ElfError {
     Io(io::Error),
     Object(object::Error),

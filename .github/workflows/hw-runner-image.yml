@@ -199,7 +199,8 @@ jobs:
           COMMIT: ${{ needs.tag.outputs.probe-rs-commit }}
         run: |
           set -euo pipefail
-          docker run --rm "$REF" cargo install --list | grep -Fx "krabi-caliper v$CALIPER:"
+          # `krabi-caliper vX.Y.Z:` from crates.io, `krabi-caliper vX.Y.Z (<git source>):` for a pre-release.
+          docker run --rm "$REF" cargo install --list | grep -E "^krabi-caliper v${CALIPER//./\\.}( \(.*\))?:$"
           version="$(docker run --rm "$REF" probe-rs --version)"
           echo "$version"
           case "$version" in
