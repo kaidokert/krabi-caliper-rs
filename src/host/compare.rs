@@ -312,6 +312,9 @@ pub fn compare_campaigns(
                 baseline: "missing".to_string(),
                 current: "present".to_string(),
             }),
+            // A case the current campaign never started has no environment or metrics to
+            // check; compare_case reports it as a status regression.
+            (Some(_), Some(current_case)) if current_case.status == CaseStatus::NotRun => {}
             (Some(baseline_case), Some(current_case)) => compare_environments(
                 &mut incompatibilities,
                 &mut warnings,
@@ -1163,5 +1166,25 @@ mod tests {
                 "| case | gate-status | — | Pass | WorkloadFail | — | — | — | REGRESSION |"
             )
         );
+    }
+
+    #[test]
+    fn a_case_the_current_campaign_did_not_run_is_a_regression() {
+        let baseline = campaign();
+        let mut current = baseline.clone();
+        let case = &mut current.cases[0];
+        case.status = CaseStatus::NotRun;
+        case.footprint = None;
+        case.result = None;
+        case.build_command = String::new();
+
+        let report = compare(&baseline, &current);
+        assert!(
+            report.incompatibilities.is_empty(),
+            "{:?}",
+            report.incompatibilities
+        );
+        assert_eq!(report.status, ComparisonStatus::Regression);
+        assert!(report.cases[0].status_regression);
     }
 }
