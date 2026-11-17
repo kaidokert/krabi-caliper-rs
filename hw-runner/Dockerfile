@@ -40,7 +40,7 @@ RUN cargo install probe-rs-tools --git ${PROBE_RS_GIT} --tag ${PROBE_RS_TAG} --l
 # comes from its `v<version>` tag in KRABI_CALIPER_GIT. Needs both cli +
 # campaign features (the cargo-krabi-caliper bin's required-features). Same
 # in-layer cache cleanup.
-ARG KRABI_CALIPER_VERSION=0.4.0-alpha.2
+ARG KRABI_CALIPER_VERSION=0.4.0-alpha.3
 ARG KRABI_CALIPER_GIT=https://github.com/kaidokert/krabi-caliper-rs
 RUN case "$KRABI_CALIPER_VERSION" in \
       *-*) source="--git $KRABI_CALIPER_GIT --tag v$KRABI_CALIPER_VERSION" ;; \
