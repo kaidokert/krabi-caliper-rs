@@ -6,6 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::string::String;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -338,15 +339,16 @@ impl CommandRunner {
         let stdout_capture = Arc::new(Mutex::new(Vec::new()));
         let stderr_capture = Arc::new(Mutex::new(Vec::new()));
         let last_output = Arc::new(Mutex::new(started));
+        let echo = spec.echo_prefix.clone().map(spawn_echo);
         let stdout_thread = spawn_reader(
             stdout,
             Arc::clone(&stdout_capture),
-            Observer::new(spec, stdout_log, &last_output),
+            Observer::new(echo.clone(), stdout_log, &last_output),
         );
         let stderr_thread = spawn_reader(
             stderr,
             Arc::clone(&stderr_capture),
-            Observer::new(spec, stderr_log, &last_output),
+            Observer::new(echo, stderr_log, &last_output),
         );
         let idle = |limit: Duration| last_output.lock().unwrap().elapsed() >= limit;
 
@@ -407,16 +409,20 @@ fn open_log(path: Option<&Path>, stream: &'static str) -> Result<Option<File>, C
 
 /// What a reader thread does with each chunk besides capturing it.
 struct Observer {
-    echo_prefix: Option<String>,
+    echo: Option<SyncSender<Vec<u8>>>,
     pending_line: Vec<u8>,
     log: Option<File>,
     last_output: Arc<Mutex<Instant>>,
 }
 
 impl Observer {
-    fn new(spec: &CommandSpec, log: Option<File>, last_output: &Arc<Mutex<Instant>>) -> Self {
+    fn new(
+        echo: Option<SyncSender<Vec<u8>>>,
+        log: Option<File>,
+        last_output: &Arc<Mutex<Instant>>,
+    ) -> Self {
         Self {
-            echo_prefix: spec.echo_prefix.clone(),
+            echo,
             pending_line: Vec::new(),
             log,
             last_output: Arc::clone(last_output),
@@ -429,32 +435,52 @@ impl Observer {
             log.write_all(bytes)?;
             log.flush()?;
         }
-        if let Some(prefix) = &self.echo_prefix {
+        if let Some(echo) = &self.echo {
+            // Only the new bytes can hold a newline; the pending ones were already searched.
+            let mut search = self.pending_line.len();
             self.pending_line.extend_from_slice(bytes);
-            while let Some(end) = self.pending_line.iter().position(|&byte| byte == b'\n') {
-                let line: Vec<u8> = self.pending_line.drain(..=end).collect();
-                echo_line(prefix, &line);
+            let mut line_start = 0;
+            while let Some(offset) = self.pending_line[search..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+            {
+                let end = search + offset;
+                let _ = echo.try_send(self.pending_line[line_start..=end].to_vec());
+                line_start = end + 1;
+                search = line_start;
             }
+            self.pending_line.drain(..line_start);
         }
         Ok(())
     }
 
     fn finish(&mut self) {
-        if let Some(prefix) = &self.echo_prefix
+        if let Some(echo) = &self.echo
             && !self.pending_line.is_empty()
         {
             let mut line = core::mem::take(&mut self.pending_line);
             line.push(b'\n');
-            echo_line(prefix, &line);
+            let _ = echo.try_send(line);
         }
     }
 }
 
-/// Writes one line to stderr. Echo is best effort: a closed stderr must not fail the command.
-fn echo_line(prefix: &str, line: &[u8]) {
-    let mut stderr = io::stderr().lock();
-    let _ = stderr.write_all(prefix.as_bytes());
-    let _ = stderr.write_all(line);
+/// Starts the thread that copies echoed lines to stderr after `prefix`, and returns its queue.
+///
+/// Echo is best effort and must never hold up capture: readers hand lines over without
+/// blocking, and a full queue drops them (the log files keep everything). The thread is not
+/// joined, so a stderr that stops draining blocks only this thread; it ends once both readers
+/// have dropped their senders and the queue is empty.
+fn spawn_echo(prefix: String) -> SyncSender<Vec<u8>> {
+    let (sender, receiver) = sync_channel::<Vec<u8>>(1024);
+    thread::spawn(move || {
+        for line in receiver {
+            let mut stderr = io::stderr().lock();
+            let _ = stderr.write_all(prefix.as_bytes());
+            let _ = stderr.write_all(&line);
+        }
+    });
+    sender
 }
 
 fn configured_command(spec: &CommandSpec, stdout: Stdio, stderr: Stdio) -> Command {
@@ -657,6 +683,19 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("stdout.log")).unwrap(), b"partial\n");
         assert_eq!(std::fs::read(dir.join("stderr.log")).unwrap(), b"warn\n");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn echo_splits_output_into_lines_across_chunks() {
+        let (sender, receiver) = sync_channel(16);
+        let mut observer = Observer::new(Some(sender), None, &Arc::new(Mutex::new(Instant::now())));
+        for chunk in [&b"ab"[..], b"c\nde", b"f\n\n", b"g"] {
+            observer.chunk(chunk).unwrap();
+        }
+        observer.finish();
+        drop(observer);
+        let lines: Vec<Vec<u8>> = receiver.into_iter().collect();
+        assert_eq!(lines, [&b"abc\n"[..], b"def\n", b"\n", b"g\n"]);
     }
 
     #[test]

@@ -1739,12 +1739,25 @@ fn write_campaign_artifacts(path: &Path, report: &CampaignReport) -> Result<(), 
         path: path.to_path_buf(),
         source,
     })?;
-    write_text(&path.join("report.md"), &report.render_markdown())?;
-    write_text(&path.join("report.csv"), &report.render_csv())?;
-    write_text(
+    replace_text(&path.join("report.md"), &report.render_markdown())?;
+    replace_text(&path.join("report.csv"), &report.render_csv())?;
+    replace_text(
         &path.join("results.json"),
         &serde_json::to_string_pretty(report).map_err(CampaignError::Json)?,
     )
+}
+
+/// Writes `path` through a sibling temporary file and a rename, so a reader or a killed
+/// campaign sees the previous summary or the new one, never a truncated file.
+fn replace_text(path: &Path, value: &str) -> Result<(), CampaignError> {
+    let mut temporary = std::ffi::OsString::from(path.as_os_str());
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    write_text(&temporary, value)?;
+    fs::rename(&temporary, path).map_err(|source| CampaignError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn write_bytes(path: &Path, value: &[u8]) -> Result<(), CampaignError> {
