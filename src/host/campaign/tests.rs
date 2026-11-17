@@ -1311,6 +1311,68 @@ cases = [{ name = "fixture", example = "fixture" }]
 
 #[cfg(unix)]
 #[test]
+fn a_failure_marker_ends_the_run_and_fails_the_case() {
+    let workspace = failure_workspace("failure-marker-test", "fn main() {}\n");
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+target-dir = "target"
+executable = "sh"
+args = ["-c", "echo '05:24:54.328: PANIC: panicked at main.rs:152:6'; exec sleep 30"]
+completion-marker = "EM_SUMMARY"
+failure-marker = "PANIC:"
+timeout-seconds = 60
+
+[campaigns.panic]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(&config, "panic", &workspace, &CampaignSelection::default())
+        .unwrap();
+
+    let case = &report.cases[0];
+    assert_eq!(case.status, CaseStatus::RunFailed);
+    let error = case.error.as_deref().unwrap();
+    assert!(
+        error.starts_with("runner command printed the failure marker"),
+        "{error}"
+    );
+    assert!(
+        error.ends_with(": 05:24:54.328: PANIC: panicked at main.rs:152:6"),
+        "{error}"
+    );
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn failure_marker_must_not_be_empty() {
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+executable = "true"
+failure-marker = ""
+
+[campaigns.panic]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    let error = config.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("failure-marker must not be empty"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_campaign_stops_at_the_first_failure_and_reports_the_rest_as_not_run() {
     let workspace = failure_workspace("fail-fast-test", "fn main() {}\n");
     let config = parse(

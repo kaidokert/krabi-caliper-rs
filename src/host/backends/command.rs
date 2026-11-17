@@ -38,6 +38,8 @@ pub struct CommandSpec {
     pub idle_timeout: Option<Duration>,
     pub completion_marker: Option<Vec<u8>>,
     pub completion_action: CompletionAction,
+    /// End the command, as failed, once a complete output line contains this.
+    pub failure_marker: Option<Vec<u8>>,
     pub silent: bool,
     /// Copy each complete output line to this process's stderr as it arrives, after this prefix.
     pub echo_prefix: Option<String>,
@@ -59,6 +61,7 @@ impl CommandSpec {
             idle_timeout: None,
             completion_marker: None,
             completion_action: CompletionAction::Kill,
+            failure_marker: None,
             silent: false,
             echo_prefix: None,
             stdout_log: None,
@@ -112,6 +115,11 @@ impl CommandSpec {
         self
     }
 
+    pub fn failure_marker(mut self, marker: impl Into<Vec<u8>>) -> Self {
+        self.failure_marker = Some(marker.into());
+        self
+    }
+
     pub const fn completion_action(mut self, action: CompletionAction) -> Self {
         self.completion_action = action;
         self
@@ -162,6 +170,8 @@ pub struct CommandOutput {
     /// The command was ended by [`CommandSpec::idle_timeout`].
     pub idle_timed_out: bool,
     pub completion_marker_hit: bool,
+    /// Output contained [`CommandSpec::failure_marker`]; the command fails whatever its exit status.
+    pub failure_marker_hit: bool,
     pub duration: Duration,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -170,6 +180,7 @@ pub struct CommandOutput {
 impl CommandOutput {
     pub fn success(&self) -> bool {
         !self.timed_out
+            && !self.failure_marker_hit
             && (self.completion_marker_hit || self.status.is_some_and(|status| status.success()))
     }
 
@@ -353,11 +364,38 @@ impl CommandRunner {
             Observer::new(echo, stderr_log, &last_output),
         );
         let idle = |limit: Duration| last_output.lock().unwrap().elapsed() >= limit;
+        let mut failure_seen: Option<Instant> = None;
 
         let (status, timed_out, mut completion_marker_hit, idle_timed_out) = loop {
+            if failure_seen.is_none()
+                && marker_seen(
+                    spec.failure_marker.as_deref(),
+                    &stdout_capture,
+                    &stderr_capture,
+                )
+            {
+                failure_seen = Some(Instant::now());
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break (Some(status), false, false, false),
-                Ok(None) if marker_seen(spec, &stdout_capture, &stderr_capture) => {
+                // Lines after the marker usually carry the rest of the failure (a panic
+                // message, a backtrace); let them land before stopping the command.
+                Ok(None)
+                    if failure_seen.is_some_and(|seen| {
+                        idle(FAILURE_SETTLE) || seen.elapsed() >= FAILURE_SETTLE_LIMIT
+                    }) =>
+                {
+                    let status = child.terminate()?;
+                    break (Some(status), false, false, false);
+                }
+                Ok(None)
+                    if failure_seen.is_none()
+                        && marker_seen(
+                            spec.completion_marker.as_deref(),
+                            &stdout_capture,
+                            &stderr_capture,
+                        ) =>
+                {
                     let status = finish_after_marker(
                         child.child.as_mut().expect("managed child must exist"),
                         spec.completion_action,
@@ -389,13 +427,17 @@ impl CommandRunner {
         // both pipes are drained, preserve a marker emitted before a normal
         // exit instead of making the result depend on thread scheduling.
         if !timed_out {
-            completion_marker_hit |= marker_seen_in_output(spec, &stdout, &stderr);
+            completion_marker_hit |=
+                marker_seen_in_output(spec.completion_marker.as_deref(), &stdout, &stderr);
         }
+        let failure_marker_hit =
+            marker_seen_in_output(spec.failure_marker.as_deref(), &stdout, &stderr);
         Ok(CommandOutput {
             status,
             timed_out,
             idle_timed_out,
             completion_marker_hit,
+            failure_marker_hit,
             duration: started.elapsed(),
             stdout,
             stderr,
@@ -567,12 +609,17 @@ fn join_reader(
         .map_err(|source| CommandError::Capture { stream, source })
 }
 
-fn marker_seen(spec: &CommandSpec, stdout: &Mutex<Vec<u8>>, stderr: &Mutex<Vec<u8>>) -> bool {
-    marker_seen_in_output(spec, &stdout.lock().unwrap(), &stderr.lock().unwrap())
+/// How long output must pause after a failure marker before the command is stopped.
+const FAILURE_SETTLE: Duration = Duration::from_millis(500);
+/// The longest a command keeps running after a failure marker.
+const FAILURE_SETTLE_LIMIT: Duration = Duration::from_secs(5);
+
+fn marker_seen(marker: Option<&[u8]>, stdout: &Mutex<Vec<u8>>, stderr: &Mutex<Vec<u8>>) -> bool {
+    marker_seen_in_output(marker, &stdout.lock().unwrap(), &stderr.lock().unwrap())
 }
 
-fn marker_seen_in_output(spec: &CommandSpec, stdout: &[u8], stderr: &[u8]) -> bool {
-    let Some(marker) = spec.completion_marker.as_deref() else {
+fn marker_seen_in_output(marker: Option<&[u8]>, stdout: &[u8], stderr: &[u8]) -> bool {
+    let Some(marker) = marker else {
         return false;
     };
     contains_complete_line(stdout, marker) || contains_complete_line(stderr, marker)
@@ -748,6 +795,44 @@ mod tests {
 
         assert!(output.timed_out);
         assert!(!still_alive, "descendant process {pid} survived timeout");
+    }
+
+    #[test]
+    fn failure_marker_fails_a_non_exiting_runner_and_keeps_the_lines_after_it() {
+        let output = CommandRunner
+            .run(
+                &CommandSpec::new("sh", ".")
+                    .args([
+                        "-c",
+                        "printf '12:00: PANIC: panicked at main.rs:152\\n'; sleep 0.2; \
+                         printf 'called unwrap on None\\n'; exec sleep 30",
+                    ])
+                    .completion_marker("EM_SUMMARY")
+                    .failure_marker("PANIC:")
+                    .timeout(Duration::from_secs(10)),
+            )
+            .unwrap();
+
+        assert!(output.failure_marker_hit);
+        assert!(!output.timed_out);
+        assert!(!output.success());
+        assert!(output.stdout_lossy().contains("called unwrap on None"));
+        assert!(output.duration < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn failure_marker_fails_a_command_that_exits_successfully() {
+        let output = CommandRunner
+            .run(
+                &CommandSpec::new("sh", ".")
+                    .args(["-c", "printf 'PANIC: boom\\nEM_SUMMARY\\n'"])
+                    .completion_marker("EM_SUMMARY")
+                    .failure_marker("PANIC:"),
+            )
+            .unwrap();
+
+        assert!(output.failure_marker_hit);
+        assert!(!output.success());
     }
 
     #[test]

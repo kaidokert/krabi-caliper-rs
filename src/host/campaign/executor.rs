@@ -1379,13 +1379,16 @@ fn runner_spec(
                 .timeout(timeout))
         }
     };
-    let spec = spec?;
-    Ok(if let Some(marker) = &profile.completion_marker {
-        spec.completion_marker(marker.as_bytes().to_vec())
-            .completion_action(profile.completion_action)
-    } else {
-        spec
-    })
+    let mut spec = spec?;
+    if let Some(marker) = &profile.completion_marker {
+        spec = spec
+            .completion_marker(marker.as_bytes().to_vec())
+            .completion_action(profile.completion_action);
+    }
+    if let Some(marker) = &profile.failure_marker {
+        spec = spec.failure_marker(marker.as_bytes().to_vec());
+    }
+    Ok(spec)
 }
 
 fn configured_runner_command(
@@ -1446,6 +1449,22 @@ fn classify_run(
     output: &CommandOutput,
     parsed: Result<RunResult, super::ParseError>,
 ) -> (CaseStatus, Option<String>, Option<RunResult>) {
+    if output.failure_marker_hit {
+        let marker = profile.failure_marker.as_deref().unwrap_or_default();
+        let combined = output.combined_lossy();
+        let line = combined
+            .lines()
+            .find(|line| line.contains(marker))
+            .map_or(marker, str::trim);
+        return (
+            CaseStatus::RunFailed,
+            Some(format!(
+                "runner command printed the failure marker after {:.1} seconds: {line}",
+                output.duration.as_secs_f64()
+            )),
+            parsed.ok(),
+        );
+    }
     if output.timed_out {
         return (
             CaseStatus::TimedOut,
