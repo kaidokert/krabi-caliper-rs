@@ -13,7 +13,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::path::PathBuf;
 use std::string::{String, ToString};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::vec;
 use std::vec::Vec;
 
@@ -46,8 +46,14 @@ pub struct CampaignConfig {
     pub matrix: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub matrix_features: Vec<String>,
-    #[serde(default = "continue_on_failure")]
+    /// Run the remaining cases after one fails. Off by default: the campaign stops at the first
+    /// case that does not pass and reports the rest as `not-run`.
+    #[serde(default)]
     pub continue_on_failure: bool,
+    /// Start no case once the campaign has run this long; the cases left are reported as
+    /// `not-run`. A case already running is bounded by its own timeouts.
+    #[serde(default)]
+    pub time_budget_seconds: Option<u64>,
     #[serde(default)]
     pub artifact_dir: Option<PathBuf>,
     /// When to run a case again after a transient status.
@@ -122,10 +128,6 @@ pub struct CaseConfig {
     pub delay_before_run_seconds: Option<u64>,
     #[serde(default)]
     pub baseline: Option<String>,
-}
-
-const fn continue_on_failure() -> bool {
-    true
 }
 
 include!("campaign/model.rs");

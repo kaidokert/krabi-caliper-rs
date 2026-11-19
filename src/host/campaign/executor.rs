@@ -239,7 +239,14 @@ impl CampaignExecutor {
             profile: campaign.profile.clone(),
             cases: Vec::new(),
         };
+        let mut stop = CampaignStop::new(&campaign);
         for case in cases {
+            if let Some(reason) = stop.reason() {
+                report
+                    .cases
+                    .push(not_run_report(&case, environment.clone(), reason));
+                continue;
+            }
             let case_report = run_with_retry(&campaign.retry, &campaign_dir, selection.silent, || {
                 self.run_case(
                     (campaign_name, &campaign.profile),
@@ -253,14 +260,11 @@ impl CampaignExecutor {
                     },
                 )
             })?;
-            let passed = case_report.status == CaseStatus::Pass;
+            stop.finished(&case_report);
             report.cases.push(case_report);
             // Rewritten after every case, so a campaign killed part way still leaves the
             // summary of the cases that finished.
             write_campaign_artifacts(&campaign_dir, &report)?;
-            if !passed && !campaign.continue_on_failure {
-                break;
-            }
         }
         write_campaign_artifacts(&campaign_dir, &report)?;
         Ok(report)
@@ -351,7 +355,19 @@ impl CampaignExecutor {
             profile: campaign.profile.clone(),
             cases: Vec::new(),
         };
+        let mut stop = CampaignStop::new(&campaign);
         for prepared_case in &prepared.cases {
+            if let Some(reason) = stop.reason() {
+                let mut case_environment = environment.clone();
+                case_environment.source = prepared.source.clone();
+                case_environment.build = prepared.build.clone();
+                report.cases.push(not_run_report(
+                    &prepared_case.case,
+                    case_environment,
+                    reason,
+                ));
+                continue;
+            }
             let artifact = manifest_dir.join(&prepared_case.artifact);
             let canonical_artifact =
                 artifact
@@ -385,14 +401,11 @@ impl CampaignExecutor {
                     selection.silent,
                 )
             })?;
-            let passed = case_report.status == CaseStatus::Pass;
+            stop.finished(&case_report);
             report.cases.push(case_report);
             // Rewritten after every case, so a campaign killed part way still leaves the
             // summary of the cases that finished.
             write_campaign_artifacts(&campaign_dir, &report)?;
-            if !passed && !campaign.continue_on_failure {
-                break;
-            }
         }
         write_campaign_artifacts(&campaign_dir, &report)?;
         Ok(report)
@@ -1366,13 +1379,16 @@ fn runner_spec(
                 .timeout(timeout))
         }
     };
-    let spec = spec?;
-    Ok(if let Some(marker) = &profile.completion_marker {
-        spec.completion_marker(marker.as_bytes().to_vec())
-            .completion_action(profile.completion_action)
-    } else {
-        spec
-    })
+    let mut spec = spec?;
+    if let Some(marker) = &profile.completion_marker {
+        spec = spec
+            .completion_marker(marker.as_bytes().to_vec())
+            .completion_action(profile.completion_action);
+    }
+    if let Some(marker) = &profile.failure_marker {
+        spec = spec.failure_marker(marker.as_bytes().to_vec());
+    }
+    Ok(spec)
 }
 
 fn configured_runner_command(
@@ -1433,6 +1449,22 @@ fn classify_run(
     output: &CommandOutput,
     parsed: Result<RunResult, super::ParseError>,
 ) -> (CaseStatus, Option<String>, Option<RunResult>) {
+    if output.failure_marker_hit {
+        let marker = profile.failure_marker.as_deref().unwrap_or_default();
+        let combined = output.combined_lossy();
+        let line = combined
+            .lines()
+            .find(|line| line.contains(marker))
+            .map_or(marker, str::trim);
+        return (
+            CaseStatus::RunFailed,
+            Some(format!(
+                "runner command printed the failure marker after {:.1} seconds: {line}",
+                output.duration.as_secs_f64()
+            )),
+            parsed.ok(),
+        );
+    }
     if output.timed_out {
         return (
             CaseStatus::TimedOut,
@@ -1582,6 +1614,79 @@ fn write_case_metadata(path: &Path, report: &CaseReport) -> Result<(), CampaignE
         &path.join("metadata.json"),
         &serde_json::to_string_pretty(report).map_err(CampaignError::Json)?,
     )
+}
+
+/// Decides when a campaign starts no more cases, and why.
+struct CampaignStop {
+    started: Instant,
+    budget: Option<Duration>,
+    continue_on_failure: bool,
+    failed: Option<String>,
+}
+
+impl CampaignStop {
+    fn new(campaign: &CampaignConfig) -> Self {
+        Self {
+            started: Instant::now(),
+            budget: campaign.time_budget_seconds.map(Duration::from_secs),
+            continue_on_failure: campaign.continue_on_failure,
+            failed: None,
+        }
+    }
+
+    fn finished(&mut self, report: &CaseReport) {
+        if report.status != CaseStatus::Pass && !self.continue_on_failure && self.failed.is_none() {
+            self.failed = Some(report.id.clone());
+        }
+    }
+
+    /// Why the next case is not started, if it is not.
+    fn reason(&self) -> Option<String> {
+        if let Some(failed) = &self.failed {
+            return Some(format!(
+                "case `{failed}` did not pass and the campaign does not continue on failure"
+            ));
+        }
+        self.budget
+            .filter(|budget| self.started.elapsed() >= *budget)
+            .map(|budget| {
+                format!(
+                    "the campaign's time budget of {} s was used up",
+                    budget.as_secs()
+                )
+            })
+    }
+}
+
+fn not_run_report(
+    case: &ExpandedCase,
+    environment: ReproducibilityMetadata,
+    reason: String,
+) -> CaseReport {
+    CaseReport {
+        id: case.id.clone(),
+        name: case.name.clone(),
+        cargo_target: case.cargo_target.clone(),
+        environment,
+        features: case.features.clone(),
+        parameters: case.parameters.clone(),
+        artifact: None,
+        footprint: None,
+        baseline: case.baseline.clone(),
+        build_command: String::new(),
+        prepare_commands: Vec::new(),
+        delay_before_run_seconds: case.delay_before_run_seconds,
+        run_command: None,
+        build_duration_ms: 0,
+        run_duration_ms: None,
+        status: CaseStatus::NotRun,
+        error: Some(reason),
+        stdout: String::new(),
+        stderr: String::new(),
+        result: None,
+        attempts: 0,
+        retried: Vec::new(),
+    }
 }
 
 /// Runs one case, then runs it again while `policy` retries its status.

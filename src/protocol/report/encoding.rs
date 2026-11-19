@@ -1,4 +1,5 @@
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Compatibility {
     #[default]
     None,
@@ -439,6 +440,7 @@ fn write_metric_ufmt<W: ufmt::uWrite + ?Sized>(
 
 #[cfg(feature = "ufmt")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum UfmtReportError<E> {
     Writer(E),
     InvalidToken,

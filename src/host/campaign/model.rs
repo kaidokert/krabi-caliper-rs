@@ -14,6 +14,7 @@ pub struct ExpandedCase {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "name", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum CargoTarget {
     Example(String),
     Binary(String),
@@ -36,6 +37,7 @@ impl CargoTarget {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum CaseStatus {
     Pass,
     WorkloadFail,
@@ -45,6 +47,9 @@ pub enum CaseStatus {
     TimedOut,
     ProtocolError,
     MissingTerminalRecord,
+    /// The campaign stopped before this case: an earlier case failed and the campaign does not
+    /// continue on failure, or its time budget was used up.
+    NotRun,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,7 +79,8 @@ pub struct CaseReport {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stderr: String,
     pub result: Option<RunResult>,
-    /// Runs of this case, including the reported one; 1 unless the case was retried.
+    /// Runs of this case, including the reported one: 1 unless the case was retried, and 0 for a
+    /// case that was not run.
     #[serde(default = "one_attempt")]
     pub attempts: u32,
     /// The status and error of each earlier attempt that was retried, oldest first.
@@ -94,6 +100,7 @@ pub struct RetriedAttempt {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ReproducibilityMetadata {
     pub recorded_unix_seconds: u64,
     pub source: SourceMetadata,
@@ -102,6 +109,7 @@ pub struct ReproducibilityMetadata {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CampaignReport {
     pub campaign: String,
     pub profile: String,
@@ -149,8 +157,20 @@ impl CampaignReport {
         let failed = self
             .cases
             .iter()
-            .filter(|case| case.status != CaseStatus::Pass)
+            .filter(|case| !matches!(case.status, CaseStatus::Pass | CaseStatus::NotRun))
             .collect::<Vec<_>>();
+        let not_run = self
+            .cases
+            .iter()
+            .filter(|case| case.status == CaseStatus::NotRun)
+            .collect::<Vec<_>>();
+        if !not_run.is_empty() {
+            output.push_str("## Not run\n\n");
+            for case in not_run {
+                output.push_str(&format!("- `{}`: {}\n", case.id, failure_reason(case)));
+            }
+            output.push('\n');
+        }
         if !failed.is_empty() {
             output.push_str("## Failures\n\n");
             for case in failed {
@@ -433,6 +453,7 @@ impl CaseStatus {
             Self::TimedOut => "timed-out",
             Self::ProtocolError => "protocol-error",
             Self::MissingTerminalRecord => "missing-terminal-record",
+            Self::NotRun => "not-run",
         }
     }
 }
@@ -477,6 +498,7 @@ fn failure_reason(case: &CaseReport) -> &str {
         CaseStatus::TimedOut => "command timed out",
         CaseStatus::ProtocolError => "target output did not satisfy the protocol",
         CaseStatus::MissingTerminalRecord => "target emitted no matching terminal record",
+        CaseStatus::NotRun => "the campaign stopped before this case",
         CaseStatus::Pass => "case passed",
     })
 }
@@ -553,6 +575,7 @@ fn delta(value: Option<u64>, baseline: Option<u64>) -> String {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CampaignError {
     MissingCampaign(String),
     MissingProfile(String),
