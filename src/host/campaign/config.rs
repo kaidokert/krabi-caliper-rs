@@ -514,6 +514,10 @@ pub struct RunnerProfile {
     pub require_external_measurements: Option<bool>,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// End a run or prepare command that writes nothing to stdout or stderr for this many
+    /// seconds, reported as `timed-out`. Unset, only `timeout-seconds` applies.
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
     #[serde(default)]
     pub target_dir: Option<PathBuf>,
     #[serde(default)]
@@ -615,6 +619,7 @@ struct ResolvedRunnerProfile {
     host_usb_path: Option<String>,
     require_external_measurements: bool,
     timeout_seconds: u64,
+    idle_timeout_seconds: Option<u64>,
     target_dir: Option<PathBuf>,
     artifact_extension: String,
     constant_time: Option<ConstantTimeConfig>,
@@ -654,6 +659,7 @@ impl RunnerProfile {
         inherit_option!(host_usb_path);
         inherit_option!(require_external_measurements);
         inherit_option!(timeout_seconds);
+        inherit_option!(idle_timeout_seconds);
         inherit_option!(target_dir);
         inherit_option!(artifact_extension);
         inherit_option!(constant_time);
@@ -762,6 +768,11 @@ impl RunnerProfile {
             }
             None => preset.as_ref().and_then(|value| value.clock_frequency_hz),
         };
+        if self.idle_timeout_seconds == Some(0) {
+            return Err(CampaignError::InvalidConfig(format!(
+                "profile {profile_name:?} idle-timeout-seconds must be at least 1"
+            )));
+        }
         let mut resolved = ResolvedRunnerProfile {
             runner,
             target,
@@ -801,6 +812,7 @@ impl RunnerProfile {
             host_usb_path: self.host_usb_path.clone(),
             require_external_measurements: self.require_external_measurements.unwrap_or(false),
             timeout_seconds: self.timeout_seconds.unwrap_or_else(default_timeout_seconds),
+            idle_timeout_seconds: self.idle_timeout_seconds,
             target_dir: self.target_dir.clone(),
             artifact_extension,
             constant_time: self.constant_time.clone(),
