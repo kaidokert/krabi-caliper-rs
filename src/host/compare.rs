@@ -21,6 +21,7 @@ pub struct ComparisonPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ComparisonStatus {
     Pass,
     Regression,
@@ -29,6 +30,7 @@ pub enum ComparisonStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MetricKind {
     Flash,
     StaticRam,
@@ -310,6 +312,11 @@ pub fn compare_campaigns(
                 baseline: "missing".to_string(),
                 current: "present".to_string(),
             }),
+            // A case the current campaign never started has no environment or metrics to
+            // check; compare_case reports it as a status regression.
+            (Some(baseline_case), Some(current_case))
+                if baseline_case.status == CaseStatus::Pass
+                    && current_case.status == CaseStatus::NotRun => {}
             (Some(baseline_case), Some(current_case)) => compare_environments(
                 &mut incompatibilities,
                 &mut warnings,
@@ -1160,6 +1167,47 @@ mod tests {
             report.render_markdown().contains(
                 "| case | gate-status | — | Pass | WorkloadFail | — | — | — | REGRESSION |"
             )
+        );
+    }
+
+    #[test]
+    fn a_case_the_current_campaign_did_not_run_is_a_regression() {
+        let baseline = campaign();
+        let mut current = baseline.clone();
+        let case = &mut current.cases[0];
+        case.status = CaseStatus::NotRun;
+        case.footprint = None;
+        case.result = None;
+        case.build_command = String::new();
+
+        let report = compare(&baseline, &current);
+        assert!(
+            report.incompatibilities.is_empty(),
+            "{:?}",
+            report.incompatibilities
+        );
+        assert_eq!(report.status, ComparisonStatus::Regression);
+        assert!(report.cases[0].status_regression);
+    }
+
+    #[test]
+    fn a_baseline_case_that_did_not_run_is_incompatible() {
+        let mut baseline = campaign();
+        let case = &mut baseline.cases[0];
+        case.status = CaseStatus::NotRun;
+        case.footprint = None;
+        case.result = None;
+        let current = baseline.clone();
+
+        let report = compare(&baseline, &current);
+        assert_eq!(report.status, ComparisonStatus::Incompatible);
+        assert!(
+            report
+                .incompatibilities
+                .iter()
+                .any(|issue| issue.field == "baseline-status"),
+            "{:?}",
+            report.incompatibilities
         );
     }
 }

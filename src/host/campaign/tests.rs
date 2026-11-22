@@ -190,6 +190,31 @@ cases = [{ name = "fixture", binary = "fixture" }]
 }
 
 #[test]
+fn a_failure_marker_binding_must_not_expand_to_empty() {
+    let config = parse(
+        r#"
+[venues.host]
+bindings = { PANIC_PREFIX = "" }
+[profiles.native]
+runner = "command"
+target = "host"
+executable = "true"
+failure-marker = "${PANIC_PREFIX}"
+venue = "host"
+[campaigns.test]
+profile = "native"
+cases = [{ name = "fixture", binary = "fixture" }]
+"#,
+    );
+
+    let error = config.resolve_profile("native").unwrap_err().to_string();
+    assert!(
+        error.contains("failure-marker must not be empty"),
+        "{error}"
+    );
+}
+
+#[test]
 fn validates_baselines_and_matrix_feature_placeholders() {
     let bad_baseline = parse(
         r#"
@@ -334,6 +359,7 @@ fn matrix_campaign() -> CampaignConfig {
         continue_on_failure: true,
         artifact_dir: None,
         retry: RetryPolicy::default(),
+        time_budget_seconds: None,
     }
 }
 
@@ -1342,6 +1368,191 @@ cases = [{ name = "fixture", example = "fixture" }]
         std::fs::read_to_string(workspace.join("target/krabi-caliper/idle/results.json")).unwrap();
     assert!(summary.contains("\"timed-out\""), "{summary}");
     std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failure_marker_ends_the_run_and_fails_the_case() {
+    let workspace = failure_workspace("failure-marker-test", "fn main() {}\n");
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+target-dir = "target"
+executable = "sh"
+args = ["-c", "echo '05:24:54.328: PANIC: panicked at main.rs:152:6'; exec sleep 30"]
+completion-marker = "EM_SUMMARY"
+failure-marker = "PANIC:"
+timeout-seconds = 60
+
+[campaigns.panic]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(&config, "panic", &workspace, &CampaignSelection::default())
+        .unwrap();
+
+    let case = &report.cases[0];
+    assert_eq!(case.status, CaseStatus::RunFailed);
+    let error = case.error.as_deref().unwrap();
+    assert!(
+        error.starts_with("runner command printed the failure marker"),
+        "{error}"
+    );
+    assert!(
+        error.ends_with(": 05:24:54.328: PANIC: panicked at main.rs:152:6"),
+        "{error}"
+    );
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn failure_marker_must_not_be_empty() {
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+executable = "true"
+failure-marker = ""
+
+[campaigns.panic]
+profile = "host"
+cases = [{ name = "fixture", example = "fixture" }]
+"#,
+    );
+    let error = config.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("failure-marker must not be empty"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_campaign_stops_at_the_first_failure_and_reports_the_rest_as_not_run() {
+    let workspace = failure_workspace("fail-fast-test", "fn main() {}\n");
+    let stale = workspace.join("target/krabi-caliper/gate/second");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("metadata.json"), "{\"status\": \"pass\"}").unwrap();
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+target-dir = "target"
+executable = "sh"
+args = ["-c", "exit 7"]
+
+[campaigns.gate]
+profile = "host"
+cases = [
+  { name = "first", example = "fixture" },
+  { name = "second", example = "fixture" },
+  { name = "third", example = "fixture" },
+]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(&config, "gate", &workspace, &CampaignSelection::default())
+        .unwrap();
+
+    let statuses: Vec<_> = report.cases.iter().map(|case| case.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            CaseStatus::RunFailed,
+            CaseStatus::NotRun,
+            CaseStatus::NotRun
+        ]
+    );
+    assert_eq!(report.cases[1].attempts, 0);
+    assert!(!report.success());
+    let markdown = report.render_markdown();
+    assert!(
+        markdown.contains(
+            "- `second`: case `first` did not pass and the campaign does not continue on failure"
+        ),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("### `second`"), "{markdown}");
+    assert!(
+        !stale.exists(),
+        "a not-run case keeps an earlier run's directory"
+    );
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_campaign_starts_no_case_after_its_time_budget() {
+    let workspace = failure_workspace("budget-test", "fn main() {}\n");
+    let config = parse(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+target-dir = "target"
+executable = "sh"
+args = ["-c", "sleep 1.2; exit 7"]
+
+[campaigns.budget]
+profile = "host"
+continue-on-failure = true
+time-budget-seconds = 1
+cases = [
+  { name = "first", example = "fixture" },
+  { name = "second", example = "fixture" },
+]
+"#,
+    );
+
+    let report = CampaignExecutor::default()
+        .run(&config, "budget", &workspace, &CampaignSelection::default())
+        .unwrap();
+
+    assert_eq!(report.cases[0].status, CaseStatus::RunFailed);
+    assert_eq!(report.cases[1].status, CaseStatus::NotRun);
+    assert_eq!(
+        report.cases[1].error.as_deref(),
+        Some("the campaign's time budget of 1 s was used up")
+    );
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn campaign_limits_reject_zero_budgets_and_retrying_not_run() {
+    for (campaign_line, expected) in [
+        (
+            "time-budget-seconds = 0",
+            "time-budget-seconds must be at least 1",
+        ),
+        (
+            "retry = { attempts = 2, on = [\"not-run\"] }",
+            "cannot retry a case that was not run",
+        ),
+    ] {
+        let config = parse(&format!(
+            r#"
+[profiles.host]
+runner = "command"
+target = "host"
+executable = "true"
+
+[campaigns.limits]
+profile = "host"
+{campaign_line}
+cases = [{{ name = "fixture", example = "fixture" }}]
+"#
+        ));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+    }
 }
 
 #[test]

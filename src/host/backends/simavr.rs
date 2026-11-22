@@ -148,6 +148,7 @@ fn windows_to_wsl_path(artifact: &Path, cwd: &Path) -> Result<OsString, SimavrEr
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SimavrError {
     ArtifactNotFound(PathBuf),
     CurrentDirectory(std::io::Error),

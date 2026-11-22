@@ -11,6 +11,7 @@ pub const DEFAULT_WELCH_THRESHOLD: f64 = 4.5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum WelchVerdict {
     InsufficientSamples,
     BelowThreshold,
