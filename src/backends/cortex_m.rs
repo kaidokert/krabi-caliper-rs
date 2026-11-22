@@ -21,12 +21,24 @@ mod dwt {
         measurement
     }
 
+    /// DEMCR.TRCENA, which powers the DWT.
+    const DEMCR_TRCENA: u32 = 1 << 24;
+    /// Enable-and-check attempts before [`DwtCycleCounter::enable`] gives up.
+    const ENABLE_ATTEMPTS: u32 = 16;
+    /// Core cycles to wait between those attempts.
+    const ENABLE_RETRY_CYCLES: u32 = 10_000;
+
     /// The Cortex-M DWT 32-bit core-cycle counter.
     ///
     /// The application retains ownership of the peripheral handles and core
     /// clock configuration. No other code may read, reset, or reconfigure
     /// CYCCNT while this adapter is active. Measurements are valid only when
     /// the interval remains below one complete 32-bit counter period.
+    ///
+    /// A debug probe that resets or detaches from the core can write DEMCR,
+    /// clearing TRCENA and stopping CYCCNT, while the firmware is starting.
+    /// [`enable`](Self::enable) retries for that reason, and every measured
+    /// interval sets TRCENA and CYCCNTENA again before it starts.
     pub struct DwtCycleCounter<'dwt> {
         dwt: &'dwt mut DWT,
         frequency_hz: Option<u64>,
@@ -34,6 +46,9 @@ mod dwt {
 
     impl<'dwt> DwtCycleCounter<'dwt> {
         /// Enables trace and CYCCNT, resets the counter, and returns its adapter.
+        ///
+        /// Returns `None` if the core has no cycle counter, or if CYCCNT reads
+        /// as disabled after every attempt to enable it.
         pub fn enable(
             dcb: &mut DCB,
             dwt: &'dwt mut DWT,
@@ -42,23 +57,32 @@ mod dwt {
             if !DWT::has_cycle_counter() {
                 return None;
             }
-            dcb.enable_trace();
-            DWT::unlock();
-            dwt.set_cycle_count(0);
-            dwt.enable_cycle_counter();
-            cortex_m::asm::dsb();
-            cortex_m::asm::isb();
-            if !DWT::cycle_counter_enabled() {
-                return None;
+            for _ in 0..ENABLE_ATTEMPTS {
+                dcb.enable_trace();
+                DWT::unlock();
+                dwt.set_cycle_count(0);
+                dwt.enable_cycle_counter();
+                cortex_m::asm::dsb();
+                cortex_m::asm::isb();
+                if DWT::cycle_counter_enabled() {
+                    return Some(Self { dwt, frequency_hz });
+                }
+                cortex_m::asm::delay(ENABLE_RETRY_CYCLES);
             }
-            Some(Self { dwt, frequency_hz })
+            None
         }
 
-        /// Resets CYCCNT immediately before a guarded measurement interval.
+        /// Re-enables CYCCNT and resets it immediately before a guarded
+        /// measurement interval.
         ///
         /// Resetting avoids rejecting a short operation merely because it
         /// crossed the counter's arbitrary global wrap boundary.
         fn reset(&mut self) {
+            // SAFETY: sets only TRCENA, by the same read-modify-write as
+            // `DCB::enable_trace`, leaving the other DEMCR bits as read.
+            unsafe { (*DCB::PTR).demcr.modify(|value| value | DEMCR_TRCENA) };
+            DWT::unlock();
+            self.dwt.enable_cycle_counter();
             self.dwt.set_cycle_count(0);
         }
     }
