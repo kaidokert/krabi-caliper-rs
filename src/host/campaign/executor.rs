@@ -23,6 +23,30 @@ impl Default for CampaignExecutor {
 }
 
 impl CampaignExecutor {
+    /// Runs a case's prepare or run command. Its output goes to `<stem>-stdout.log` and
+    /// `<stem>-stderr.log` in the case directory as it arrives and, unless `silent`, to stderr
+    /// line by line after `[label]`, so a hung or killed session still leaves its output behind.
+    fn run_observed(
+        &self,
+        spec: CommandSpec,
+        profile: &ResolvedRunnerProfile,
+        case_dir: &Path,
+        stem: &str,
+        label: &str,
+        silent: bool,
+    ) -> Result<CommandOutput, CampaignError> {
+        let mut spec = spec
+            .idle_timeout(profile.idle_timeout_seconds.map(Duration::from_secs))
+            .logs(
+                case_dir.join(format!("{stem}-stdout.log")),
+                case_dir.join(format!("{stem}-stderr.log")),
+            );
+        if !silent {
+            spec = spec.echo_prefix(format!("[{label}] "));
+        }
+        Ok(self.runner.run(&spec)?)
+    }
+
     pub fn build_prepared(
         &self,
         config: &ToolkitConfig,
@@ -114,6 +138,7 @@ impl CampaignExecutor {
                 return Err(CampaignError::InvalidConfig(command_failure_reason(
                     "build command",
                     &output,
+                    None,
                 )));
             }
             let artifact = artifact_from_build_output(&case, &output.stdout)?;
@@ -209,9 +234,13 @@ impl CampaignExecutor {
                 .unwrap_or_else(|| PathBuf::from("target/krabi-caliper")),
         );
         let campaign_dir = artifact_child(&artifact_root, campaign_name, "campaign name")?;
-        let mut reports = Vec::new();
+        let mut report = CampaignReport {
+            campaign: campaign_name.to_string(),
+            profile: campaign.profile.clone(),
+            cases: Vec::new(),
+        };
         for case in cases {
-            let report = run_with_retry(&campaign.retry, &campaign_dir, selection.silent, || {
+            let case_report = run_with_retry(&campaign.retry, &campaign_dir, selection.silent, || {
                 self.run_case(
                     (campaign_name, &campaign.profile),
                     &profile,
@@ -224,17 +253,15 @@ impl CampaignExecutor {
                     },
                 )
             })?;
-            let passed = report.status == CaseStatus::Pass;
-            reports.push(report);
+            let passed = case_report.status == CaseStatus::Pass;
+            report.cases.push(case_report);
+            // Rewritten after every case, so a campaign killed part way still leaves the
+            // summary of the cases that finished.
+            write_campaign_artifacts(&campaign_dir, &report)?;
             if !passed && !campaign.continue_on_failure {
                 break;
             }
         }
-        let report = CampaignReport {
-            campaign: campaign_name.to_string(),
-            profile: campaign.profile.clone(),
-            cases: reports,
-        };
         write_campaign_artifacts(&campaign_dir, &report)?;
         Ok(report)
     }
@@ -319,7 +346,11 @@ impl CampaignExecutor {
                 .unwrap_or_else(|| PathBuf::from("target/krabi-caliper")),
         );
         let campaign_dir = artifact_child(&artifact_root, campaign_name, "campaign name")?;
-        let mut reports = Vec::new();
+        let mut report = CampaignReport {
+            campaign: campaign_name.to_string(),
+            profile: campaign.profile.clone(),
+            cases: Vec::new(),
+        };
         for prepared_case in &prepared.cases {
             let artifact = manifest_dir.join(&prepared_case.artifact);
             let canonical_artifact =
@@ -342,7 +373,7 @@ impl CampaignExecutor {
             case_environment.source = prepared.source.clone();
             case_environment.build = prepared.build.clone();
             case_environment.build.features = prepared_case.case.features.clone();
-            let report = run_with_retry(&campaign.retry, &campaign_dir, selection.silent, || {
+            let case_report = run_with_retry(&campaign.retry, &campaign_dir, selection.silent, || {
                 self.run_prepared_case(
                     (campaign_name, &campaign.profile),
                     &profile,
@@ -354,17 +385,15 @@ impl CampaignExecutor {
                     selection.silent,
                 )
             })?;
-            let passed = report.status == CaseStatus::Pass;
-            reports.push(report);
+            let passed = case_report.status == CaseStatus::Pass;
+            report.cases.push(case_report);
+            // Rewritten after every case, so a campaign killed part way still leaves the
+            // summary of the cases that finished.
+            write_campaign_artifacts(&campaign_dir, &report)?;
             if !passed && !campaign.continue_on_failure {
                 break;
             }
         }
-        let report = CampaignReport {
-            campaign: campaign_name.to_string(),
-            profile: campaign.profile,
-            cases: reports,
-        };
         write_campaign_artifacts(&campaign_dir, &report)?;
         Ok(report)
     }
@@ -421,7 +450,7 @@ impl CampaignExecutor {
                 build_duration_ms: build_output.duration.as_millis(),
                 run_duration_ms: None,
                 status,
-                error: Some(command_failure_reason("build command", &build_output)),
+                error: Some(command_failure_reason("build command", &build_output, None)),
                 stdout: build_output.stdout_lossy(),
                 stderr: build_output.stderr_lossy(),
                 result: None,
@@ -446,14 +475,13 @@ impl CampaignExecutor {
         for (index, prepare) in profile.prepare.iter().enumerate() {
             let spec = configured_runner_command(prepare, workspace, &built_artifact).silent(silent);
             prepare_commands.push(spec.display());
-            let output = self.runner.run(&spec)?;
-            write_bytes(
-                &case_dir.join(format!("prepare-{index}-stdout.log")),
-                &output.stdout,
-            )?;
-            write_bytes(
-                &case_dir.join(format!("prepare-{index}-stderr.log")),
-                &output.stderr,
+            let output = self.run_observed(
+                spec,
+                profile,
+                &case_dir,
+                &format!("prepare-{index}"),
+                &format!("{} prepare-{index}", case.id),
+                silent,
             )?;
             if !output.success() {
                 let report = CaseReport {
@@ -477,7 +505,7 @@ impl CampaignExecutor {
                     } else {
                         CaseStatus::RunFailed
                     },
-                    error: Some(command_failure_reason("prepare command", &output)),
+                    error: Some(command_failure_reason("prepare command", &output, profile.idle_timeout_seconds)),
                     stdout: output.stdout_lossy(),
                     stderr: output.stderr_lossy(),
                     result: None,
@@ -493,8 +521,7 @@ impl CampaignExecutor {
         }
         let run = runner_spec(profile, workspace, case, &built_artifact)?.silent(silent);
         let run_display = run.display();
-        let run_output = self.runner.run(&run)?;
-        write_run_logs(&case_dir, &run_output)?;
+        let run_output = self.run_observed(run, profile, &case_dir, "raw", &case.id, silent)?;
         let combined = run_output.combined_lossy();
         let parsed = parse(&combined).map(|mut result| {
             result.correlate_external(profile.require_external_measurements);
@@ -587,14 +614,13 @@ impl CampaignExecutor {
         for (index, prepare) in profile.prepare.iter().enumerate() {
             let spec = configured_runner_command(prepare, workspace, artifact).silent(silent);
             prepare_commands.push(spec.display());
-            let output = self.runner.run(&spec)?;
-            write_bytes(
-                &case_dir.join(format!("prepare-{index}-stdout.log")),
-                &output.stdout,
-            )?;
-            write_bytes(
-                &case_dir.join(format!("prepare-{index}-stderr.log")),
-                &output.stderr,
+            let output = self.run_observed(
+                spec,
+                profile,
+                &case_dir,
+                &format!("prepare-{index}"),
+                &format!("{} prepare-{index}", case.id),
+                silent,
             )?;
             if !output.success() {
                 let report = CaseReport {
@@ -618,7 +644,7 @@ impl CampaignExecutor {
                     } else {
                         CaseStatus::RunFailed
                     },
-                    error: Some(command_failure_reason("prepare command", &output)),
+                    error: Some(command_failure_reason("prepare command", &output, profile.idle_timeout_seconds)),
                     stdout: output.stdout_lossy(),
                     stderr: output.stderr_lossy(),
                     result: None,
@@ -634,8 +660,7 @@ impl CampaignExecutor {
         }
         let run = runner_spec(profile, workspace, case, artifact)?.silent(silent);
         let run_display = run.display();
-        let run_output = self.runner.run(&run)?;
-        write_run_logs(&case_dir, &run_output)?;
+        let run_output = self.run_observed(run, profile, &case_dir, "raw", &case.id, silent)?;
         let combined = run_output.combined_lossy();
         let parsed = parse(&combined).map(|mut result| {
             result.correlate_external(profile.require_external_measurements);
@@ -1411,14 +1436,14 @@ fn classify_run(
     if output.timed_out {
         return (
             CaseStatus::TimedOut,
-            Some(command_failure_reason("runner command", output)),
+            Some(command_failure_reason("runner command", output, profile.idle_timeout_seconds)),
             parsed.ok(),
         );
     }
     if !output.success() {
         return (
             CaseStatus::RunFailed,
-            Some(command_failure_reason("runner command", output)),
+            Some(command_failure_reason("runner command", output, profile.idle_timeout_seconds)),
             parsed.ok(),
         );
     }
@@ -1551,10 +1576,6 @@ fn substitute(template: &str, parameters: &BTreeMap<String, String>) -> String {
         })
 }
 
-fn write_run_logs(path: &Path, output: &CommandOutput) -> Result<(), CampaignError> {
-    write_bytes(&path.join("raw-stdout.log"), &output.stdout)?;
-    write_bytes(&path.join("raw-stderr.log"), &output.stderr)
-}
 
 fn write_case_metadata(path: &Path, report: &CaseReport) -> Result<(), CampaignError> {
     write_text(
@@ -1683,8 +1704,15 @@ fn write_case_artifacts(path: &Path, report: &CaseReport) -> Result<(), Campaign
     Ok(())
 }
 
-fn command_failure_reason(phase: &str, output: &CommandOutput) -> String {
-    if output.timed_out {
+/// `idle_seconds` is the idle limit the command ran under, for the reason when it ended it.
+fn command_failure_reason(phase: &str, output: &CommandOutput, idle_seconds: Option<u64>) -> String {
+    if output.idle_timed_out {
+        format!(
+            "{phase} wrote no output for {} s and was stopped after {:.1} seconds",
+            idle_seconds.unwrap_or_default(),
+            output.duration.as_secs_f64()
+        )
+    } else if output.timed_out {
         format!(
             "{phase} timed out after {:.1} seconds",
             output.duration.as_secs_f64()
@@ -1711,12 +1739,39 @@ fn write_campaign_artifacts(path: &Path, report: &CampaignReport) -> Result<(), 
         path: path.to_path_buf(),
         source,
     })?;
-    write_text(&path.join("report.md"), &report.render_markdown())?;
-    write_text(&path.join("report.csv"), &report.render_csv())?;
-    write_text(
+    replace_text(&path.join("report.md"), &report.render_markdown())?;
+    replace_text(&path.join("report.csv"), &report.render_csv())?;
+    replace_text(
         &path.join("results.json"),
         &serde_json::to_string_pretty(report).map_err(CampaignError::Json)?,
     )
+}
+
+/// Writes `path` through a sibling temporary file and a rename, so a reader or a killed
+/// campaign sees the previous summary or the new one, never a truncated file.
+fn replace_text(path: &Path, value: &str) -> Result<(), CampaignError> {
+    use std::io::Write as _;
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| CampaignError::Io { path, source }
+    };
+    // Case directories share the campaign directory and any case name is allowed, so the
+    // temporary file takes the first name nothing else holds.
+    let mut attempt = 0u32;
+    let (temporary, mut file) = loop {
+        let mut name = std::ffi::OsString::from(path.as_os_str());
+        name.push(format!(".{}.{attempt}.tmp", std::process::id()));
+        let name = PathBuf::from(name);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&name) {
+            Ok(file) => break (name, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(error) => return Err(io_error(&name)(error)),
+        }
+    };
+    file.write_all(value.as_bytes())
+        .map_err(io_error(&temporary))?;
+    drop(file);
+    fs::rename(&temporary, path).map_err(io_error(path))
 }
 
 fn write_bytes(path: &Path, value: &[u8]) -> Result<(), CampaignError> {
