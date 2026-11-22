@@ -314,7 +314,9 @@ pub fn compare_campaigns(
             }),
             // A case the current campaign never started has no environment or metrics to
             // check; compare_case reports it as a status regression.
-            (Some(_), Some(current_case)) if current_case.status == CaseStatus::NotRun => {}
+            (Some(baseline_case), Some(current_case))
+                if baseline_case.status == CaseStatus::Pass
+                    && current_case.status == CaseStatus::NotRun => {}
             (Some(baseline_case), Some(current_case)) => compare_environments(
                 &mut incompatibilities,
                 &mut warnings,
@@ -1186,5 +1188,26 @@ mod tests {
         );
         assert_eq!(report.status, ComparisonStatus::Regression);
         assert!(report.cases[0].status_regression);
+    }
+
+    #[test]
+    fn a_baseline_case_that_did_not_run_is_incompatible() {
+        let mut baseline = campaign();
+        let case = &mut baseline.cases[0];
+        case.status = CaseStatus::NotRun;
+        case.footprint = None;
+        case.result = None;
+        let current = baseline.clone();
+
+        let report = compare(&baseline, &current);
+        assert_eq!(report.status, ComparisonStatus::Incompatible);
+        assert!(
+            report
+                .incompatibilities
+                .iter()
+                .any(|issue| issue.field == "baseline-status"),
+            "{:?}",
+            report.incompatibilities
+        );
     }
 }

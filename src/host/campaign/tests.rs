@@ -190,6 +190,31 @@ cases = [{ name = "fixture", binary = "fixture" }]
 }
 
 #[test]
+fn a_failure_marker_binding_must_not_expand_to_empty() {
+    let config = parse(
+        r#"
+[venues.host]
+bindings = { PANIC_PREFIX = "" }
+[profiles.native]
+runner = "command"
+target = "host"
+executable = "true"
+failure-marker = "${PANIC_PREFIX}"
+venue = "host"
+[campaigns.test]
+profile = "native"
+cases = [{ name = "fixture", binary = "fixture" }]
+"#,
+    );
+
+    let error = config.resolve_profile("native").unwrap_err().to_string();
+    assert!(
+        error.contains("failure-marker must not be empty"),
+        "{error}"
+    );
+}
+
+#[test]
 fn validates_baselines_and_matrix_feature_placeholders() {
     let bad_baseline = parse(
         r#"
@@ -1271,6 +1296,42 @@ cases = [{ name = "fixture", example = "fixture" }]
 
 #[cfg(unix)]
 #[test]
+fn campaign_reports_are_written_past_a_case_directory_on_their_temporary_path() {
+    let workspace = failure_workspace("report-temporary-test", "fn main() {}\n");
+    let case = format!("report.md.{}.0.tmp", std::process::id());
+    let config = parse(&format!(
+        r#"
+[profiles.host]
+runner = "command"
+target = "host"
+target-dir = "target"
+executable = "true"
+
+[campaigns.reports]
+profile = "host"
+continue-on-failure = true
+cases = [{{ name = "{case}", example = "fixture" }}]
+"#
+    ));
+
+    let report = CampaignExecutor::default()
+        .run(
+            &config,
+            "reports",
+            &workspace,
+            &CampaignSelection::default(),
+        )
+        .unwrap();
+
+    assert_eq!(report.cases.len(), 1);
+    let campaign_dir = workspace.join("target/krabi-caliper/reports");
+    assert!(campaign_dir.join(&case).is_dir());
+    assert!(campaign_dir.join("report.md").is_file());
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn an_idle_runner_times_out_and_leaves_its_output_on_disk() {
     let workspace = failure_workspace("idle-test", "fn main() {}\n");
     let config = parse(
@@ -1375,6 +1436,9 @@ cases = [{ name = "fixture", example = "fixture" }]
 #[test]
 fn a_campaign_stops_at_the_first_failure_and_reports_the_rest_as_not_run() {
     let workspace = failure_workspace("fail-fast-test", "fn main() {}\n");
+    let stale = workspace.join("target/krabi-caliper/gate/second");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("metadata.json"), "{\"status\": \"pass\"}").unwrap();
     let config = parse(
         r#"
 [profiles.host]
@@ -1417,6 +1481,10 @@ cases = [
         "{markdown}"
     );
     assert!(!markdown.contains("### `second`"), "{markdown}");
+    assert!(
+        !stale.exists(),
+        "a not-run case keeps an earlier run's directory"
+    );
     std::fs::remove_dir_all(workspace).unwrap();
 }
 

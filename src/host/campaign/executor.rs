@@ -242,6 +242,7 @@ impl CampaignExecutor {
         let mut stop = CampaignStop::new(&campaign);
         for case in cases {
             if let Some(reason) = stop.reason() {
+                remove_case_dir(&campaign_dir, &case.id)?;
                 report
                     .cases
                     .push(not_run_report(&case, environment.clone(), reason));
@@ -361,6 +362,7 @@ impl CampaignExecutor {
                 let mut case_environment = environment.clone();
                 case_environment.source = prepared.source.clone();
                 case_environment.build = prepared.build.clone();
+                remove_case_dir(&campaign_dir, &prepared_case.case.id)?;
                 report.cases.push(not_run_report(
                     &prepared_case.case,
                     case_environment,
@@ -1658,6 +1660,18 @@ impl CampaignStop {
     }
 }
 
+/// Removes a case directory left by an earlier run, so it cannot contradict this run's report.
+fn remove_case_dir(campaign_dir: &Path, id: &str) -> Result<(), CampaignError> {
+    let case_dir = artifact_child(campaign_dir, id, "expanded case id")?;
+    if case_dir.exists() {
+        fs::remove_dir_all(&case_dir).map_err(|source| CampaignError::Io {
+            path: case_dir,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 fn not_run_report(
     case: &ExpandedCase,
     environment: ReproducibilityMetadata,
@@ -1855,14 +1869,28 @@ fn write_campaign_artifacts(path: &Path, report: &CampaignReport) -> Result<(), 
 /// Writes `path` through a sibling temporary file and a rename, so a reader or a killed
 /// campaign sees the previous summary or the new one, never a truncated file.
 fn replace_text(path: &Path, value: &str) -> Result<(), CampaignError> {
-    let mut temporary = std::ffi::OsString::from(path.as_os_str());
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-    write_text(&temporary, value)?;
-    fs::rename(&temporary, path).map_err(|source| CampaignError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    use std::io::Write as _;
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| CampaignError::Io { path, source }
+    };
+    // Case directories share the campaign directory and any case name is allowed, so the
+    // temporary file takes the first name nothing else holds.
+    let mut attempt = 0u32;
+    let (temporary, mut file) = loop {
+        let mut name = std::ffi::OsString::from(path.as_os_str());
+        name.push(format!(".{}.{attempt}.tmp", std::process::id()));
+        let name = PathBuf::from(name);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&name) {
+            Ok(file) => break (name, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(error) => return Err(io_error(&name)(error)),
+        }
+    };
+    file.write_all(value.as_bytes())
+        .map_err(io_error(&temporary))?;
+    drop(file);
+    fs::rename(&temporary, path).map_err(io_error(path))
 }
 
 fn write_bytes(path: &Path, value: &[u8]) -> Result<(), CampaignError> {
