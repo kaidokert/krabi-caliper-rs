@@ -854,6 +854,11 @@ impl RunnerProfile {
         };
         reject_identity_secrets(&resolved, &secrets)?;
         resolve_profile_bindings(&mut resolved, &bindings, &secrets, initial_evidence)?;
+        if resolved.failure_marker.as_ref().is_some_and(String::is_empty) {
+            return Err(CampaignError::InvalidConfig(format!(
+                "profile {profile_name:?} failure-marker must not be empty"
+            )));
+        }
         resolved.configuration_identity = configuration_identity(&resolved);
         Ok(resolved)
     }

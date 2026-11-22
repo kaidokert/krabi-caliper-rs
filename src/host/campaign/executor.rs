@@ -242,6 +242,7 @@ impl CampaignExecutor {
         let mut stop = CampaignStop::new(&campaign);
         for case in cases {
             if let Some(reason) = stop.reason() {
+                remove_case_dir(&campaign_dir, &case.id)?;
                 report
                     .cases
                     .push(not_run_report(&case, environment.clone(), reason));
@@ -361,6 +362,7 @@ impl CampaignExecutor {
                 let mut case_environment = environment.clone();
                 case_environment.source = prepared.source.clone();
                 case_environment.build = prepared.build.clone();
+                remove_case_dir(&campaign_dir, &prepared_case.case.id)?;
                 report.cases.push(not_run_report(
                     &prepared_case.case,
                     case_environment,
@@ -1656,6 +1658,18 @@ impl CampaignStop {
                 )
             })
     }
+}
+
+/// Removes a case directory left by an earlier run, so it cannot contradict this run's report.
+fn remove_case_dir(campaign_dir: &Path, id: &str) -> Result<(), CampaignError> {
+    let case_dir = artifact_child(campaign_dir, id, "expanded case id")?;
+    if case_dir.exists() {
+        fs::remove_dir_all(&case_dir).map_err(|source| CampaignError::Io {
+            path: case_dir,
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 fn not_run_report(
