@@ -35,7 +35,7 @@ inputs:
   caliper-version:
     description: Exact krabi-caliper CLI version required in the runner image
     required: false
-    default: 0.4.0-alpha.4
+    default: 0.4.0-alpha.5
 
 runs:
   using: composite
