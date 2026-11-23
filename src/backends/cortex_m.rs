@@ -48,18 +48,33 @@ mod dwt {
         /// Enables trace and CYCCNT, resets the counter, and returns its adapter.
         ///
         /// Returns `None` if the core has no cycle counter, or if CYCCNT reads
-        /// as disabled after every attempt to enable it.
+        /// as disabled after every attempt to enable it. Either way TRCENA is
+        /// left as it was on entry.
         pub fn enable(
             dcb: &mut DCB,
             dwt: &'dwt mut DWT,
             frequency_hz: Option<u64>,
         ) -> Option<Self> {
-            if !DWT::has_cycle_counter() {
-                return None;
-            }
+            let trace_was_enabled = dcb.demcr.read() & DEMCR_TRCENA != 0;
+            let restore = |dcb: &mut DCB| {
+                if !trace_was_enabled {
+                    dcb.disable_trace();
+                }
+            };
             for _ in 0..ENABLE_ATTEMPTS {
                 dcb.enable_trace();
                 DWT::unlock();
+                cortex_m::asm::dsb();
+                // DWT_CTRL reads its real value only while TRCENA is set; a clear
+                // TRCENA here means the probe wrote DEMCR, so try again.
+                if dcb.demcr.read() & DEMCR_TRCENA == 0 {
+                    cortex_m::asm::delay(ENABLE_RETRY_CYCLES);
+                    continue;
+                }
+                if !DWT::has_cycle_counter() {
+                    restore(dcb);
+                    return None;
+                }
                 dwt.set_cycle_count(0);
                 dwt.enable_cycle_counter();
                 cortex_m::asm::dsb();
@@ -69,6 +84,7 @@ mod dwt {
                 }
                 cortex_m::asm::delay(ENABLE_RETRY_CYCLES);
             }
+            restore(dcb);
             None
         }
 
