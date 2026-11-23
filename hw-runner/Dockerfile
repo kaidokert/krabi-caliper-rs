@@ -22,6 +22,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Cross target for the Cortex-M firmware krabi-caliper builds + flashes.
 RUN rustup target add thumbv7em-none-eabihf
 
+# Consumers pin `channel = "stable"` in rust-toolchain.toml, but the base image's
+# toolchain is named by its version (e.g. 1.100.0), which rustup does not treat
+# as `stable` and will not link under that name. Without a toolchain called
+# `stable`, the first cargo call in every job downloads one (6-8 min on the Pi).
+RUN rustup toolchain install stable --profile minimal --target thumbv7em-none-eabihf \
+ && rustup default stable
+
 # probe-rs CLI (the `probe-rs` binary lives in the probe-rs-tools crate), built
 # from the kaidokert/probe-rs fork at a fixed tag: the same build every bench
 # host and dev box runs, carrying fixes not yet released upstream (0.29.1 from

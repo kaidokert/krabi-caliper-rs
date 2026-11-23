@@ -206,6 +206,11 @@ jobs:
             *"git commit: $COMMIT"*) ;;
             *) echo "::error::probe-rs reports '$version', expected commit $COMMIT"; exit 1 ;;
           esac
+          # A consumer pinned to `stable` must find it installed, with the target.
+          docker run --rm -e RUSTUP_AUTO_INSTALL=0 -w /tmp "$REF" sh -ec '
+            printf "[toolchain]\nchannel = \"stable\"\n" > rust-toolchain.toml
+            cargo --version
+            rustup target list --installed | grep -Fx thumbv7em-none-eabihf'
 
       - uses: docker/login-action@v3
         if: steps.published.outputs.published != 'true'
