@@ -54,12 +54,15 @@ mod dwt {
             dwt: &'dwt mut DWT,
             frequency_hz: Option<u64>,
         ) -> Option<Self> {
-            if !DWT::has_cycle_counter() {
-                return None;
-            }
             for _ in 0..ENABLE_ATTEMPTS {
                 dcb.enable_trace();
                 DWT::unlock();
+                cortex_m::asm::dsb();
+                // DWT_CTRL reads its NOCYCCNT bit correctly only once TRCENA is set.
+                if !DWT::has_cycle_counter() {
+                    cortex_m::asm::delay(ENABLE_RETRY_CYCLES);
+                    continue;
+                }
                 dwt.set_cycle_count(0);
                 dwt.enable_cycle_counter();
                 cortex_m::asm::dsb();
