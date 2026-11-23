@@ -22,11 +22,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Cross target for the Cortex-M firmware krabi-caliper builds + flashes.
 RUN rustup target add thumbv7em-none-eabihf
 
-# Consumers pin `channel = "stable"` in rust-toolchain.toml, but the base image's
-# toolchain is named by its version (e.g. 1.100.0), which rustup does not treat
-# as `stable` and will not link under that name. Without a toolchain called
-# `stable`, the first cargo call in every job downloads one (6-8 min on the Pi).
-RUN rustup toolchain install stable --profile minimal --target thumbv7em-none-eabihf \
+# Consumers pin `channel = "stable"` with rustfmt + clippy in rust-toolchain.toml,
+# but the base image's toolchain is named by its version (e.g. 1.100.0), which
+# rustup does not treat as `stable` and will not link under that name. Anything
+# missing here is downloaded by the first cargo call in every job (6-8 min on
+# the Pi), so this ships the components and every Cortex-M target: M0/M0+, M3,
+# M4/M7 (soft and hard float), M23, M33 (soft and hard float).
+RUN rustup toolchain install stable --profile minimal --component rustfmt,clippy \
+      --target thumbv6m-none-eabi,thumbv7m-none-eabi,thumbv7em-none-eabi,thumbv7em-none-eabihf,thumbv8m.base-none-eabi,thumbv8m.main-none-eabi,thumbv8m.main-none-eabihf \
  && rustup default stable
 
 # probe-rs CLI (the `probe-rs` binary lives in the probe-rs-tools crate), built

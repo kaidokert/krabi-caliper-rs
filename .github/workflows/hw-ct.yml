@@ -39,7 +39,7 @@ on:
       container-image:
         description: Hardware job image
         required: false
-        default: ghcr.io/kaidokert/krabi-hw-runner:caliper-0.4.0-probe-rs-0.32.0-kk.2-trixie-0f70826e3cb8
+        default: ghcr.io/kaidokert/krabi-hw-runner:caliper-0.4.0-probe-rs-0.32.0-kk.2-trixie-e1e8ddb09bb0
         type: string
       container-options:
         description: Docker options for probe access and CPU control
